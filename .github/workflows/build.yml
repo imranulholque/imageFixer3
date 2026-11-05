@@ -18,6 +18,20 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
         run: python smoke_test.py
+      # The program icon: made here when icon.ico is not in the repository.
+      - name: Make icon if missing
+        shell: python
+        run: |
+          import os
+          from PIL import Image, ImageDraw
+          if not os.path.exists("icon.ico"):
+              im = Image.new("RGBA", (256, 256), (0, 0, 0, 0))
+              d = ImageDraw.Draw(im)
+              d.rounded_rectangle((0, 0, 255, 255), 56, fill=(99, 102, 241, 255))
+              d.rounded_rectangle((52, 62, 204, 194), 18, outline=(255, 255, 255, 255), width=12)
+              d.polygon([(70, 176), (110, 130), (136, 158), (158, 138), (190, 176)], fill=(255, 255, 255, 255))
+              d.ellipse((84, 86, 108, 110), fill=(255, 255, 255, 255))
+              im.save("icon.ico", sizes=[(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
       - run: pyinstaller --noconsole --onedir --name ImageFixer --icon icon.ico --collect-all pillow_heif --exclude-module tkinter app.py
       - uses: actions/upload-artifact@v4
         with:
