@@ -141,6 +141,7 @@ class AdjRow(QFrame):
     removed = Signal(str)
     activated = Signal(str)
     deactivated = Signal()
+    selectRequested = Signal(str)
 
     def __init__(self, adj, removable=True, parent=None):
         super().__init__(parent)
@@ -217,6 +218,12 @@ class AdjRow(QFrame):
             rr.addWidget(lab)
             rr.addWidget(self.rs, 1)
             v.addLayout(rr)
+        sr = QHBoxLayout()
+        self.btnSelect = QPushButton("Select this color" if adj["type"] == "color" else "Select this shade")
+        self.btnSelect.setToolTip("Make every place with this color the selection. Then Delete, Fill, Hue ... act only there.")
+        self.btnSelect.clicked.connect(lambda: self.selectRequested.emit(self.adj["id"]))
+        sr.addWidget(self.btnSelect)
+        v.addLayout(sr)
         if adj["type"] == "color":
             to = QHBoxLayout()
             to.setSpacing(8)
@@ -301,6 +308,7 @@ class ColorList(QWidget):
     clearAll = Signal()
     activated = Signal(str)
     deactivated = Signal()
+    selectAdj = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -345,6 +353,7 @@ class ColorList(QWidget):
     def _wire(self, row):
         row.changed.connect(self.changed.emit)
         row.activated.connect(self._act)
+        row.selectRequested.connect(self.selectAdj.emit)
         row.deactivated.connect(self._deact)
 
     def _act(self, aid):
@@ -863,6 +872,7 @@ class Card(QWidget):
         self.colors.removeBands.connect(self._remove_bands)
         self.colors.clearAll.connect(self._clear_adjs)
         self.colors.activated.connect(self._set_focus)
+        self.colors.selectAdj.connect(self._select_adj)
         self.exportReady.connect(self._on_export_ready)
         self._tool_widgets = [self.btnHand, self.btnPick, self.btnApply, self.btnCancel, self.btnSelAll,
                               self.btnDeselect, self.btnInvert, self.btnGrow, self.btnShrink, self.btnSave,
@@ -967,7 +977,7 @@ class Card(QWidget):
         self.modeOut = QButtonGroup(self)
         self.modeOut.setExclusive(True)
         for i, (text, tip) in enumerate((("Color", "Keep the colors"), ("Gray", "Grayscale scan"),
-                                         ("Black & white", "Pure black text on white paper"))):
+                                         ("Black && white", "Pure black text on white paper"))):
             b = QPushButton(text)
             b.setCheckable(True)
             b.setToolTip(tip)
@@ -1584,6 +1594,24 @@ class Card(QWidget):
         self.sel = None
         self._sel_changed()
 
+    def _warn(self, text):
+        """Short message right where the user looks (the hint line), also in the status bar."""
+        self.message.emit(text)
+        self.lblHint.setText("\u26a0  " + text)
+        QTimer.singleShot(5000, lambda: self.lblHint.setText(HINTS.get(self._tool, "")))
+
+    def _select_adj(self, aid):
+        """'Select this color': the places of a picked color become the selection."""
+        if not self._loaded:
+            return
+        for a in self.adjs:
+            if a["id"] == aid:
+                mask = core.get_mask(self.prev, a, self._get_lab(), self._cache)
+                self._set_selection(mask, self.sel_mode)
+                if self.sel is None:
+                    self._warn("Nothing found for this color.")
+                return
+
     def invert_selection(self):
         if not self._loaded:
             return
@@ -1662,7 +1690,7 @@ class Card(QWidget):
         if not self._loaded:
             return
         if self.sel is None:
-            self.message.emit("Select something first, then press Delete.")
+            self._warn("Nothing is selected. Select something first (Select menu), or pick a color and press 'Select this color'.")
             return
         sel, base = self.sel, self.base
 
@@ -1674,7 +1702,7 @@ class Card(QWidget):
         if not self._loaded:
             return
         if self.sel is None:
-            self.message.emit("Select something first.")
+            self._warn("Nothing is selected. Select something first.")
             return
         sel, base, rgb = self.sel, self.base, self.fill_rgb
 
@@ -1728,7 +1756,7 @@ class Card(QWidget):
             return
         px = self.canvas.selection_pixels() if self.sel is not None else None
         if px is None:
-            self.message.emit("Select something first, then press Ctrl+T.")
+            self._warn("Select something first, then press Ctrl+T.")
             return
         self._set_tool("transform")
         self.canvas.start_transform(*px)
@@ -1988,4 +2016,3 @@ class Card(QWidget):
         except Exception:
             pass
         d.exec(Qt.DropAction.CopyAction, Qt.DropAction.CopyAction)     # copy only: never moves the original file
-
