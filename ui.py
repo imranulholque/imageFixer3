@@ -61,13 +61,35 @@ class Strip(QListWidget):
         super().__init__()
         self.provider = None
         self.preparer = None
+        self._press = None
+        self._press_item = None
         self.setMouseTracking(True)
         self.itemEntered.connect(lambda it: self.preparer(it.data(Qt.ItemDataRole.UserRole)) if self.preparer else None)
 
-    def startDrag(self, supportedActions):
+    def mousePressEvent(self, e):
+        self._press = e.position().toPoint() if e.button() == Qt.MouseButton.LeftButton else None
+        self._press_item = self.itemAt(e.position().toPoint())
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        """Our own drag start (Qt's list drag does not start in this layout): press a thumbnail, move a little."""
+        if (self._press is not None and self._press_item is not None and (e.buttons() & Qt.MouseButton.LeftButton)
+                and (e.position().toPoint() - self._press).manhattanLength() >= QApplication.startDragDistance()):
+            it = self._press_item
+            self._press = None
+            self._press_item = None
+            self._drag_item(it)
+            return
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        self._press = None
+        self._press_item = None
+        super().mouseReleaseEvent(e)
+
+    def _drag_item(self, it):
         """Always COPY: a move would take the user's original file away."""
-        it = self.currentItem()
-        if it is None or self.provider is None:
+        if self.provider is None:
             return
         try:
             md = self.provider(it.data(Qt.ItemDataRole.UserRole))
@@ -81,6 +103,9 @@ class Strip(QListWidget):
         if not ic.isNull():
             d.setPixmap(ic.pixmap(96, 96))
         d.exec(Qt.DropAction.CopyAction, Qt.DropAction.CopyAction)
+
+    def startDrag(self, supportedActions):
+        pass
 
     def mimeData(self, items):
         if self.provider is not None and items:
@@ -374,8 +399,8 @@ class MainWindow(QMainWindow):
         self.strip = Strip()
         self.strip.provider = self._mime_for
         self.strip.preparer = self._prepare_for
-        self.strip.setDragEnabled(True)
-        self.strip.setDragDropMode(QAbstractItemView.DragDropMode.DragOnly)
+        self.strip.setDragEnabled(False)
+        self.strip.setDragDropMode(QAbstractItemView.DragDropMode.NoDragDrop)
         self.strip.setDefaultDropAction(Qt.DropAction.CopyAction)
         self.strip.setObjectName("strip")
         self.strip.setViewMode(QListView.ViewMode.IconMode)
