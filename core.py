@@ -5,7 +5,31 @@ import os
 import uuid
 
 import numpy as np
-from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageOps
+from PIL import Image, ImageChops, ImageDraw, ImageOps
+from PIL import ImageFilter as _PilFilter
+
+
+class _RankFilter(_PilFilter.Filter):
+    """Min / Max filter that does not keep Python's lock while it works (Pillow's does, which froze the window)."""
+    def __init__(self, size, use_max):
+        self.size, self.use_max = int(size), use_max
+
+    def filter(self, image):
+        a = np.asarray(Image.Image()._new(image))
+        return Image.fromarray(min_filter(a, self.size, self.use_max)).im
+
+
+class ImageFilter:                                  # the names used in this file; the rank filters are our own
+    GaussianBlur = _PilFilter.GaussianBlur
+
+    @staticmethod
+    def MaxFilter(size=3):
+        return _RankFilter(size, True)
+
+    @staticmethod
+    def MinFilter(size=3):
+        return _RankFilter(size, False)
+
 
 Image.MAX_IMAGE_PIXELS = 400_000_000
 
@@ -343,6 +367,54 @@ def _saturate(x, sat):
     return x + (255.0 - x) * (f * w)[..., None]
 
 
+# ---- rank filters in pure numpy.  Pillow's Min / Max / Median filters keep the Python lock while they run, so the whole
+# window froze during a text / shadow preview.  numpy releases it, so the window stays alive.
+def _shift_stack(a, k):
+    r = k // 2
+    p = np.pad(a, [(r, r), (r, r)] + [(0, 0)] * (a.ndim - 2), mode="edge")
+    return p, r
+
+
+def min_filter(a, k, use_max=False):
+    """k x k minimum (or maximum) of a 2-D / 3-D array (same shape back)."""
+    if k <= 1:
+        return a
+    op = np.maximum if use_max else np.minimum
+    p, r = _shift_stack(a, k)
+    H, W = a.shape[:2]
+    rows = p[0:H]
+    for i in range(1, k):                               # vertical pass
+        rows = op(rows, p[i:i + H])
+    out = rows[:, 0:W]
+    for j in range(1, k):                               # horizontal pass
+        out = op(out, rows[:, j:j + W])
+    return out
+
+
+def max_filter(a, k):
+    return min_filter(a, k, True)
+
+
+def median3(a):
+    """3 x 3 median (2-D array), sorting network."""
+    p = np.pad(a, 1, mode="edge")
+    H, W = a.shape
+    v = [p[i:i + H, j:j + W] for i in range(3) for j in range(3)]
+
+    def s(i, j):
+        lo, hi = np.minimum(v[i], v[j]), np.maximum(v[i], v[j])
+        v[i], v[j] = lo, hi
+    for i, j in ((1, 2), (4, 5), (7, 8), (0, 1), (3, 4), (6, 7), (1, 2), (4, 5), (7, 8), (0, 3), (5, 8), (4, 7),
+                 (3, 6), (1, 4), (2, 5), (4, 7), (4, 2), (6, 4), (4, 2)):
+        s(i, j)
+    return v[4]
+
+
+def _mask_filter(m, k, use_max=True):
+    """Min / max filter of a uint8 / bool mask given as a numpy array."""
+    return min_filter(np.asarray(m), k, use_max)
+
+
 def clarity(rgb, look):
     """Text / line / shape sharpness, faint strokes, darker text, cleaner specks.  Only the lightness is changed,
     with a limit against halos, so shapes are never bent or moved."""
@@ -361,19 +433,20 @@ def clarity(rgb, look):
 
     def unsharp(Yf, r, amount, noise):
         im = u8(Yf)
+        u = np.asarray(im)
         blur = np.asarray(im.filter(ImageFilter.GaussianBlur(r)), dtype=np.float32)
         d = Yf - blur
         if noise:
             d = np.sign(d) * np.maximum(np.abs(d) - noise, 0.0)
         Ys = Yf + amount * d
         k = max(3, int(2 * math.ceil(r) + 1))
-        mn = np.asarray(im.filter(ImageFilter.MinFilter(k)), dtype=np.float32)
-        mx = np.asarray(im.filter(ImageFilter.MaxFilter(k)), dtype=np.float32)
+        mn = min_filter(u, k).astype(np.float32)
+        mx = max_filter(u, k).astype(np.float32)
         margin = 0.3 * (mx - mn) + 2.0
         return np.clip(Ys, mn - margin, mx + margin)
 
     if clear > 0:                                   # remove specks / noise
-        med = np.asarray(u8(Yf).filter(ImageFilter.MedianFilter(3)), dtype=np.float32)
+        med = median3(np.asarray(u8(Yf))).astype(np.float32)
         a = clear / 100.0
         Yf = Yf * (1 - a) + med * a
     if detail > 0:                                  # local contrast with a wide radius = faint strokes
@@ -393,7 +466,7 @@ def clarity(rgb, look):
 
 def _grow(m):
     """Selection grown by ~2 px so anti-aliased edge pixels of a stamp are included."""
-    im = Image.fromarray((np.clip(m, 0, 1) * 255 + 0.5).astype(np.uint8)).filter(ImageFilter.MaxFilter(5))
+    im = Image.fromarray(max_filter((np.clip(m, 0, 1) * 255 + 0.5).astype(np.uint8), 5))
     return np.asarray(im.filter(ImageFilter.GaussianBlur(0.8)), dtype=np.float32) / 255.0
 
 
