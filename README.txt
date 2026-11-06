@@ -61,3 +61,10 @@ NEW (round 3)
 - "Apply last setting to all pictures" copies only the last changed setting.
 - Phone: Local network (plain http://IP:PORT, 4-digit port box) and Internet (only while that tab is open).
   On the local network no secret link is needed; the Internet link keeps a secret path.
+
+NEW (round 4)
+- Transform: buttons Scale/Rotate, Skew, Distort, Perspective, Warp (16-point net to bend a curved line straight),
+  90-degree turns and flips. Keys: [ ] rotate 1 deg, Ctrl+[ ] 15 deg, Ctrl+Alt+Left/Right 90 deg, arrows move (Shift = 10 px).
+- Photo detection now needs skin tones (a face), so watermarks / big stamps are not treated as photos.
+  Photos get only a soft light correction in shadow removal, no ink / contrast changes.
+- Erase: the soft edge of removed writing is removed too (no grey ghost); the fill uses only real paper colour.

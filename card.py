@@ -52,7 +52,7 @@ HINTS = {
     "color": "Click a color: every place with that color is selected (Tolerance = how wide).",
     "move": "Drag inside the selection to move it (old place is filled from around).  Alt + drag = copy.",
     "copy": "Drag the selection: a copy is placed there, the original stays.",
-    "transform": "Drag inside = move.  Square handles = resize (corner keeps shape, Shift = free).  Round handle on top (or drag outside) = rotate.  "
+    "transform": "Scale / Rotate, Skew, Distort, Perspective, Warp (buttons).  Drag inside = move, round handle = rotate.  Keys: [ ] rotate 1°, Ctrl+[ ] 15°, arrows move.  "
                  "Enter = apply,  Esc = cancel.",
     "crop": "Drag the box or its handles, then Apply (Enter).",
     "persp": "Drag the 4 corner points onto the 4 corners of the page, then Apply (Enter).",
@@ -767,6 +767,35 @@ class Card(QWidget):
             mb.addWidget(b)
         self.modeBtns[1].setChecked(True)
         a.addWidget(self.modeBox)
+        self.tfBox = QWidget()
+        tfl = QHBoxLayout(self.tfBox)
+        tfl.setContentsMargins(0, 0, 0, 0)
+        tfl.setSpacing(4)
+        self.tfGroup = QButtonGroup(self)
+        self.tfGroup.setExclusive(True)
+        self.tfBtns = {}
+        for key, text, tip in (("free", "Scale / Rotate", "Resize, rotate, move (corner handle keeps the shape, Shift = free)"),
+                               ("skew", "Skew", "Slide a side along itself to slant the part"),
+                               ("distort", "Distort", "Drag any corner or side anywhere - makes a crooked part straight"),
+                               ("perspective", "Perspective", "Drag a corner: the neighbouring corners move the opposite way"),
+                               ("warp", "Warp", "A net of 16 points: pull points to bend a curved line straight")):
+            b = QPushButton(text)
+            b.setCheckable(True)
+            b.setToolTip(tip)
+            b.clicked.connect(lambda _=False, k=key: self.set_tf_mode(k))
+            self.tfGroup.addButton(b)
+            self.tfBtns[key] = b
+            tfl.addWidget(b)
+        self.tfBtns["free"].setChecked(True)
+        for text, tip, fn in (("⟲ 90°", "Rotate 90° left   (Ctrl+Alt+Left)", lambda: self.tf_rotate(-90)),
+                              ("⟳ 90°", "Rotate 90° right   (Ctrl+Alt+Right)", lambda: self.tf_rotate(90)),
+                              ("⇋ Flip", "Mirror left-right", lambda: self.canvas.tf_flip(True)),
+                              ("⇵ Flip", "Mirror top-bottom", lambda: self.canvas.tf_flip(False))):
+            b = QPushButton(text)
+            b.setToolTip(tip)
+            b.clicked.connect(lambda _=False, f=fn: f())
+            tfl.addWidget(b)
+        a.addWidget(self.tfBox)
         self.sizeBox = QWidget()
         sb = QHBoxLayout(self.sizeBox)
         sb.setContentsMargins(0, 0, 0, 0)
@@ -1805,7 +1834,8 @@ class Card(QWidget):
         pend = key in CROP_KEYS or key == "transform"
         self.btnApply.setVisible(pend)
         self.btnCancel.setVisible(pend)
-        self.optsA.setVisible(sel_t or er)
+        self.optsA.setVisible(sel_t or er or key == "transform")
+        self.tfBox.setVisible(key == "transform")
         self.optsB.setVisible(sel_t or key in MOVE_KEYS)
         self.modeBox.setVisible(sel_t)
         self.sizeBox.setVisible(key in ("quick", "brush", "erase_brush"))
@@ -1813,6 +1843,19 @@ class Card(QWidget):
         self.btnClone.setVisible(er and self.clone_src is not None)
         self._sync_brush()
         self.lblHint.setText(HINTS[key])
+
+    def set_tf_mode(self, k):
+        if self._tool == "transform":
+            self.canvas.set_tf_mode(k)
+            self.tfBtns[k].setChecked(True)
+
+    def tf_rotate(self, deg):
+        if self._tool == "transform":
+            self.canvas.tf_rotate(deg)
+
+    def tf_nudge(self, dx, dy):
+        if self._tool == "transform":
+            self.canvas.tf_nudge(dx, dy)
 
     def start_transform(self):
         """Ctrl+T: resize / rotate / move the selected part."""
@@ -1824,6 +1867,7 @@ class Card(QWidget):
             return
         self._set_tool("transform")
         self.canvas.start_transform(*px)
+        self.tfBtns["free"].setChecked(True)
 
     def apply_pending(self):
         if self._tool in CROP_KEYS:
@@ -1914,14 +1958,15 @@ class Card(QWidget):
         p = self.canvas.transform_params()
         if p is None or self.sel is None or not self._loaded:
             return
-        cx, cy, sx, sy, ang = p
+        pts, n = p
         s = self.scale
+        grid = [(x / s, y / s) for x, y in pts]
         sel, base = self.sel, self.base
         H, W = self.prev.shape[:2]
 
         def make(progress):
             mask = self._mask_img(sel, base.size)
-            new, nm = core.transform_region(base, mask, cx / s, cy / s, sx, sy, ang)
+            new, nm = core.warp_region(base, mask, grid, n)
             nsel = core.resize_mask(np.asarray(nm, dtype=np.float32) / 255.0, (W, H))
             return new, (nsel if float(nsel.max()) > 0.02 else None)
         self._edit_base("Transforming", make, after=self._go_move)

@@ -3,7 +3,7 @@ import math
 
 import numpy as np
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QBrush, QColor, QImage, QPainter, QPainterPath, QPen, QPolygonF
+from PySide6.QtGui import QBrush, QColor, QImage, QPainter, QPainterPath, QPen, QPolygonF, QTransform
 from PySide6.QtWidgets import QApplication, QWidget
 
 import core
@@ -263,11 +263,12 @@ class ImageCanvas(QWidget):
         self.update()
 
     # ------------------------------------------------------------ transform
+    # The transformed part is a net of points: 2x2 (the four corners) or, for Warp, 4x4.
     def start_transform(self, img, x0, y0):
         """img = QImage (RGBA) of the selected pixels, placed at (x0, y0) in preview pixels."""
         w, h = img.width(), img.height()
-        self._tf = {"img": img, "w": float(w), "h": float(h), "cx": x0 + w / 2.0, "cy": y0 + h / 2.0,
-                    "sx": 1.0, "sy": 1.0, "ang": 0.0}
+        self._tf = {"img": img, "w": float(w), "h": float(h), "n": 1, "mode": "free",
+                    "pts": [QPointF(x0, y0), QPointF(x0 + w, y0), QPointF(x0, y0 + h), QPointF(x0 + w, y0 + h)]}
         self._tf_drag = None
         self.mode = self.TRANSFORM
         self._update_cursor()
@@ -290,91 +291,245 @@ class ImageCanvas(QWidget):
         return img, x0, y0
 
     def transform_params(self):
+        """(points [(x, y) ...] row by row, n) in preview pixels."""
         t = self._tf
-        return None if t is None else (t["cx"], t["cy"], t["sx"], t["sy"], t["ang"])
+        return None if t is None else ([(p.x(), p.y()) for p in t["pts"]], t["n"])
 
-    def _tf_corners(self):
-        """8 handles (name, widget point) of the transformed box."""
+    # --- the net: pts[i*(n+1)+j]
+    def _corners(self):
         t = self._tf
-        hw, hh = t["w"] * t["sx"] / 2.0, t["h"] * t["sy"] / 2.0
-        a = math.radians(t["ang"])
+        n = t["n"]
+        p = t["pts"]
+        return [p[0], p[n], p[(n + 1) * (n + 1) - 1], p[n * (n + 1)]]          # TL TR BR BL
+
+    def _set_corners(self, c):
+        t = self._tf
+        t["pts"] = [QPointF(q) for q in (c[0], c[1], c[3], c[2])]
+        t["n"] = 1
+
+    def _tf_center(self):
+        c = self._corners()
+        return QPointF(sum(q.x() for q in c) / 4.0, sum(q.y() for q in c) / 4.0)
+
+    def set_tf_mode(self, m):
+        """'free' | 'skew' | 'distort' | 'perspective' | 'warp'"""
+        t = self._tf
+        if t is None:
+            return
+        t["mode"] = m
+        c = self._corners()
+        if m == "warp" and t["n"] == 1:
+            pts = []
+            for i in range(4):
+                v = i / 3.0
+                l = QPointF(c[0].x() * (1 - v) + c[3].x() * v, c[0].y() * (1 - v) + c[3].y() * v)
+                r = QPointF(c[1].x() * (1 - v) + c[2].x() * v, c[1].y() * (1 - v) + c[2].y() * v)
+                for j in range(4):
+                    u = j / 3.0
+                    pts.append(QPointF(l.x() * (1 - u) + r.x() * u, l.y() * (1 - u) + r.y() * u))
+            t["pts"], t["n"] = pts, 3
+        elif m != "warp" and t["n"] == 3:
+            self._set_corners(c)
+        self.update()
+
+    def tf_rotate(self, deg):
+        t = self._tf
+        if t is None:
+            return
+        c = self._tf_center()
+        a = math.radians(deg)
         ca, sa = math.cos(a), math.sin(a)
+        t["pts"] = [QPointF(c.x() + (p.x() - c.x()) * ca - (p.y() - c.y()) * sa,
+                            c.y() + (p.x() - c.x()) * sa + (p.y() - c.y()) * ca) for p in t["pts"]]
+        self.update()
+
+    def tf_flip(self, horizontal):
+        t = self._tf
+        if t is None:
+            return
+        n, c = t["n"], self._tf_center()
+        old = t["pts"]
+        new = []
+        for i in range(n + 1):
+            for j in range(n + 1):
+                q = old[i * (n + 1) + (n - j)] if horizontal else old[(n - i) * (n + 1) + j]
+                new.append(QPointF(q))
+        # keep the picture itself in place: only the pixels are mirrored, so mirror the points' content
+        t["pts"] = new
+        self.update()
+
+    def tf_nudge(self, dx, dy):
+        t = self._tf
+        if t is None:
+            return
+        t["pts"] = [QPointF(p.x() + dx, p.y() + dy) for p in t["pts"]]
+        self.update()
+
+    def _tf_handles(self):
+        """[(name, image point)] ; names: 'c0'..'c3' corners, 'e0'..'e3' edges (top, right, bottom, left),
+        'p<index>' net points (warp), 'rot'."""
+        t = self._tf
         out = []
-        for name, lx, ly in (("tl", -hw, -hh), ("t", 0, -hh), ("tr", hw, -hh), ("r", hw, 0),
-                             ("br", hw, hh), ("b", 0, hh), ("bl", -hw, hh), ("l", -hw, 0)):
-            ip = QPointF(t["cx"] + lx * ca - ly * sa, t["cy"] + lx * sa + ly * ca)
-            out.append((name, self.to_wid(ip)))
-        top = out[1][1]                                  # rotate handle: a little circle above the top edge
-        out.append(("rot", QPointF(top.x() + 34.0 * sa, top.y() - 34.0 * ca)))
+        if t["n"] == 1:
+            c = self._corners()
+            for i in range(4):
+                out.append(("c%d" % i, c[i]))
+            for i in range(4):
+                a, b = c[i], c[(i + 1) % 4]
+                out.append(("e%d" % i, QPointF((a.x() + b.x()) / 2, (a.y() + b.y()) / 2)))
+        else:
+            for k, p in enumerate(t["pts"]):
+                out.append(("p%d" % k, p))
+        c = self._corners()
+        mid = QPointF((c[0].x() + c[1].x()) / 2, (c[0].y() + c[1].y()) / 2)
+        ctr = self._tf_center()
+        wm = self.to_wid(mid)
+        wc = self.to_wid(ctr)
+        dx, dy = wm.x() - wc.x(), wm.y() - wc.y()
+        d = math.hypot(dx, dy) or 1.0
+        out.append(("rot", self.to_img(QPointF(wm.x() + dx / d * 34.0, wm.y() + dy / d * 34.0))))
         return out
 
     def _paint_transform(self, p):
         t = self._tf
         if t is None:
             return
-        c = self.to_wid(QPointF(t["cx"], t["cy"]))
-        p.save()
-        p.translate(c)
-        p.rotate(t["ang"])
-        p.scale(self.zoom * t["sx"], self.zoom * t["sy"])
-        p.drawImage(QPointF(-t["w"] / 2.0, -t["h"] / 2.0), t["img"])
-        p.restore()
-        hs = self._tf_corners()
-        poly = QPolygonF([hs[i][1] for i in (0, 2, 4, 6)])
+        n = t["n"]
+        w, h = t["w"], t["h"]
+        wp = [self.to_wid(q) for q in t["pts"]]
+        for i in range(n):
+            for j in range(n):
+                sq = [QPointF(j * w / n, i * h / n), QPointF((j + 1) * w / n, i * h / n),
+                      QPointF((j + 1) * w / n, (i + 1) * h / n), QPointF(j * w / n, (i + 1) * h / n)]
+                dq = [wp[i * (n + 1) + j], wp[i * (n + 1) + j + 1], wp[(i + 1) * (n + 1) + j + 1], wp[(i + 1) * (n + 1) + j]]
+                try:
+                    H = core.homography([(q.x(), q.y()) for q in sq], [(q.x(), q.y()) for q in dq])
+                except Exception:
+                    continue
+                p.save()
+                p.setTransform(QTransform(H[0, 0], H[1, 0], H[2, 0], H[0, 1], H[1, 1], H[2, 1], H[0, 2], H[1, 2], H[2, 2]))
+                p.drawImage(QRectF(sq[0], sq[2]), t["img"], QRectF(sq[0], sq[2]))
+                p.restore()
         p.setBrush(Qt.BrushStyle.NoBrush)
-        p.setPen(QPen(QColor(255, 255, 255), 1.6))
-        p.drawPolygon(poly)
-        p.setPen(QPen(QColor("#4f46e5"), 1.5))
-        p.setBrush(QBrush(QColor("white")))
-        for name, w in hs:
+        p.setPen(QPen(QColor(255, 255, 255), 1.4))
+        if n > 1:                                         # the net
+            for i in range(n + 1):
+                p.drawPolyline(QPolygonF([wp[i * (n + 1) + j] for j in range(n + 1)]))
+                p.drawPolyline(QPolygonF([wp[j * (n + 1) + i] for j in range(n + 1)]))
+        else:
+            p.drawPolygon(QPolygonF([self.to_wid(q) for q in self._corners()]))
+        hs = self._tf_handles()
+        wtop = self.to_wid(hs[-1][1])
+        for name, ip in hs:
+            w_ = self.to_wid(ip)
             if name == "rot":
+                top = self.to_wid(QPointF((self._corners()[0].x() + self._corners()[1].x()) / 2,
+                                          (self._corners()[0].y() + self._corners()[1].y()) / 2))
                 p.setPen(QPen(QColor(255, 255, 255), 1.4))
-                p.drawLine(hs[1][1], w)
+                p.drawLine(top, w_)
                 p.setPen(QPen(QColor("#4f46e5"), 1.5))
-                p.drawEllipse(w, 7.0, 7.0)
+                p.setBrush(QBrush(QColor("white")))
+                p.drawEllipse(w_, 7.0, 7.0)
             else:
-                p.drawRect(QRectF(w.x() - 5, w.y() - 5, 10, 10))
+                p.setPen(QPen(QColor("#4f46e5"), 1.5))
+                p.setBrush(QBrush(QColor("#ffd24a") if name[0] == "p" else QColor("white")))
+                p.drawRect(QRectF(w_.x() - 5, w_.y() - 5, 10, 10))
 
     def _tf_hit(self, pos):
-        for name, w in self._tf_corners():
+        for name, ip in reversed(self._tf_handles()):
+            w = self.to_wid(ip)
             if abs(pos.x() - w.x()) <= 10 and abs(pos.y() - w.y()) <= 10:
                 return "rotate" if name == "rot" else name
-        t = self._tf
-        ip = self.to_img(pos)
-        a = -math.radians(t["ang"])
-        dx, dy = ip.x() - t["cx"], ip.y() - t["cy"]
-        lx, ly = dx * math.cos(a) - dy * math.sin(a), dx * math.sin(a) + dy * math.cos(a)
-        if abs(lx) <= t["w"] * t["sx"] / 2.0 and abs(ly) <= t["h"] * t["sy"] / 2.0:
+        poly = QPolygonF(self._corners())
+        if poly.containsPoint(self.to_img(pos), Qt.FillRule.OddEvenFill):
             return "move"
         return "rotate"
+
+    def _tf_start(self, hit, ip):
+        t = self._tf
+        t["start"] = [QPointF(q) for q in t["pts"]]
+        t["sc"] = self._tf_center()
+        return ("move" if hit == "move" else "rotate" if hit == "rotate" else "handle", hit, QPointF(ip),
+                math.degrees(math.atan2(ip.y() - t["sc"].y(), ip.x() - t["sc"].x())))
 
     def _tf_do(self, pos):
         t, d = self._tf, self._tf_drag
         ip = self.to_img(pos)
+        st, c0 = t["start"], t["sc"]
+        dx, dy = ip.x() - d[2].x(), ip.y() - d[2].y()
+        n = t["n"]
         if d[0] == "move":
-            t["cx"] = d[1] + (ip.x() - d[3].x())
-            t["cy"] = d[2] + (ip.y() - d[3].y())
+            t["pts"] = [QPointF(q.x() + dx, q.y() + dy) for q in st]
         elif d[0] == "rotate":
-            a = math.degrees(math.atan2(ip.y() - t["cy"], ip.x() - t["cx"]))
-            t["ang"] = d[1] + (a - d[2])
+            a = math.radians(math.degrees(math.atan2(ip.y() - c0.y(), ip.x() - c0.x())) - d[3])
+            ca, sa = math.cos(a), math.sin(a)
+            t["pts"] = [QPointF(c0.x() + (q.x() - c0.x()) * ca - (q.y() - c0.y()) * sa,
+                                c0.y() + (q.x() - c0.x()) * sa + (q.y() - c0.y()) * ca) for q in st]
         else:
-            name = d[1]
-            a = -math.radians(t["ang"])
-            dx, dy = ip.x() - t["cx"], ip.y() - t["cy"]
-            lx, ly = dx * math.cos(a) - dy * math.sin(a), dx * math.sin(a) + dy * math.cos(a)
-            nsx = max(0.02, abs(lx) / (t["w"] / 2.0))
-            nsy = max(0.02, abs(ly) / (t["h"] / 2.0))
-            if len(name) == 2:                       # corner: keep the proportions (Shift = free)
-                if QApplication_shift():
-                    t["sx"], t["sy"] = nsx, nsy
-                else:
-                    k = max(nsx / d[2], nsy / d[3])
-                    t["sx"], t["sy"] = d[2] * k, d[3] * k
-            elif name in ("l", "r"):
-                t["sx"] = nsx
+            name, mode = d[1], t["mode"]
+            if name[0] == "p":                                    # warp: one point of the net
+                k = int(name[1:])
+                t["pts"] = [QPointF(q) for q in st]
+                t["pts"][k] = QPointF(st[k].x() + dx, st[k].y() + dy)
             else:
-                t["sy"] = nsy
+                self._tf_corner_edge(name, mode, st, c0, ip, dx, dy)
         self.update()
+
+    def _tf_corner_edge(self, name, mode, st, c0, ip, dx, dy):
+        t = self._tf
+        S = [QPointF(q) for q in (st[0], st[1], st[3], st[2])]       # TL TR BR BL
+        u = QPointF(S[1].x() - S[0].x(), S[1].y() - S[0].y())
+        v = QPointF(S[3].x() - S[0].x(), S[3].y() - S[0].y())
+        lu, lv = math.hypot(u.x(), u.y()) or 1.0, math.hypot(v.x(), v.y()) or 1.0
+        u, v = QPointF(u.x() / lu, u.y() / lu), QPointF(v.x() / lv, v.y() / lv)
+        N = [QPointF(q) for q in S]
+        idx = int(name[1])
+        if name[0] == "c":
+            if mode in ("free", "skew"):                         # scale around the centre (Shift = free)
+                r0 = math.hypot(S[idx].x() - c0.x(), S[idx].y() - c0.y()) or 1.0
+                if QApplication_shift():
+                    gx = (S[idx].x() - c0.x()) * u.x() + (S[idx].y() - c0.y()) * u.y()
+                    gy = (S[idx].x() - c0.x()) * v.x() + (S[idx].y() - c0.y()) * v.y()
+                    px = (ip.x() - c0.x()) * u.x() + (ip.y() - c0.y()) * u.y()
+                    py = (ip.x() - c0.x()) * v.x() + (ip.y() - c0.y()) * v.y()
+                    kx = max(0.02, px / gx) if abs(gx) > 1e-6 else 1.0
+                    ky = max(0.02, py / gy) if abs(gy) > 1e-6 else 1.0
+                    N = []
+                    for q in S:
+                        qx = (q.x() - c0.x()) * u.x() + (q.y() - c0.y()) * u.y()
+                        qy = (q.x() - c0.x()) * v.x() + (q.y() - c0.y()) * v.y()
+                        N.append(QPointF(c0.x() + u.x() * qx * kx + v.x() * qy * ky,
+                                         c0.y() + u.y() * qx * kx + v.y() * qy * ky))
+                else:
+                    k = max(0.02, math.hypot(ip.x() - c0.x(), ip.y() - c0.y()) / r0)
+                    N = [QPointF(c0.x() + (q.x() - c0.x()) * k, c0.y() + (q.y() - c0.y()) * k) for q in S]
+            elif mode == "perspective":
+                hn = {0: 1, 1: 0, 2: 3, 3: 2}[idx]               # same top / bottom edge
+                vn = {0: 3, 3: 0, 1: 2, 2: 1}[idx]               # same left / right edge
+                du = dx * u.x() + dy * u.y()
+                dv = dx * v.x() + dy * v.y()
+                N[idx] = QPointF(S[idx].x() + dx, S[idx].y() + dy)
+                N[hn] = QPointF(S[hn].x() - du * u.x(), S[hn].y() - du * u.y())
+                N[vn] = QPointF(S[vn].x() - dv * v.x(), S[vn].y() - dv * v.y())
+            else:                                                # distort
+                N[idx] = QPointF(S[idx].x() + dx, S[idx].y() + dy)
+        else:                                                    # edge: 0 top, 1 right, 2 bottom, 3 left
+            a, b = idx, (idx + 1) % 4
+            horiz = idx in (0, 2)
+            if mode == "skew":                                   # slide the edge along its own direction
+                d = u if horiz else v
+                k = dx * d.x() + dy * d.y()
+                for i in (a, b):
+                    N[i] = QPointF(S[i].x() + k * d.x(), S[i].y() + k * d.y())
+            elif mode in ("distort", "perspective"):
+                for i in (a, b):
+                    N[i] = QPointF(S[i].x() + dx, S[i].y() + dy)
+            else:                                                # free: stretch this side only
+                nrm = v if horiz else u
+                k = dx * nrm.x() + dy * nrm.y()
+                for i in (a, b):
+                    N[i] = QPointF(S[i].x() + k * nrm.x(), S[i].y() + k * nrm.y())
+        t["pts"] = [N[0], N[1], N[3], N[2]]
 
     def crop_rect_img(self):
         r = self._crop
@@ -679,14 +834,7 @@ class ImageCanvas(QWidget):
             return
         ip = self.to_img(pos)
         if self.mode == self.TRANSFORM and self._tf is not None:
-            hit = self._tf_hit(pos)
-            t = self._tf
-            if hit == "move":
-                self._tf_drag = ("move", t["cx"], t["cy"], QPointF(ip))
-            elif hit == "rotate":
-                self._tf_drag = ("rotate", t["ang"], math.degrees(math.atan2(ip.y() - t["cy"], ip.x() - t["cx"])))
-            else:
-                self._tf_drag = ("scale", hit, t["sx"], t["sy"])
+            self._tf_drag = self._tf_start(self._tf_hit(pos), ip)
             return
         if self.mode == self.PICK:
             if 0 <= ip.x() < self._iw and 0 <= ip.y() < self._ih:

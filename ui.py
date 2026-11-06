@@ -479,8 +479,25 @@ class MainWindow(QMainWindow):
 
         def cur(fn):
             return lambda: self._with_current(fn)
-        sc("Left", lambda: self.carousel.prev())
-        sc("Right", lambda: self.carousel.next())
+        def arrow(dx, dy):
+            c = self.carousel.current()
+            if c is not None and c._tool == "transform":
+                c.tf_nudge(dx, dy)
+            elif dx < 0:
+                self.carousel.prev()
+            elif dx > 0:
+                self.carousel.next()
+        sc("Left", lambda: arrow(-1, 0))
+        sc("Right", lambda: arrow(1, 0))
+        sc("Up", lambda: arrow(0, -1))
+        sc("Down", lambda: arrow(0, 1))
+        sc("Shift+Left", lambda: arrow(-10, 0) if (self.carousel.current() is not None and self.carousel.current()._tool == "transform") else None)
+        sc("Shift+Right", lambda: arrow(10, 0) if (self.carousel.current() is not None and self.carousel.current()._tool == "transform") else None)
+        sc("Shift+Up", lambda: arrow(0, -10) if (self.carousel.current() is not None and self.carousel.current()._tool == "transform") else None)
+        sc("Shift+Down", lambda: arrow(0, 10) if (self.carousel.current() is not None and self.carousel.current()._tool == "transform") else None)
+        for keys, deg in (("[", -1), ("]", 1), ("Ctrl+[", -15), ("Ctrl+]", 15),
+                          ("Ctrl+Alt+Left", -90), ("Ctrl+Alt+Right", 90)):
+            sc(keys, lambda d=deg: self._with_current(lambda c: c.tf_rotate(d)))
         sc("Ctrl+V", self.paste)
         sc("Ctrl+C", cur(lambda c: c.copy_image()))
         sc("Ctrl+O", self.choose_files)

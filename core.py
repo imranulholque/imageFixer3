@@ -771,11 +771,18 @@ def photo_mask(img):
     gh, gw = -(-h // cell), -(-w // cell)
     pad = np.pad(nonpaper, ((0, gh * cell - h), (0, gw * cell - w)))
     dens = pad.reshape(gh, cell, gw, cell).mean((1, 3))
-    dense = Image.fromarray(((dens > 0.62) * 255).astype(np.uint8))
+    dense = Image.fromarray(((dens > 0.55) * 255).astype(np.uint8))
     dense = dense.filter(ImageFilter.MinFilter(3)).filter(ImageFilter.MaxFilter(3))
     g = np.asarray(dense) > 127
+    # skin: a face / neck / hands. Medium dark and warm; the pale gold of a watermark does not count
+    f = small.astype(np.float32)
+    R, G, B = f[..., 0], f[..., 1], f[..., 2]
+    Cb = 128 - 0.168736 * R - 0.331264 * G + 0.5 * B
+    Cr = 128 + 0.5 * R - 0.418688 * G - 0.081312 * B
+    ratio = lum / np.maximum(paper, 30.0)
+    skin = (Cb > 77) & (Cb < 127) & (Cr > 133) & (Cr < 173) & (ratio > 0.22) & (ratio < 0.80) & (R > G) & (G > B * 0.85)
     seen = np.zeros_like(g)
-    out = np.zeros((gh, gw), np.float32)
+    out = np.zeros((h, w), np.float32)
     for y in range(gh):
         for x in range(gw):
             if g[y, x] and not seen[y, x]:
@@ -788,15 +795,56 @@ def photo_mask(img):
                         if 0 <= ny < gh and 0 <= nx < gw and g[ny, nx] and not seen[ny, nx]:
                             seen[ny, nx] = True
                             stack.append((ny, nx))
-                ys = [c[0] for c in cells]
-                xs = [c[1] for c in cells]
+                ys = [c_[0] for c_ in cells]
+                xs = [c_[1] for c_ in cells]
                 box = (max(ys) - min(ys) + 1) * (max(xs) - min(xs) + 1)
-                if len(cells) >= max(6, 0.012 * gh * gw) and len(cells) / box >= 0.55:
-                    out[max(0, min(ys) - 1):max(ys) + 2, max(0, min(xs) - 1):max(xs) + 2] = 1.0
+                if not (len(cells) >= max(6, 0.012 * gh * gw) and len(cells) / box >= 0.55):
+                    continue
+                cy0, cy1, cx0, cx1 = min(ys), max(ys) + 1, min(xs), max(xs) + 1
+                # where inside this block is a person?  cells that are mostly skin, grouped; the photo is the
+                # rectangle around such a group (a watermark / text next to the photo is not part of it)
+                spad = np.pad(skin, ((0, gh * cell - h), (0, gw * cell - w)))
+                sd = spad.reshape(gh, cell, gw, cell).mean((1, 3))
+                sk = sd > 0.25
+                sk[:cy0], sk[cy1:], sk[:, :cx0], sk[:, cx1:] = False, False, False, False
+                sk = np.asarray(Image.fromarray((sk * 255).astype(np.uint8)).filter(ImageFilter.MaxFilter(3))) > 127
+                seen2 = np.zeros_like(sk)
+                for sy in range(gh):
+                    for sx in range(gw):
+                        if not sk[sy, sx] or seen2[sy, sx]:
+                            continue
+                        st2, cl = [(sy, sx)], []
+                        seen2[sy, sx] = True
+                        while st2:
+                            qy, qx = st2.pop()
+                            cl.append((qy, qx))
+                            for ny in (qy - 1, qy, qy + 1):
+                                for nx in (qx - 1, qx, qx + 1):
+                                    if 0 <= ny < gh and 0 <= nx < gw and sk[ny, nx] and not seen2[ny, nx]:
+                                        seen2[ny, nx] = True
+                                        st2.append((ny, nx))
+                        if len(cl) < 6:
+                            continue
+                        qys = [q[0] for q in cl]
+                        qxs = [q[1] for q in cl]
+                        y0 = max(cy0, min(qys) - 1) * cell
+                        y1 = min(h, min(cy1, max(qys) + 2) * cell)
+                        x0 = max(cx0, min(qxs) - 1) * cell
+                        x1 = min(w, min(cx1, max(qxs) + 2) * cell)
+                        npx = nonpaper[y0:y1, x0:x1] > 0.5
+                        while y1 - y0 > 8 and npx[0].mean() < 0.5:                 # trim paper-coloured rim
+                            y0 += 1; npx = nonpaper[y0:y1, x0:x1] > 0.5
+                        while y1 - y0 > 8 and npx[-1].mean() < 0.5:
+                            y1 -= 1; npx = nonpaper[y0:y1, x0:x1] > 0.5
+                        while x1 - x0 > 8 and npx[:, 0].mean() < 0.5:
+                            x0 += 1; npx = nonpaper[y0:y1, x0:x1] > 0.5
+                        while x1 - x0 > 8 and npx[:, -1].mean() < 0.5:
+                            x1 -= 1; npx = nonpaper[y0:y1, x0:x1] > 0.5
+                        out[y0:y1, x0:x1] = 1.0
     if not out.any():
         return np.zeros((H, W), np.float32)
     big = Image.fromarray((out * 255).astype(np.uint8)).resize((W, H), Image.Resampling.BILINEAR)
-    big = big.filter(ImageFilter.GaussianBlur(max(1.0, 0.004 * max(W, H))))
+    big = big.filter(ImageFilter.GaussianBlur(max(0.8, 0.0025 * max(W, H))))
     return np.asarray(big, dtype=np.float32) / 255.0
 
 
@@ -827,6 +875,9 @@ def remove_shadow(img, strength=1.0, progress=None, opts=None):
     wp = float(max(bp + 20.0, min(254.0, wp)))
     gam = (1.0 + 0.35 * s) * (1.0 + (o["ink"] - 50) / 100.0 * 0.9)
     out = np.empty_like(arr)
+    pm = photo_mask(img) if o.get("protect", 1) else None      # photos (faces ...): only the light is evened out
+    if pm is not None and float(pm.max()) < 0.05:
+        pm = None
     step = 600
     for y0 in range(0, H, step):
         y1 = min(H, y0 + step)
@@ -841,14 +892,17 @@ def remove_shadow(img, strength=1.0, progress=None, opts=None):
                 gray = np.clip((gray - 0.45) / 0.12 + 0.5, 0.0, 1.0)      # hard but anti-aliased threshold
             x = np.repeat(gray[..., None], 3, 2)
         res = np.clip(x * 255.0 + 0.5, 0, 255)
+        if pm is not None and float(pm[y0:y1].max()) > 0.01:
+            gp = np.minimum(1.0 + 0.6 * (g - 1.0), 1.3)           # soft correction: no contrast / ink changes
+            xp = np.minimum(arr[y0:y1].astype(np.float32) * gp, 255.0)
+            if o["mode"] in ("gray", "bw"):
+                xp = np.repeat((xp[..., 0] * 0.299 + xp[..., 1] * 0.587 + xp[..., 2] * 0.114)[..., None], 3, 2)
+            a_ = pm[y0:y1, :, None]
+            res = res * (1.0 - a_) + xp * a_
         out[y0:y1] = np.clip(res + 0.5, 0, 255).astype(np.uint8)
         if progress:
             progress(0.6 + 0.4 * y1 / H, "Applying")
     res = Image.fromarray(out)
-    if o.get("protect", 1):                              # photos (faces ...) are left exactly as they were
-        pm = photo_mask(img)
-        if float(pm.max()) > 0.05:
-            res = Image.composite(img, res, Image.fromarray((np.clip(pm, 0, 1) * 255).astype(np.uint8)))
     return res
 
 
@@ -950,6 +1004,34 @@ def _keep_dark_ink(reg, hole_img, res):
     return res * (1 - s) + gray * s
 
 
+def _ink_like(reg, F):
+    """Pixels that clearly differ from the paper estimate F (dark / coloured: writing, lines, stamps)."""
+    d = np.abs(reg.astype(np.float32) - F.astype(np.float32)).sum(2)
+    return d > 22.0
+
+
+def _grow_over_ink(reg, hole):
+    """The brush covers most of a letter, but its soft anti-aliased edge sticks out. Grow the hole 1-3 px, but only
+    over pixels that are ink-like, so it follows the strokes and does not eat paper."""
+    h0 = hole > 0.5
+    F = fill_background(reg, (~h0).astype(np.float32))
+    ink = _ink_like(reg, F)
+    cur = h0
+    for _ in range(3):
+        grow = np.asarray(Image.fromarray((cur * 255).astype(np.uint8)).filter(ImageFilter.MaxFilter(3))) > 127
+        cur = cur | (grow & ink)
+    out = cur.astype(np.float32)
+    return out, Image.fromarray((cur * 255).astype(np.uint8))
+
+
+def _paper_like(reg, valid):
+    """1 where a valid pixel looks like plain paper (not ink, not the dim halo around ink)."""
+    F = fill_background(reg, valid)
+    ink = _ink_like(reg, F)
+    ink = np.asarray(Image.fromarray((ink * 255).astype(np.uint8)).filter(ImageFilter.MaxFilter(5))) > 127
+    return (~ink).astype(np.float32)
+
+
 def erase_region(img, mask, offset=None, feather=1.5, keep_ink=False):
     """Removes what is under the mask and puts there what surrounds it, so it looks as if nothing was there.
     offset=(dx,dy): copy from that spot instead (clone / heal): the texture comes from (x+dx, y+dy),
@@ -966,7 +1048,11 @@ def erase_region(img, mask, offset=None, feather=1.5, keep_ink=False):
     reg = full[box[1]:box[3], box[0]:box[2]].copy()
     hole_img = hard.crop(box).filter(ImageFilter.MaxFilter(5))
     hole = np.asarray(hole_img, dtype=np.float32) / 255.0
+    if offset is None:
+        hole, hole_img = _grow_over_ink(reg, hole)           # the soft edge of the writing goes too: no grey ghost
     valid = 1.0 - hole
+    if offset is None:                                       # only real paper counts for the fill, never ink / halo
+        valid = valid * _paper_like(reg, valid)
     F = fill_background(reg, valid).astype(np.float32)
 
     # soft edge: grow a little, then blur, so nothing of the old picture is left at the border
@@ -986,7 +1072,11 @@ def erase_region(img, mask, offset=None, feather=1.5, keep_ink=False):
             h = hf[ring]
             sig = 1.4826 * np.median(np.abs(h - np.median(h, axis=0)), axis=0)     # robust: text edges do not count
             rng = np.random.default_rng(12345)
-            res = F + rng.standard_normal(F.shape).astype(np.float32) * sig * 0.9
+            nz = rng.standard_normal(F.shape).astype(np.float32)
+            p_ = np.pad(nz, ((1, 1), (1, 1), (0, 0)), mode="edge")             # slight blur: grain, not white noise
+            nz = (2 * nz + p_[:-2, 1:-1] + p_[2:, 1:-1] + p_[1:-1, :-2] + p_[1:-1, 2:]) / 6.0
+            nz /= max(1e-3, float(nz.std()))
+            res = F + nz * sig * 0.9
     else:
         dx, dy = int(round(offset[0])), int(round(offset[1]))
         ys = np.clip(np.arange(box[1], box[3]) + dy, 0, H - 1)
@@ -1283,6 +1373,60 @@ def transform_region(img, mask, cx, cy, sx, sy, ang_cw, soft=1.0):
     newmask = Image.new("L", img.size, 0)
     newmask.paste(patch.split()[3], (px, py))
     return base, newmask
+
+
+def homography(src, dst):
+    """3x3 matrix H with  dst ~ H @ src  for 4 point pairs."""
+    A, b = [], []
+    for (x, y), (u, v) in zip(src, dst):
+        A.append([x, y, 1, 0, 0, 0, -u * x, -u * y]); b.append(u)
+        A.append([0, 0, 0, x, y, 1, -v * x, -v * y]); b.append(v)
+    h = np.linalg.solve(np.array(A, np.float64), np.array(b, np.float64))
+    return np.append(h, 1.0).reshape(3, 3)
+
+
+def warp_region(img, mask, grid, n, soft=1.0):
+    """Perspective / distort / skew / warp of the selected part.
+    grid = (n+1)*(n+1) points (x, y) in picture pixels, row by row: where the corners of the selection (n = 1) or
+    the points of a 4x4 net (n = 3) are now.  The selected part is bent onto them; the old place is filled from the
+    surroundings.  Returns (new picture, new mask 'L')."""
+    hard = mask.point(lambda v: 255 if v > 16 else 0)
+    bbox = hard.getbbox()
+    if bbox is None:
+        return img, mask
+    base = erase_region(img, mask, None, soft).convert("RGBA")
+    patch = img.crop(bbox).convert("RGBA")
+    patch.putalpha(mask.crop(bbox))
+    pw, ph = patch.size
+    W, H = img.size
+    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    g = [[grid[i * (n + 1) + j] for j in range(n + 1)] for i in range(n + 1)]
+    for i in range(n):
+        for j in range(n):
+            sx0, sx1 = j * pw / n, (j + 1) * pw / n
+            sy0, sy1 = i * ph / n, (i + 1) * ph / n
+            dq = [g[i][j], g[i][j + 1], g[i + 1][j + 1], g[i + 1][j]]
+            xs = [p[0] for p in dq]; ys = [p[1] for p in dq]
+            bx0, by0 = max(0, int(math.floor(min(xs)))), max(0, int(math.floor(min(ys))))
+            bx1, by1 = min(W, int(math.ceil(max(xs)))), min(H, int(math.ceil(max(ys))))
+            if bx1 - bx0 < 1 or by1 - by0 < 1:
+                continue
+            m = 0 if n == 1 else 2                       # a little overlap so the cells have no seams
+            cx0, cy0 = max(0, int(sx0) - m), max(0, int(sy0) - m)
+            cx1, cy1 = min(pw, int(math.ceil(sx1)) + m), min(ph, int(math.ceil(sy1)) + m)
+            crop = patch.crop((cx0, cy0, cx1, cy1))
+            sq = [(sx0 - cx0, sy0 - cy0), (sx1 - cx0, sy0 - cy0), (sx1 - cx0, sy1 - cy0), (sx0 - cx0, sy1 - cy0)]
+            dloc = [(p[0] - bx0, p[1] - by0) for p in dq]
+            try:
+                Hm = homography(dloc, sq)                # output -> source, what PIL wants
+            except np.linalg.LinAlgError:
+                continue
+            Hm = Hm / Hm[2, 2]
+            co = (Hm[0, 0], Hm[0, 1], Hm[0, 2], Hm[1, 0], Hm[1, 1], Hm[1, 2], Hm[2, 0], Hm[2, 1])
+            piece = crop.transform((bx1 - bx0, by1 - by0), Image.Transform.PERSPECTIVE, co, Image.Resampling.BICUBIC)
+            layer.alpha_composite(piece, (bx0, by0))
+    out = Image.alpha_composite(base, layer).convert("RGB")
+    return out, layer.split()[3]
 
 
 def remove_stamp(img, mask):
