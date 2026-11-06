@@ -52,3 +52,12 @@ KEYS
 SETTINGS (top right): start with Windows, Send to entry, save folder.
 Closing the window keeps the program in the tray; use the tray icon -> Exit to quit.
 Problems are written to  %APPDATA%\ImageFixer\error.log
+
+NEW (round 3)
+- Shadow options stay live after one-click removal; "Keep photos / faces untouched" is on by default.
+- Quick select removed. Freehand = real lasso (closes itself). Transform has a round rotate handle.
+- Color picking is hue/chroma aware (red no longer takes dark pixels with a faint red cast).
+- Deleting a stamp keeps the dark signature under it ("Keep dark writing under a removed stamp").
+- "Apply last setting to all pictures" copies only the last changed setting.
+- Phone: Local network (plain http://IP:PORT, 4-digit port box) and Internet (only while that tab is open).
+  On the local network no secret link is needed; the Internet link keeps a secret path.

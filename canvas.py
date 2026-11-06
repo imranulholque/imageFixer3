@@ -304,6 +304,8 @@ class ImageCanvas(QWidget):
                              ("br", hw, hh), ("b", 0, hh), ("bl", -hw, hh), ("l", -hw, 0)):
             ip = QPointF(t["cx"] + lx * ca - ly * sa, t["cy"] + lx * sa + ly * ca)
             out.append((name, self.to_wid(ip)))
+        top = out[1][1]                                  # rotate handle: a little circle above the top edge
+        out.append(("rot", QPointF(top.x() + 34.0 * sa, top.y() - 34.0 * ca)))
         return out
 
     def _paint_transform(self, p):
@@ -324,13 +326,19 @@ class ImageCanvas(QWidget):
         p.drawPolygon(poly)
         p.setPen(QPen(QColor("#4f46e5"), 1.5))
         p.setBrush(QBrush(QColor("white")))
-        for _, w in hs:
-            p.drawRect(QRectF(w.x() - 5, w.y() - 5, 10, 10))
+        for name, w in hs:
+            if name == "rot":
+                p.setPen(QPen(QColor(255, 255, 255), 1.4))
+                p.drawLine(hs[1][1], w)
+                p.setPen(QPen(QColor("#4f46e5"), 1.5))
+                p.drawEllipse(w, 7.0, 7.0)
+            else:
+                p.drawRect(QRectF(w.x() - 5, w.y() - 5, 10, 10))
 
     def _tf_hit(self, pos):
         for name, w in self._tf_corners():
-            if abs(pos.x() - w.x()) <= 9 and abs(pos.y() - w.y()) <= 9:
-                return name
+            if abs(pos.x() - w.x()) <= 10 and abs(pos.y() - w.y()) <= 10:
+                return "rotate" if name == "rot" else name
         t = self._tf
         ip = self.to_img(pos)
         a = -math.radians(t["ang"])
@@ -455,8 +463,11 @@ class ImageCanvas(QWidget):
                                   Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
                     if len(pts) > 1:
                         p.drawPolyline(QPolygonF(pts))
-                elif kind == "lasso":
-                    p.drawPolygon(QPolygonF(pts)) if len(pts) > 2 else p.drawPolyline(QPolygonF(pts))
+                elif kind == "lasso":                      # free pen line; it closes by itself when you let go
+                    p.setPen(QPen(QColor(0, 0, 0, 200) if width > 2 else QColor(255, 255, 255, 255), width,
+                                  Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+                    if len(pts) > 1:
+                        p.drawPolyline(QPolygonF(pts))
                 else:
                     r = QRectF(pts[0], pts[-1]).normalized()
                     if kind == "ellipse":
@@ -495,7 +506,9 @@ class ImageCanvas(QWidget):
                 p.setPen(QPen(QColor(255, 255, 255), 1.6, Qt.PenStyle.DashLine))
                 p.setBrush(QBrush(red))
                 if kind == "lasso":
-                    p.drawPolygon(QPolygonF(pts))
+                    p.setBrush(Qt.BrushStyle.NoBrush)
+                    if len(pts) > 1:
+                        p.drawPolyline(QPolygonF(pts))
                 else:
                     rect = QRectF(pts[0], pts[-1]).normalized()
                     if kind == "rect":

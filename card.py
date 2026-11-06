@@ -11,7 +11,7 @@ import numpy as np
 from PIL import Image
 from PySide6.QtCore import QMimeData, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QDrag, QImage, QPixmap
-from PySide6.QtWidgets import (QApplication, QButtonGroup, QColorDialog, QFrame, QHBoxLayout, QLabel, QMenu,
+from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QColorDialog, QFrame, QHBoxLayout, QLabel, QMenu,
                                QPushButton, QScrollArea, QSizePolicy, QSlider, QStackedWidget, QToolButton,
                                QVBoxLayout, QWidget)
 
@@ -48,11 +48,11 @@ HINTS = {
     "brush": "Paint the area to select.  Shift = add,  Alt = subtract.",
     "rect": "Drag a box.  Shift = add,  Alt = subtract.",
     "ellipse": "Drag an ellipse.  Shift = add,  Alt = subtract.",
-    "lasso": "Draw around an area (it closes when you let go).  Shift = add,  Alt = subtract.",
+    "lasso": "Draw freely around an area like with a pen. When you let go it closes by itself.  Shift = add,  Alt = subtract.",
     "color": "Click a color: every place with that color is selected (Tolerance = how wide).",
     "move": "Drag inside the selection to move it (old place is filled from around).  Alt + drag = copy.",
     "copy": "Drag the selection: a copy is placed there, the original stays.",
-    "transform": "Drag a handle to resize (corner keeps shape, Shift = free), drag outside to rotate, inside to move.  "
+    "transform": "Drag inside = move.  Square handles = resize (corner keeps shape, Shift = free).  Round handle on top (or drag outside) = rotate.  "
                  "Enter = apply,  Esc = cancel.",
     "crop": "Drag the box or its handles, then Apply (Enter).",
     "persp": "Drag the 4 corner points onto the 4 corners of the page, then Apply (Enter).",
@@ -63,6 +63,9 @@ HINTS = {
 }
 COLOR_HINT = ("Eyedropper: click a color in the picture.\n"
               "Lower than 100%: it fades into the paper.  Higher: stronger.  'Change to' recolors it.")
+LOOK_TITLES = {"bright": "Brightness", "contrast": "Contrast", "sat": "Saturation", "hue": "Hue", "warm": "Warmth",
+               "sharp": "Text sharpness", "objs": "Line & shape sharpness", "detail": "Faint strokes",
+               "dark": "Text darkness", "clear": "Clean specks"}
 SHAPES = {"erase_brush": "brush", "erase_rect": "rect", "erase_ellipse": "ellipse", "erase_lasso": "lasso"}
 
 
@@ -543,6 +546,9 @@ class Card(QWidget):
         self._gest = False
         self.ops = 0
         self._shadow_done = False
+        self.shadow_src = None                     # picture before shadow removal: lets the shadow options be changed later
+        self.last_action = None                    # the last setting changed: what 'apply to all' copies
+        self.keep_ink = True
         self._pending = None
         self._focus_id = None
         self._hl_key = None
@@ -575,6 +581,10 @@ class Card(QWidget):
         self._gest_timer.setSingleShot(True)
         self._gest_timer.setInterval(700)
         self._gest_timer.timeout.connect(self._end_gesture)
+        self._shadow_timer = QTimer(self)          # shadow sliders: re-apply live, a moment after the last move
+        self._shadow_timer.setSingleShot(True)
+        self._shadow_timer.setInterval(450)
+        self._shadow_timer.timeout.connect(lambda: self._auto_shadow(live=True))
         self._build()
 
     # ------------------------------------------------------------------ ui helpers
@@ -694,9 +704,9 @@ class Card(QWidget):
         self.btnPick.setToolTip("Click a color in the picture to change only that color (I)")
         T = self.choose_tool
         self.menuSelect = self._menu_button("Select", [
-            ("Quick select      W", lambda: T("quick")), ("Brush select      B", lambda: T("brush")),
+            ("Brush select      B", lambda: T("brush")),
             ("Box      M", lambda: T("rect")), ("Ellipse", lambda: T("ellipse")),
-            ("Freehand      L", lambda: T("lasso")), ("Color range  (click a color)", lambda: T("color")),
+            ("Freehand (draw around)      L", lambda: T("lasso")), ("Color range  (click a color)      W", lambda: T("color")),
             None, ("Select all      Ctrl+A", self.select_all), ("Deselect      Ctrl+D", self.deselect),
             ("Inverse      Ctrl+Shift+I", self.invert_selection)], "Ways to select a part of the picture")
         self.menuMove = self._menu_button("Move", [
@@ -924,7 +934,7 @@ class Card(QWidget):
         gl.addWidget(self._look_row("warm", "Warmth", -100, 100, ("cooler", "", "warmer"),
                                     "Cooler = bluer, warmer = more yellow / red.", ""))
         lay.addWidget(g)
-        g2, gl2 = self._group_box("Fill color")
+        g2, gl2 = self._group_box("Fill & delete")
         fr = QHBoxLayout()
         self.btnPickFill = QPushButton("Pick color...")
         self.btnPickFill.setToolTip("Choose the color used by 'Fill selection'")
@@ -938,6 +948,12 @@ class Card(QWidget):
         self.btnDelete.setToolTip("Remove what is selected; the place is filled from its surroundings")
         gl2.addWidget(self.btnFill)
         gl2.addWidget(self.btnDelete)
+        self.chkInk = QCheckBox("Keep dark writing under a removed stamp")
+        self.chkInk.setChecked(True)
+        self.chkInk.setToolTip("Deleting a coloured stamp on top of a black signature: the signature is kept\n"
+                               "(drawn from what is still visible) instead of leaving a white gap.")
+        self.chkInk.toggled.connect(lambda on: setattr(self, "keep_ink", bool(on)))
+        gl2.addWidget(self.chkInk)
         self._paint_swatch()
         lay.addWidget(g2)
         self.colors = ColorList()
@@ -969,7 +985,7 @@ class Card(QWidget):
                 ("scale", "Shadow size", ("small", "", "large"),
                  "Small = follows small shadows (a pen, folds). Large = only wide, soft shadows.")):
             row = SliderRow(title, 0, 100, self.shadow_opts[key], caps, tip)
-            row.changed.connect(lambda v, k=key: self.shadow_opts.__setitem__(k, int(v)))
+            row.changed.connect(lambda v, k=key: self._shadow_opt(k, int(v)))
             self.shadowRows[key] = row
             gl.addWidget(row)
         mrow = QHBoxLayout()
@@ -984,9 +1000,14 @@ class Card(QWidget):
             self.modeOut.addButton(b, i)
             mrow.addWidget(b)
         self.modeOut.button(0).setChecked(True)
-        self.modeOut.idClicked.connect(lambda i: self.shadow_opts.__setitem__("mode", ("color", "gray", "bw")[i]))
+        self.modeOut.idClicked.connect(lambda i: self._shadow_opt("mode", ("color", "gray", "bw")[i]))
         gl.addWidget(self._label("Result"))
         gl.addLayout(mrow)
+        self.chkProtect = QCheckBox("Keep photos / faces untouched")
+        self.chkProtect.setChecked(True)
+        self.chkProtect.setToolTip("Photos (a face on an ID card ...) are found automatically and left as they are.")
+        self.chkProtect.toggled.connect(lambda on: self._shadow_opt("protect", 1 if on else 0))
+        gl.addWidget(self.chkProtect)
         lay.addWidget(g)
         lay.addStretch(1)
         self.stackPages.addWidget(pg)
@@ -1028,8 +1049,9 @@ class Card(QWidget):
             gl.addWidget(w)
         lay.addWidget(g)
         g, gl = self._group_box("Share")
-        self.btnApplyAll = QPushButton("Same settings for all pictures")
-        self.btnApplyAll.setToolTip("Gives every picture the same colors / light / clarity / shadow settings as this one.")
+        self.btnApplyAll = QPushButton("Apply last setting to all pictures")
+        self.btnApplyAll.setToolTip("Copies ONLY the setting you changed last (one slider, the shadow removal, or the picked colors) "
+                                   "to the other pictures. Crop, erase, move ... are never copied.")
         self.btnCopy = QPushButton("Copy picture  (Ctrl+C)")
         self.btnCopy.setToolTip("Copy this picture (with your edits) - then paste it anywhere")
         self.btnDrag = DragHandle(self)
@@ -1293,12 +1315,12 @@ class Card(QWidget):
     # ------------------------------------------------- history (undo / redo)
     def _snap(self):
         return {"base": self.base, "adjs": copy.deepcopy(self.adjs), "look": dict(self.look),
-                "shadow": self._shadow_done, "sel": self.sel, "ops": self.ops}
+                "shadow": self._shadow_done, "sel": self.sel, "ops": self.ops, "shadow_src": self.shadow_src}
 
     def _push_undo(self, st):
         self.undo.append(st)
         self.redo = []
-        while len(self.undo) > 80 or len({id(e["base"]) for e in self.undo}) > 8:
+        while len(self.undo) > 80 or len({id(x) for e in self.undo for x in (e["base"], e.get("shadow_src")) if x is not None}) > 8:
             self.undo.pop(0)
         self._update_buttons()
 
@@ -1314,7 +1336,7 @@ class Card(QWidget):
         if not self._gest:
             self._gest = True
             self._push_undo(self._cur_snap if self._cur_snap is not None else self._snap())
-        self._gest_timer.start()
+        self._gest_timer.start(700)
 
     def _end_gesture(self):
         self._gest = False
@@ -1325,6 +1347,9 @@ class Card(QWidget):
             row.set_value(self.look[k])
         for k, row in self.shadowRows.items():
             row.set_value(self.shadow_opts[k])
+        self.chkProtect.blockSignals(True)
+        self.chkProtect.setChecked(bool(self.shadow_opts.get("protect", 1)))
+        self.chkProtect.blockSignals(False)
         i = ("color", "gray", "bw").index(self.shadow_opts.get("mode", "color"))
         self.modeOut.button(i).setChecked(True)
 
@@ -1335,6 +1360,7 @@ class Card(QWidget):
         self._shadow_done = st["shadow"]
         self.sel = st.get("sel")
         self.ops = st["ops"]
+        self.shadow_src = st.get("shadow_src")
         self._sel_ver += 1
         self.colors.rebuild(self.adjs)
         self._sync_sliders()
@@ -1384,7 +1410,7 @@ class Card(QWidget):
         self.undo.append(self._snap())
         self._goto(self.redo.pop())
 
-    def _edit_base(self, label, make, keep_sel=True, refit=False, after=None, msg=None):
+    def _edit_base(self, label, make, keep_sel=True, refit=False, after=None, msg=None, shadow_src=None, merge=False):
         """Change the picture itself (erase, crop, rotate, move ...) in a worker thread, then show it.
         make(progress) -> new PIL image, or (new image, new selection)."""
         adjs = copy.deepcopy(self.adjs)
@@ -1401,8 +1427,15 @@ class Card(QWidget):
 
         def done(r):
             new, sel_out, v = r
-            self._checkpoint()
-            self.ops += 1
+            if merge and self._gest:                 # a live shadow slider drag is ONE undo step
+                self._gest_timer.start(2500)
+            else:
+                self._checkpoint()
+                self.ops += 1
+                if merge:
+                    self._gest = True
+                    self._gest_timer.start(2500)
+            self.shadow_src = shadow_src
             self.base = new
             self.sel = sel_out
             self._sel_ver += 1
@@ -1415,6 +1448,29 @@ class Card(QWidget):
         self._job(label, work, done)
 
     # ------------------------------------------- settings shared by all pictures
+    def apply_action(self, act):
+        """'Apply last setting to all': copies only the LAST changed setting from another picture (never crop, erase ...)."""
+        self.ensure_loaded()
+        if not self._loaded:
+            return
+        k = act["kind"]
+        if k == "look":
+            self._checkpoint()
+            self.look[act["key"]] = act["value"]
+            self._sync_sliders()
+            self._timer.start()
+            self._touch()
+        elif k == "adjs":
+            self._checkpoint()
+            self.adjs = copy.deepcopy(act["adjs"])
+            self.colors.rebuild(self.adjs)
+            self._timer.start()
+            self._touch()
+        elif k == "shadow":
+            self.shadow_opts = dict(act["opts"])
+            self._sync_sliders()
+            self._auto_shadow()
+
     def settings(self):
         return {"adjs": copy.deepcopy(self.adjs), "look": dict(self.look), "shadow_opts": dict(self.shadow_opts),
                 "shadow": self._shadow_done}
@@ -1470,7 +1526,12 @@ class Card(QWidget):
         self._job("Applying settings to " + self.name, work, done)
 
     # -------------------------------------------------------------- look / colours
+    def _set_last(self, act):
+        self.last_action = act
+        self.btnApplyAll.setText("Apply last setting to all  (%s)" % act["label"])
+
     def _on_adj_changed(self):
+        self._set_last({"kind": "adjs", "adjs": copy.deepcopy(self.adjs), "label": "colors"})
         self._begin_change()
         self._timer.start()
         self._touch()
@@ -1478,6 +1539,7 @@ class Card(QWidget):
     def _set_look(self, key, v):
         self._begin_change()
         self.look[key] = int(v)
+        self._set_last({"kind": "look", "key": key, "value": int(v), "label": LOOK_TITLES.get(key, key)})
         self._timer.start()
         self._touch()
 
@@ -1689,13 +1751,15 @@ class Card(QWidget):
         """Delete key: what is selected disappears, the place is filled from its surroundings."""
         if not self._loaded:
             return
+        if self._tool == "transform":                # Delete while transforming: the object goes away
+            self._go_move()
         if self.sel is None:
             self._warn("Nothing is selected. Select something first (Select menu), or pick a color and press 'Select this color'.")
             return
-        sel, base = self.sel, self.base
+        sel, base, ink = self.sel, self.base, self.keep_ink
 
         def make(progress):
-            return core.erase_region(base, self._mask_img(sel, base.size), None, 2.0)
+            return core.erase_region(base, self._mask_img(sel, base.size), None, 2.0, ink)
         self._edit_base("Deleting", make, msg="Deleted. Ctrl+Z brings it back.")
 
     def fill_selection(self):
@@ -1810,7 +1874,7 @@ class Card(QWidget):
                 self.canvas.set_clone(self.clone_src, (self.clone_off[0] * s, self.clone_off[1] * s))
             offset = self.clone_off
         size = self.sizeSlider.value()
-        base, sel = self.base, self.sel
+        base, sel, ink = self.base, self.sel, self.keep_ink
 
         def make(progress):
             mask = core.make_mask(base.size, kind, payload, brush=size)
@@ -1818,7 +1882,7 @@ class Card(QWidget):
                 m = np.asarray(mask, dtype=np.float32) * core.resize_mask(sel, base.size)
                 mask = Image.fromarray(np.clip(m, 0, 255).astype(np.uint8))
             feather = max(1.5, 0.08 * size) if kind == "brush" else 2.0
-            return core.erase_region(base, mask, offset, feather)
+            return core.erase_region(base, mask, offset, feather, ink)
         self._edit_base("Erasing", make)
 
     def _apply_crop(self):
@@ -1868,23 +1932,33 @@ class Card(QWidget):
         base = self.base
         self._edit_base("Rotating", lambda progress: core.rotate_image(base, deg_ccw), keep_sel=False, refit=True)
 
-    def _auto_shadow(self):
+    def _auto_shadow(self, live=False):
+        """Shadow removal. It always starts from the picture BEFORE the first shadow removal, so the options
+        (strength, whiteness ...) can be changed afterwards and the result follows - nothing is applied twice."""
         if not self._loaded:
             return
-        base, sel = self.base, self.sel
+        if live and self.shadow_src is None:
+            return
+        src = self.shadow_src if self.shadow_src is not None else self.base
+        sel = self.sel
         opts = dict(self.shadow_opts)
 
         def make(progress):
-            new = core.remove_shadow(base, opts["strength"] / 100.0, progress, opts)
+            new = core.remove_shadow(src, opts["strength"] / 100.0, progress, opts)
             if sel is not None:                      # only the selected part
-                new = Image.composite(new, base, self._mask_img(sel, base.size))
+                new = Image.composite(new, src, self._mask_img(sel, src.size))
             return new
 
         def after():
-            if sel is None:
-                self._shadow_done = True
-        self._edit_base("Removing shadows", make, after=after,
-                        msg="Shadow removed. Ctrl+Z undoes it; change the options in the Shadow tab and click again.")
+            self._shadow_done = sel is None
+        self._set_last({"kind": "shadow", "opts": opts, "label": "shadow removal"})
+        self._edit_base("Removing shadows", make, after=after, shadow_src=src, merge=live,
+                        msg=None if live else "Shadow removed. Move the sliders to change it, Ctrl+Z to undo.")
+
+    def _shadow_opt(self, key, v):
+        self.shadow_opts[key] = v
+        if self.shadow_src is not None:              # shadow already applied: follow the slider live
+            self._shadow_timer.start()
 
     def reset_image(self):
         if not self._loaded:
@@ -1903,6 +1977,7 @@ class Card(QWidget):
         self.sel = None
         self._sel_ver += 1
         self._shadow_done = False
+        self.shadow_src = None
         self._pending = None
         self.colors.rebuild(self.adjs)
         self._sync_sliders()
@@ -2016,3 +2091,4 @@ class Card(QWidget):
         except Exception:
             pass
         d.exec(Qt.DropAction.CopyAction, Qt.DropAction.CopyAction)     # copy only: never moves the original file
+

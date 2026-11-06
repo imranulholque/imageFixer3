@@ -500,7 +500,7 @@ class MainWindow(QMainWindow):
         sc("Enter", cur(lambda c: c.apply_pending()))
         sc("Escape", cur(lambda c: c.cancel_pending()))
         # tools (single letters, like in a picture editor)
-        for key, tool in (("V", "move"), ("M", "rect"), ("L", "lasso"), ("W", "quick"), ("B", "brush"),
+        for key, tool in (("V", "move"), ("M", "rect"), ("L", "lasso"), ("W", "color"), ("B", "brush"),
                           ("E", "erase_brush"), ("C", "crop"), ("I", "pick"), ("H", "view")):
             sc(key, cur(lambda c, t=tool: c.choose_tool(t)))
         # zoom
@@ -525,7 +525,10 @@ class MainWindow(QMainWindow):
             else:
                 self.progress.setRange(0, 1000)
                 self.progress.setValue(int(frac * 1000))
+            self._job_text = text
             self.lblStatus.setText(text)
+        elif self.lblStatus.text() == getattr(self, "_job_text", None):
+            self.lblStatus.setText("")                  # the work is finished: remove "Selecting" etc.
 
     def _busy(self):
         if self.runner.busy:
@@ -735,12 +738,15 @@ class MainWindow(QMainWindow):
         if not others:
             self.say("There is no other picture yet.")
             return
-        st = card.settings()
+        act = card.last_action
+        if act is None:
+            self.say("Change a setting first (a slider, shadow removal ...). Then this button copies that one setting.")
+            return
         for c in others:
-            c.apply_settings(st)
+            c.apply_action(act)
         self._refresh_counts()
-        self.say("Same colors / light / clarity / shadow settings given to %d other picture(s). "
-                 "From now on a change stays on the picture you change." % len(others))
+        self.say("Last setting (%s) applied to %d other picture(s). Crop, erase and other edits were not touched."
+                 % (act["label"], len(others)))
 
     def _card(self, uid):
         for c in self.carousel.cards:

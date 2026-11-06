@@ -152,10 +152,49 @@ def _neutral_factor(lab):
     return 1.0 - _smooth((C - NEUTRAL_C) / NEUTRAL_SOFT)
 
 
+def color_match(lab, t, tol):
+    """Pixels that have the SAME COLOUR as target t (Lab), whatever their lightness: same hue, enough colour strength.
+    A black pixel with a hint of red, or a grey one, is NOT matched (it has too little colour)."""
+    Ct = math.hypot(t[1], t[2])
+    a, b = lab[..., 1], lab[..., 2]
+    C = np.hypot(a, b)
+    dh = np.abs((np.arctan2(b, a) - math.atan2(t[2], t[1]) + math.pi) % (2 * math.pi) - math.pi)
+    dh = np.degrees(dh)
+    hw = 12.0 + tol * 0.5
+    hue_g = 1.0 - _smooth((dh - hw * 0.75) / (hw * 0.5))
+    chroma_g = _smooth((C - 0.32 * Ct) / (0.25 * Ct))
+    dL = np.abs(lab[..., 0] - t[0])
+    light_g = 1.0 - _smooth((dL - tol * 1.6) / (tol * 0.8))
+    return (hue_g * chroma_g * light_g).astype(np.float32)
+
+
+def color_match(lab, t, tol):
+    """0..1: how much each pixel IS colour t=(L,a,b).  Hue and chroma decide first, lightness counts less, and
+    grey / black pixels (even with a faint colour cast) never match a strong colour, so selecting red does not
+    take the black writing with it."""
+    L, a, b = lab[..., 0], lab[..., 1], lab[..., 2]
+    da, db = a - t[1], b - t[2]
+    dL = (L - t[0]) * 0.5
+    d = np.sqrt(dL * dL + da * da + db * db)
+    inner, outer = tol * 0.7, tol * 1.3
+    m = 1.0 - _smooth((d - inner) / (outer - inner))
+    Ct = math.hypot(t[1], t[2])
+    if Ct > 18.0:
+        C = np.hypot(a, b)
+        m = m * _smooth((C - 0.2 * Ct) / (0.2 * Ct))                      # must be coloured too
+        cosang = (a * t[1] + b * t[2]) / (C * Ct + 1e-3)
+        dh = np.degrees(np.arccos(np.clip(cosang, -1.0, 1.0)))
+        m = m * (1.0 - _smooth((dh - (22.0 + tol * 0.5)) / 15.0))            # same hue
+    return m.astype(np.float32)
+
+
 def adj_mask(lab, a):
     """float32 0..1 : how strongly each pixel belongs to this colour / shade (no feather)."""
     if a["type"] == "color":
         t = a["target"]
+        Ct = math.hypot(t[1], t[2])
+        if Ct >= 22.0:
+            return color_match(lab, t, a["tol"])
         dL = (lab[..., 0] - t[0]) * 0.8
         da = lab[..., 1] - t[1]
         db = lab[..., 2] - t[2]
@@ -709,7 +748,59 @@ def paper_light(small, progress=None, kfrac=0.022):
     return np.maximum(bg * 0.985, 30.0)
 
 
-SHADOW_DEFAULTS = {"strength": 100, "white": 50, "ink": 50, "scale": 50, "mode": "color"}
+def photo_mask(img):
+    """Where are photos (a face on an ID card, a picture in a form)?  float32 mask (picture size, 0..1).
+    A photo is a big, dense, roughly rectangular area that is not paper-white; writing and stamps are thin."""
+    W, H = img.size
+    sc = min(1.0, 400.0 / max(W, H))
+    small = np.asarray(img.resize((max(16, round(W * sc)), max(16, round(H * sc))), Image.Resampling.BOX)) \
+        if sc < 1.0 else np.asarray(img)
+    h, w = small.shape[:2]
+    lum = small.astype(np.float32).mean(2)
+    # paper level: 90th percentile in big blocks, then the lightest neighbour block (a photo fills whole blocks)
+    gb = 6
+    paper = np.zeros((gb, gb), np.float32)
+    for i in range(gb):
+        for j in range(gb):
+            blk = lum[i * h // gb:(i + 1) * h // gb, j * w // gb:(j + 1) * w // gb]
+            paper[i, j] = np.percentile(blk, 90) if blk.size else 255.0
+    paper = np.asarray(Image.fromarray(paper).filter(ImageFilter.MaxFilter(3)), dtype=np.float32)
+    paper = _up(paper, h, w)
+    nonpaper = (lum / np.maximum(paper, 30.0) < 0.88).astype(np.float32)
+    cell = 12
+    gh, gw = -(-h // cell), -(-w // cell)
+    pad = np.pad(nonpaper, ((0, gh * cell - h), (0, gw * cell - w)))
+    dens = pad.reshape(gh, cell, gw, cell).mean((1, 3))
+    dense = Image.fromarray(((dens > 0.62) * 255).astype(np.uint8))
+    dense = dense.filter(ImageFilter.MinFilter(3)).filter(ImageFilter.MaxFilter(3))
+    g = np.asarray(dense) > 127
+    seen = np.zeros_like(g)
+    out = np.zeros((gh, gw), np.float32)
+    for y in range(gh):
+        for x in range(gw):
+            if g[y, x] and not seen[y, x]:
+                stack, cells = [(y, x)], []
+                seen[y, x] = True
+                while stack:
+                    cy, cx = stack.pop()
+                    cells.append((cy, cx))
+                    for ny, nx in ((cy + 1, cx), (cy - 1, cx), (cy, cx + 1), (cy, cx - 1)):
+                        if 0 <= ny < gh and 0 <= nx < gw and g[ny, nx] and not seen[ny, nx]:
+                            seen[ny, nx] = True
+                            stack.append((ny, nx))
+                ys = [c[0] for c in cells]
+                xs = [c[1] for c in cells]
+                box = (max(ys) - min(ys) + 1) * (max(xs) - min(xs) + 1)
+                if len(cells) >= max(6, 0.012 * gh * gw) and len(cells) / box >= 0.55:
+                    out[max(0, min(ys) - 1):max(ys) + 2, max(0, min(xs) - 1):max(xs) + 2] = 1.0
+    if not out.any():
+        return np.zeros((H, W), np.float32)
+    big = Image.fromarray((out * 255).astype(np.uint8)).resize((W, H), Image.Resampling.BILINEAR)
+    big = big.filter(ImageFilter.GaussianBlur(max(1.0, 0.004 * max(W, H))))
+    return np.asarray(big, dtype=np.float32) / 255.0
+
+
+SHADOW_DEFAULTS = {"strength": 100, "white": 50, "ink": 50, "scale": 50, "mode": "color", "protect": 1}
 
 
 def remove_shadow(img, strength=1.0, progress=None, opts=None):
@@ -749,10 +840,16 @@ def remove_shadow(img, strength=1.0, progress=None, opts=None):
             if o["mode"] == "bw":
                 gray = np.clip((gray - 0.45) / 0.12 + 0.5, 0.0, 1.0)      # hard but anti-aliased threshold
             x = np.repeat(gray[..., None], 3, 2)
-        out[y0:y1] = np.clip(x * 255.0 + 0.5, 0, 255).astype(np.uint8)
+        res = np.clip(x * 255.0 + 0.5, 0, 255)
+        out[y0:y1] = np.clip(res + 0.5, 0, 255).astype(np.uint8)
         if progress:
             progress(0.6 + 0.4 * y1 / H, "Applying")
-    return Image.fromarray(out)
+    res = Image.fromarray(out)
+    if o.get("protect", 1):                              # photos (faces ...) are left exactly as they were
+        pm = photo_mask(img)
+        if float(pm.max()) > 0.05:
+            res = Image.composite(img, res, Image.fromarray((np.clip(pm, 0, 1) * 255).astype(np.uint8)))
+    return res
 
 
 # --------------------------------------------------------------------- crop
@@ -828,7 +925,32 @@ def make_mask(size, shape, data, brush=20.0):
     return m
 
 
-def erase_region(img, mask, offset=None, feather=1.5):
+def _gray_from_L(L):
+    fy = (L + 16.0) / 116.0
+    y = np.where(fy ** 3 > 0.008856, fy ** 3, (fy - 16.0 / 116.0) / 7.787)
+    v = np.where(y <= 0.0031308, 12.92 * y, 1.055 * np.power(np.maximum(y, 1e-6), 1 / 2.4) - 0.055)
+    return np.clip(v, 0, 1) * 255.0
+
+
+def _keep_dark_ink(reg, hole_img, res):
+    """A coloured stamp lies on top of black writing: where the removed pixels are clearly DARKER than the stamp ink,
+    the writing is still there - keep it (as neutral dark) instead of painting paper over it."""
+    hm = np.asarray(hole_img) > 127
+    if not hm.any():
+        return res
+    lab = rgb_to_lab(reg)
+    L, C = lab[..., 0], np.hypot(lab[..., 1], lab[..., 2])
+    ink = hm & (C > 18.0)
+    if int(ink.sum()) < 20 or int(ink.sum()) < 0.04 * int(hm.sum()):
+        return res                                   # what is removed is not coloured ink: nothing to keep
+    Lref = float(np.median(L[ink]))
+    s = np.clip((Lref - L - 6.0) / (0.4 * Lref + 1.0), 0.0, 1.0) ** 0.7
+    s = (s * hm)[..., None].astype(np.float32)
+    gray = np.repeat(_gray_from_L(L)[..., None], 3, 2)
+    return res * (1 - s) + gray * s
+
+
+def erase_region(img, mask, offset=None, feather=1.5, keep_ink=False):
     """Removes what is under the mask and puts there what surrounds it, so it looks as if nothing was there.
     offset=(dx,dy): copy from that spot instead (clone / heal): the texture comes from (x+dx, y+dy),
     the brightness and colour are matched to the surroundings."""
@@ -873,6 +995,8 @@ def erase_region(img, mask, offset=None, feather=1.5):
         res = src
         if int(ring.sum()) > 50:                   # heal: same texture, but the tone of the new surroundings
             res = src + (np.median(reg[ring].astype(np.float32), axis=0) - np.median(src[ring], axis=0))
+    if keep_ink and offset is None:
+        res = _keep_dark_ink(reg, hard.crop(box), res)
     out = reg.astype(np.float32) * (1 - soft) + res * soft
     result = img.copy()
     result.paste(Image.fromarray(np.clip(out + 0.5, 0, 255).astype(np.uint8)), (box[0], box[1]))
@@ -949,11 +1073,10 @@ def shape_mask(size, shape, data, brush=20.0):
 
 
 def color_range_mask(lab, rgb, tol=30.0):
-    """Every pixel whose colour is close to rgb (like Photoshop's Color Range with 'fuzziness' = tol)."""
+    """Every pixel whose colour matches rgb (like Photoshop's Color Range). Coloured targets match by hue + colour
+    strength (so a dark pixel with a faint tint is not taken); white / grey / black match by lightness."""
     pt = rgb_to_lab(np.array([[list(rgb)]], dtype=np.uint8))[0, 0]
-    d = np.sqrt(((lab[..., 0] - pt[0]) * 0.8) ** 2 + (lab[..., 1] - pt[1]) ** 2 + (lab[..., 2] - pt[2]) ** 2)
-    inner, outer = tol * 0.7, tol * 1.3
-    return (1.0 - _smooth((d - inner) / (outer - inner))).astype(np.float32)
+    return adj_mask(lab, {"type": "color", "target": [float(pt[0]), float(pt[1]), float(pt[2])], "tol": float(tol)})
 
 
 def quick_select(lab, stroke, tol=28.0):
@@ -1160,3 +1283,49 @@ def transform_region(img, mask, cx, cy, sx, sy, ang_cw, soft=1.0):
     newmask = Image.new("L", img.size, 0)
     newmask.paste(patch.split()[3], (px, py))
     return base, newmask
+
+
+def remove_stamp(img, mask):
+    """Removes a stamp / seal (the selected part) but KEEPS a black signature that crosses it.
+    The stamp becomes paper again (filled from around); dark neutral strokes inside the selection are kept, their
+    blue tint is taken out, and small gaps in the strokes are bridged so the signature looks complete.
+    mask = PIL 'L' selection at the picture's size."""
+    hard = mask.point(lambda v: 255 if v > 40 else 0)
+    bbox = hard.getbbox()
+    if bbox is None:
+        return img
+    W, H = img.size
+    m = 14
+    box = (max(0, bbox[0] - m), max(0, bbox[1] - m), min(W, bbox[2] + m), min(H, bbox[3] + m))
+    full = np.asarray(img)
+    reg = full[box[1]:box[3], box[0]:box[2]].copy()
+    hole_img = hard.crop(box).filter(ImageFilter.MaxFilter(7))
+    hole = np.asarray(hole_img) > 127
+    F = fill_background(reg, (~hole).astype(np.float32)).astype(np.float32)
+    lab = rgb_to_lab(reg)
+    Lp = np.maximum(rgb_to_lab(np.clip(F, 0, 255).astype(np.uint8))[..., 0], 40.0)
+    L = lab[..., 0]
+    C = np.hypot(lab[..., 1], lab[..., 2])
+    sig = hole & (L < 0.58 * Lp) & (C < 45.0)                    # dark, hardly coloured = the signature
+    gray = (reg[..., 0] * 0.299 + reg[..., 1] * 0.587 + reg[..., 2] * 0.114).astype(np.float32)
+    out = F.copy()
+    if sig.any():
+        a0 = np.clip((0.75 * Lp - L) / (0.30 * Lp), 0.0, 1.0)
+        a0 = np.where(sig, a0, 0.0)[..., None]
+        sg = np.repeat(gray[..., None], 3, 2)
+        out = out * (1 - a0) + sg * a0
+        # bridge small gaps in the strokes (the stamp ink was hiding them)
+        s_img = Image.fromarray((sig * 255).astype(np.uint8))
+        closed = np.asarray(s_img.filter(ImageFilter.MaxFilter(5)).filter(ImageFilter.MinFilter(5))) > 127
+        gap = closed & ~sig & hole
+        if gap.any():
+            col = float(np.median(gray[sig]))
+            gsoft = np.asarray(Image.fromarray((gap * 255).astype(np.uint8)).filter(ImageFilter.GaussianBlur(0.6)),
+                               dtype=np.float32)[..., None] / 255.0 * 0.85
+            out = out * (1 - gsoft) + col * gsoft
+    soft = np.asarray(mask.crop(box).filter(ImageFilter.MaxFilter(7)).filter(ImageFilter.GaussianBlur(1.5)),
+                      dtype=np.float32)[..., None] / 255.0
+    res = reg.astype(np.float32) * (1 - soft) + out * soft
+    result = img.copy()
+    result.paste(Image.fromarray(np.clip(res + 0.5, 0, 255).astype(np.uint8)), (box[0], box[1]))
+    return result

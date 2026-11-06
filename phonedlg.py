@@ -3,9 +3,9 @@ import os
 
 import segno
 from PySide6.QtCore import Qt, QTimer, QUrl
-from PySide6.QtGui import QColor, QDesktopServices, QGuiApplication, QPainter, QPixmap
+from PySide6.QtGui import QColor, QIntValidator, QDesktopServices, QGuiApplication, QPainter, QPixmap
 from PySide6.QtWidgets import (QButtonGroup, QDialog, QFileDialog, QFrame, QHBoxLayout, QLabel, QPushButton,
-                               QSpinBox, QStackedWidget, QVBoxLayout, QWidget)
+                               QLineEdit, QStackedWidget, QVBoxLayout, QWidget)
 
 import phone
 from theme import logo_pixmap
@@ -136,7 +136,7 @@ class PhoneDialog(QDialog):
         tabs.setSpacing(0)
         self.tabGroup = QButtonGroup(self)
         self.tabGroup.setExclusive(True)
-        for i, n in enumerate(("Same Wi-Fi", "Internet")):
+        for i, n in enumerate(("Local network", "Internet")):
             b = QPushButton(n)
             b.setCheckable(True)
             b.setProperty("tab", True)
@@ -151,39 +151,40 @@ class PhoneDialog(QDialog):
 
         # tab 1: same Wi-Fi
         self.wifi = _Pane("Scan to connect",
-                          "Point your phone camera at the code. Phone and PC need to be on the same Wi-Fi. "
-                          "The phone opens a web page - no app is needed.")
+                          "Phone and PC on the same Wi-Fi. Scan the code, the phone opens a web page (no app). "
+                          "The address is found automatically, only the port can be changed.")
         self.stack.addWidget(self.wifi)
         prow = QHBoxLayout()
         prow.setSpacing(8)
         prow.addWidget(QLabel("Port"))
-        self.spinPort = QSpinBox()
-        self.spinPort.setRange(1024, 65535)
-        self.spinPort.setFixedWidth(100)
-        self.spinPort.setValue(win.settings.value("phone_port", 8765, type=int) or 8765)
+        self.spinPort = QLineEdit(str(win.settings.value("phone_port", 8765, type=int) or 8765))
+        self.spinPort.setValidator(QIntValidator(1024, 65535, self))
+        self.spinPort.setMaxLength(5)
+        self.spinPort.setFixedSize(110, 38)
+        self.spinPort.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.spinPort.setStyleSheet("QLineEdit { background: #ffffff; color: #111111; border: 2px solid #5b8cff; "
+                                    "border-radius: 8px; font-size: 18px; font-weight: 700; }")
+        self.spinPort.returnPressed.connect(self._set_port)
         self.spinPort.setToolTip("The door number the phone connects to. Change it if another program uses it "
                                  "or your firewall needs a fixed number. The IP address is found automatically.")
-        self.btnPort = QPushButton("Set port")
-        self.btnNew = QPushButton("New code")
-        self.btnNew.setToolTip("Makes a new secret link. The old QR code stops working.")
+        self.btnPort = QPushButton("Set")
         prow.addWidget(self.spinPort)
         prow.addWidget(self.btnPort)
-        prow.addWidget(self.btnNew)
         prow.addStretch(1)
         self.wifi.extra.addLayout(prow)
 
         # tab 2: internet
         self.net = _Pane("Use it from anywhere",
-                         "For a phone that is NOT on the same Wi-Fi (mobile data). Press Start: a temporary public "
-                         "link is made through the free localhost.run service. Anyone who has the link can send "
-                         "pictures to this PC, so stop it when you are done.")
+                         "For a phone that is NOT on the same Wi-Fi. The link is made automatically when this tab is open "
+                         "and closed when you leave the tab or close this window. Anyone with the link can send pictures.")
         self.stack.addWidget(self.net)
-        self.btnNet = QPushButton("Start internet link")
+        self.btnNet = QPushButton("Retry")
         self.btnNet.setProperty("accent", True)
         self.btnNet.setMinimumHeight(36)
         self.lblNet = QLabel("")
         self.lblNet.setObjectName("muted")
         self.lblNet.setWordWrap(True)
+        self.btnNet.hide()
         self.net.extra.addWidget(self.btnNet)
         self.net.extra.addWidget(self.lblNet)
         root.addWidget(card, 1)
@@ -220,11 +221,10 @@ class PhoneDialog(QDialog):
         root.addWidget(self.lblState)
 
         # ---- wiring
-        self.tabGroup.idClicked.connect(self.stack.setCurrentIndex)
+        self.tabGroup.idClicked.connect(self._tab)
         self.wifi.btnCopy.clicked.connect(lambda: self._copy(self._url))
         self.net.btnCopy.clicked.connect(lambda: self._copy(self._net_url))
         self.btnPort.clicked.connect(self._set_port)
-        self.btnNew.clicked.connect(lambda: self._start(new_token=True))
         self.btnDir.clicked.connect(self._choose_dir)
         self.btnOpen.clicked.connect(self._open_dir)
         self.btnStop.clicked.connect(self._stop_or_start)
@@ -284,21 +284,21 @@ class PhoneDialog(QDialog):
         srv = self.win.phone
         srv.inbox = self._dir()
         if not srv.running():
-            if not srv.start(int(self.spinPort.value())):
+            if not srv.start(self._port()):
                 self._set_running(False, "Could not start")
                 self.lblState.setText("The connection could not be started (a firewall or another program may block it).")
                 return
             self.win.settings.setValue("phone_port", srv.port)
-        if srv.port != self.spinPort.value():
-            self.spinPort.setValue(srv.port)
+        if srv.port != self._port():
+            self.spinPort.setText(str(srv.port))
         self._url = None
         self._set_running(True)
         self._tick()
 
     def _set_port(self):
         """Use the port typed in the box (new QR code, new secret link)."""
-        self.win.settings.setValue("phone_port", int(self.spinPort.value()))
-        want = int(self.spinPort.value())
+        want = self._port()
+        self.win.settings.setValue("phone_port", want)
         if self.win.phone is not None:
             self.win.phone.stop()
             self.win.phone = None
@@ -307,6 +307,22 @@ class PhoneDialog(QDialog):
         srv = self.win.phone
         if srv is not None and srv.running() and srv.port != want:
             self.lblState.setText("Port %d is busy - using %d instead." % (want, srv.port))
+
+    def _port(self):
+        try:
+            p = int(self.spinPort.text())
+            if 1024 <= p <= 65535:
+                return p
+        except ValueError:
+            pass
+        return int(self.win.settings.value("phone_port", 8765, type=int) or 8765)
+
+    def _tab(self, i):
+        self.stack.setCurrentIndex(i)
+        if i == 1:
+            self._net_start()
+        else:
+            self._stop_net()
 
     def _stop_or_start(self):
         if self.win.phone is not None and self.win.phone.running():
@@ -328,8 +344,11 @@ class PhoneDialog(QDialog):
 
     # ---- internet tunnel
     def _net_toggle(self):
+        self._stop_net()
+        self._net_start()
+
+    def _net_start(self):
         if self.win.phone_tunnel is not None:
-            self._stop_net()
             return
         srv = self.win.phone
         if srv is None or not srv.running():
@@ -338,7 +357,7 @@ class PhoneDialog(QDialog):
         if srv is None:
             return
         self.win.phone_tunnel = phone.Tunnel(srv.port)
-        self.btnNet.setText("Stop internet link")
+        self.btnNet.hide()
         self.lblNet.setText("Connecting ... (can take up to 30 seconds)")
         self.timer.start()
 
@@ -348,7 +367,7 @@ class PhoneDialog(QDialog):
             self.win.phone_tunnel = None
         self._net_url = None
         self.net.show_url(None)
-        self.btnNet.setText("Start internet link")
+        self.btnNet.hide()
         self.lblNet.setText("")
 
     def _copy(self, url):
@@ -388,9 +407,13 @@ class PhoneDialog(QDialog):
         msg = self.lblNet.text()
         self._stop_net()
         self.lblNet.setText(msg)
+        self.btnNet.show()
 
     def closeEvent(self, e):
-        self.timer.stop()          # the connection stays open: pictures can still arrive
+        self._stop_net()           # the internet link only lives while this window is open
+        self.tabGroup.button(0).setChecked(True)
+        self.stack.setCurrentIndex(0)
+        self.timer.stop()          # the local connection stays open: pictures can still arrive
         super().closeEvent(e)
 
     def hideEvent(self, e):
