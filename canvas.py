@@ -2,7 +2,7 @@
 import math
 
 import numpy as np
-from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import QPointF, QRect, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor, QImage, QPainter, QPainterPath, QPen, QPolygonF, QTransform
 from PySide6.QtWidgets import QApplication, QWidget
 
@@ -73,7 +73,7 @@ class ImageCanvas(QWidget):
         self._tf = None                       # transform: dict(img, w, h, cx, cy, sx, sy, ang)
         self._tf_drag = None
         self._ants_timer = QTimer(self)
-        self._ants_timer.setInterval(120)
+        self._ants_timer.setInterval(200)
         self._ants_timer.timeout.connect(self._tick)
         self._pick_cursor = dropper_cursor()
         self.setCursor(Qt.CursorShape.OpenHandCursor)
@@ -138,7 +138,17 @@ class ImageCanvas(QWidget):
 
     def _tick(self):
         self._phase = (self._phase + 1) % 8
-        self.update()
+        r = None                                      # repaint only where the outline is, not the whole picture
+        for name in ("sel", "hl"):
+            hit = self._edge_cache.get(name)
+            if self._masks[name] is not None and hit is not None and hit[1].size:
+                b = QRect(int(hit[2].min()) - 2, int(hit[1].min()) - 2, int(hit[2].max() - hit[2].min()) + 5,
+                          int(hit[1].max() - hit[1].min()) + 5)
+                r = b if r is None else r.united(b)
+        if self.mode in (self.CROP, self.PERSP, self.TRANSFORM) or r is None:
+            self.update()
+        else:
+            self.update(r)
 
     def _edges(self, name):
         """Boundary pixels (in widget pixels) of a mask, recomputed only when the view or the mask changed."""
