@@ -649,11 +649,47 @@ class Card(QWidget):
         return f, l
 
     def _scope_label(self):
+        box = QWidget()
+        bl = QVBoxLayout(box)
+        bl.setContentsMargins(0, 0, 0, 0)
+        bl.setSpacing(4)
         lab = QLabel("")
         lab.setObjectName("hint")
         lab.setWordWrap(True)
         self._scope_labels.append(lab)
-        return lab
+        btn = QPushButton("Apply to the selection")
+        btn.setProperty("accent", True)
+        btn.setToolTip("Makes these changes part of the picture. They stay when you deselect (undo with Ctrl+Z).\n"
+                       "If you deselect without pressing this, it is applied automatically.")
+        btn.clicked.connect(lambda: self._bake(None, True))
+        self._bake_btns.append(btn)
+        bl.addWidget(lab)
+        bl.addWidget(btn)
+        return box
+
+    def _pending_settings(self):
+        return core.active_adjs(self.adjs) or core.look_edited(self.look)
+
+    def _bake(self, then=None, manual=False):
+        """Settings made with a selection active are written into the picture (inside the selection) before the
+        selection goes away / changes, so they never spill over to the whole picture.  Returns True when it
+        started (then() is called when finished)."""
+        if not self._loaded or self.sel is None or not self._pending_settings():
+            if manual:
+                self._warn("Nothing to apply: select something and change a setting first.")
+            return False
+        a0, l0, sel0, base0 = copy.deepcopy(self.adjs), dict(self.look), self.sel, self.base
+        self._checkpoint()                           # one undo step brings the settings back
+        self.adjs = []
+        self.look = core.new_look()
+        self.colors.rebuild(self.adjs)
+        self._sync_sliders()
+
+        def make(progress):
+            return core.render_full(base0, a0, l0, sel0), sel0
+        self._edit_base("Applying to the selection", make, after=then, checkpoint=False,
+                        msg="Applied to the selection." if manual else None)
+        return True
 
     def _look_row(self, key, title, lo, hi, caps, tip, unit="%"):
         row = SliderRow(title, lo, hi, self.look[key], caps, tip, unit)
@@ -665,6 +701,7 @@ class Card(QWidget):
     def _build(self):
         self.lookRows = {}
         self._scope_labels = []
+        self._bake_btns = []
         root = QVBoxLayout(self)
         root.setContentsMargins(14, 10, 14, 8)
         root.setSpacing(7)
@@ -1153,6 +1190,8 @@ class Card(QWidget):
             short = "Selected: %.0f%%" % pct
         for lab in self._scope_labels:
             lab.setText(scope)
+        for b in self._bake_btns:
+            b.setVisible(self.sel is not None)
         self.lblSel.setText(short)
 
     # ------------------------------------------------------------ slow work
@@ -1439,7 +1478,8 @@ class Card(QWidget):
         self.undo.append(self._snap())
         self._goto(self.redo.pop())
 
-    def _edit_base(self, label, make, keep_sel=True, refit=False, after=None, msg=None, shadow_src=None, merge=False):
+    def _edit_base(self, label, make, keep_sel=True, refit=False, after=None, msg=None, shadow_src=None, merge=False,
+                   checkpoint=True):
         """Change the picture itself (erase, crop, rotate, move ...) in a worker thread, then show it.
         make(progress) -> new PIL image, or (new image, new selection)."""
         adjs = copy.deepcopy(self.adjs)
@@ -1456,7 +1496,9 @@ class Card(QWidget):
 
         def done(r):
             new, sel_out, v = r
-            if merge and self._gest:                 # a live shadow slider drag is ONE undo step
+            if not checkpoint:
+                self.ops += 1
+            elif merge and self._gest:               # a live shadow slider drag is ONE undo step
                 self._gest_timer.start(2500)
             else:
                 self._checkpoint()
@@ -1664,6 +1706,8 @@ class Card(QWidget):
         self._touch()
 
     def _set_selection(self, mask, mode=None):
+        if self._bake(lambda: self._set_selection(mask, mode)):
+            return
         new = core.sel_combine(self.sel, mask, mode or self.sel_mode)
         if new is None and self.sel is None:
             return
@@ -1674,12 +1718,16 @@ class Card(QWidget):
     def select_all(self):
         if not self._loaded:
             return
+        if self._bake(self.select_all):
+            return
         self._checkpoint()
         self.sel = np.ones(self.prev.shape[:2], np.float32)
         self._sel_changed()
 
     def deselect(self):
         if not self._loaded or self.sel is None:
+            return
+        if self._bake(self.deselect):
             return
         self._checkpoint()
         self.sel = None
@@ -1706,6 +1754,8 @@ class Card(QWidget):
     def invert_selection(self):
         if not self._loaded:
             return
+        if self._bake(self.invert_selection):
+            return
         new = core.sel_invert(self.sel, self.prev.shape[:2])
         self._checkpoint()
         self.sel = new
@@ -1716,6 +1766,8 @@ class Card(QWidget):
             return
         if self.sel is None:
             self.message.emit("Select something first.")
+            return
+        if self._bake(lambda: self.grow_selection(px)):
             return
         new = core.sel_grow(self.sel, px)
         self._checkpoint()
@@ -2136,4 +2188,3 @@ class Card(QWidget):
         except Exception:
             pass
         d.exec(Qt.DropAction.CopyAction, Qt.DropAction.CopyAction)     # copy only: never moves the original file
-
