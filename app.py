@@ -88,6 +88,14 @@ def main():
             pass
     sys.excepthook = hook
     app = QApplication(sys.argv)
+    sys.setswitchinterval(0.001)                  # a busy worker thread hands the window thread back quickly: no freezing
+    try:
+        from PySide6.QtCore import QThread, QThreadPool
+        pool = QThreadPool.globalInstance()
+        pool.setMaxThreadCount(max(2, (os.cpu_count() or 4) - 1))      # keep one core free for the window
+        pool.setThreadPriority(QThread.Priority.LowPriority)
+    except Exception:
+        pass
     app.setQuitOnLastWindowClosed(False)
     app.setApplicationName("Image Fixer")
     app.setOrganizationName("ImageFixer")
