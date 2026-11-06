@@ -546,6 +546,8 @@ class Card(QWidget):
         self._gest = False
         self.ops = 0
         self._shadow_done = False
+        self._shadow_busy = False
+        self._shadow_again = False
         self.shadow_src = None                     # picture before shadow removal: lets the shadow options be changed later
         self.last_action = None                    # the last setting changed: what 'apply to all' copies
         self.keep_ink = True
@@ -1479,7 +1481,7 @@ class Card(QWidget):
         self._goto(self.redo.pop())
 
     def _edit_base(self, label, make, keep_sel=True, refit=False, after=None, msg=None, shadow_src=None, merge=False,
-                   checkpoint=True):
+                   checkpoint=True, fail=None):
         """Change the picture itself (erase, crop, rotate, move ...) in a worker thread, then show it.
         make(progress) -> new PIL image, or (new image, new selection)."""
         adjs = copy.deepcopy(self.adjs)
@@ -1516,7 +1518,7 @@ class Card(QWidget):
                 after()
             if msg:
                 self.message.emit(msg)
-        self._job(label, work, done)
+        self._job(label, work, done, fail)
 
     # ------------------------------------------- settings shared by all pictures
     def apply_action(self, act):
@@ -1634,11 +1636,22 @@ class Card(QWidget):
         x, y = min(max(x, 0), W - 1), min(max(y, 0), H - 1)
         patch = self.prev[max(0, y - 1):y + 2, max(0, x - 1):x + 2].reshape(-1, 3).mean(0)
         rgb = tuple(int(round(float(v))) for v in patch)
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            kind, items, L = core.classify_pick(self._get_lab(), rgb)
-        finally:
-            QApplication.restoreOverrideCursor()
+        prev, lab0 = self.prev, self._lab
+
+        def work(progress):                          # the colour analysis of a big picture takes a moment: not in the window thread
+            lab = lab0 if lab0 is not None else core.rgb_to_lab(prev)
+            return core.classify_pick(lab, rgb), lab
+
+        def done(r):
+            (kind, items, L), lab = r
+            if self.prev is not prev:
+                return
+            if self._lab is None:
+                self._lab = lab
+            self._after_pick(kind, items, L)
+        self._job("Analysing colors", work, done)
+
+    def _after_pick(self, kind, items, L):
         self.show_tab(0)
         if kind == "color":
             new = items[0]
@@ -1745,10 +1758,22 @@ class Card(QWidget):
             return
         for a in self.adjs:
             if a["id"] == aid:
-                mask = core.get_mask(self.prev, a, self._get_lab(), self._cache)
-                self._set_selection(mask, self.sel_mode)
-                if self.sel is None:
-                    self._warn("Nothing found for this color.")
+                prev, lab0, cache, a0 = self.prev, self._lab, self._cache, copy.deepcopy(a)
+
+                def work(progress):
+                    lab = lab0 if lab0 is not None else core.rgb_to_lab(prev)
+                    return core.get_mask(prev, a0, lab, cache), lab
+
+                def done(r):
+                    mask, lab = r
+                    if self.prev is not prev:
+                        return
+                    if self._lab is None:
+                        self._lab = lab
+                    self._set_selection(mask, self.sel_mode)
+                    if self.sel is None:
+                        self._warn("Nothing found for this color.")
+                self._job("Selecting this color", work, done)
                 return
 
     def invert_selection(self):
@@ -2036,6 +2061,10 @@ class Card(QWidget):
             return
         if live and self.shadow_src is None:
             return
+        if live and self._shadow_busy:               # still working: one more pass follows, with the latest values
+            self._shadow_again = True
+            return
+        self._shadow_busy = True
         src = self.shadow_src if self.shadow_src is not None else self.base
         sel = self.sel
         opts = dict(self.shadow_opts)
@@ -2046,10 +2075,17 @@ class Card(QWidget):
                 new = Image.composite(new, src, self._mask_img(sel, src.size))
             return new
 
+        def finish():
+            self._shadow_busy = False
+            if self._shadow_again:
+                self._shadow_again = False
+                self._shadow_timer.start()
+
         def after():
             self._shadow_done = sel is None
+            finish()
         self._set_last({"kind": "shadow", "opts": opts, "label": "shadow removal"})
-        self._edit_base("Removing shadows", make, after=after, shadow_src=src, merge=live,
+        self._edit_base("Removing shadows", make, after=after, shadow_src=src, merge=live, fail=lambda m: finish(),
                         msg=None if live else "Shadow removed. Move the sliders to change it, Ctrl+Z to undo.")
 
     def _shadow_opt(self, key, v):
