@@ -637,14 +637,17 @@ def render(rgb, adjs, look=None, lab=None, cache=None, chunk_rows=0, sel=None):
     return out8
 
 
-def render_full(img, adjs, look=None, sel=None):
-    """Full resolution result as a PIL image.  sel = selection mask at preview size (or None)."""
+def render_full(img, adjs, look=None, sel=None, layers=None):
+    """Full resolution result as a PIL image.  sel = selection mask at preview size (or None).
+    layers = pictures placed on the page (signature, stamp ...), put on top after the page settings."""
     look = look or DEFAULT_LOOK
     if not active_adjs(adjs) and not look_edited(look):
-        return img
-    arr = np.asarray(img)
-    full_sel = None if sel is None else resize_mask(sel, img.size)
-    return Image.fromarray(render(arr, adjs, look, chunk_rows=700, sel=full_sel))
+        out = img
+    else:
+        arr = np.asarray(img)
+        full_sel = None if sel is None else resize_mask(sel, img.size)
+        out = Image.fromarray(render(arr, adjs, look, chunk_rows=700, sel=full_sel))
+    return composite_layers(out, layers) if layers else out
 
 
 # -------------------------------------------------------- shade detection
@@ -1470,8 +1473,16 @@ def warp_region(img, mask, grid, n, soft=1.0):
     base = erase_region(img, mask, None, soft).convert("RGBA")
     patch = img.crop(bbox).convert("RGBA")
     patch.putalpha(mask.crop(bbox))
+    layer = warp_layer(patch, img.size, grid, n)
+    out = Image.alpha_composite(base, layer).convert("RGB")
+    return out, layer.split()[3]
+
+
+def warp_layer(patch, size, grid, n):
+    """An RGBA patch bent onto a net of points (n = 1: 4 corners, n = 3: 4x4 points, row by row, picture pixels).
+    Returns an RGBA layer of the given size."""
     pw, ph = patch.size
-    W, H = img.size
+    W, H = size
     layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     g = [[grid[i * (n + 1) + j] for j in range(n + 1)] for i in range(n + 1)]
     for i in range(n):
@@ -1498,8 +1509,112 @@ def warp_region(img, mask, grid, n, soft=1.0):
             co = (Hm[0, 0], Hm[0, 1], Hm[0, 2], Hm[1, 0], Hm[1, 1], Hm[1, 2], Hm[2, 0], Hm[2, 1])
             piece = crop.transform((bx1 - bx0, by1 - by0), Image.Transform.PERSPECTIVE, co, Image.Resampling.BICUBIC)
             layer.alpha_composite(piece, (bx0, by0))
-    out = Image.alpha_composite(base, layer).convert("RGB")
-    return out, layer.split()[3]
+    return layer
+
+
+# ------------------------------------------------------------------ picture layers (signature, stamp ...)
+def remove_background(img, alpha=None, strength=50, soft=30, uneven=False, tint="orig", opacity=100, remove=True):
+    """PIL RGB (+ optional 'L' alpha of its own) -> PIL RGBA with the background taken away.
+    The background colour is read from the border; with 'uneven' (grey print paper, shading) it is followed across the
+    picture.  Edge pixels are un-mixed from the paper colour, so a signature / stamp has no light halo."""
+    rgb = np.asarray(img.convert("RGB"))
+    H, W = rgb.shape[:2]
+    x = rgb.astype(np.float32)
+    a = np.ones((H, W), np.float32)
+    C = x
+    if remove:
+        lab = rgb_to_lab(rgb)
+        k = max(1, min(4, H // 8, W // 8))
+        border = np.concatenate([rgb[:k].reshape(-1, 3), rgb[-k:].reshape(-1, 3),
+                                 rgb[:, :k].reshape(-1, 3), rgb[:, -k:].reshape(-1, 3)])
+        bgc = np.median(border, axis=0).astype(np.uint8)
+        bl = rgb_to_lab(bgc[None, None, :])[0, 0]
+        B = np.broadcast_to(bgc.astype(np.float32), x.shape)
+        Bl = bl
+        if uneven:
+            d0 = np.sqrt(((lab - bl) ** 2).sum(2))
+            valid = (d0 < 30.0).astype(np.float32)
+            if valid.sum() > 16:
+                F = fill_background(rgb, valid)
+                r = max(3.0, 0.01 * max(H, W))
+                F = np.stack([np.asarray(Image.fromarray(F[..., ch]).filter(_PilFilter.GaussianBlur(r)))
+                              for ch in range(3)], -1)
+                B = F.astype(np.float32)
+                Bl = rgb_to_lab(F)
+        dist = np.sqrt(((lab - Bl) ** 2).sum(2))
+        t0 = 3.0 + 0.3 * strength
+        t1 = t0 + 6.0 + 0.5 * soft
+        a = _smooth((dist - t0) / (t1 - t0))
+        a3 = a[..., None]
+        C = np.where(a3 > 0.97, x, np.clip((x - B * (1.0 - a3)) / np.maximum(a3, 0.08), 0, 255))
+    if alpha is not None:
+        a = a * (np.asarray(alpha.convert("L"), dtype=np.float32) / 255.0)
+    if tint == "black":
+        C = np.broadcast_to(np.array([22, 22, 24], np.float32), x.shape)
+    elif tint == "blue":
+        C = np.broadcast_to(np.array([24, 52, 170], np.float32), x.shape)
+    a = a * (opacity / 100.0)
+    out = np.empty((H, W, 4), np.uint8)
+    out[..., :3] = np.clip(C + 0.5, 0, 255)
+    out[..., 3] = np.clip(a * 255.0 + 0.5, 0, 255)
+    return Image.fromarray(out, "RGBA")
+
+
+def content_box(alpha, pad=0.03, thr=14):
+    """Box of everything that is not transparent, with a little room (None if empty)."""
+    b = alpha.point(lambda v: 255 if v > thr else 0).getbbox()
+    if b is None:
+        return None
+    w, h = alpha.size
+    px = int(max(2, pad * max(b[2] - b[0], b[3] - b[1])))
+    return (max(0, b[0] - px), max(0, b[1] - px), min(w, b[2] + px), min(h, b[3] + px))
+
+
+def layer_rgba(l, pend=True):
+    """RGBA of a layer dict (rgb, a, opacity; an unfinished edit 'pend' = (adjs, look, sel) is applied too)."""
+    rgb = l["rgb"]
+    if pend and l.get("pend"):
+        adjs, look, sel = l["pend"]
+        rgb = render_full(rgb, adjs, look, sel)
+    out = rgb.convert("RGBA")
+    a = l["a"]
+    if l.get("opacity", 100) < 100:
+        a = a.point(lambda v, f=l["opacity"] / 100.0: int(v * f))
+    out.putalpha(a)
+    return out
+
+
+def composite_layers(base, layers, hide=None):
+    """PIL RGB page + layers (placed with a normalised net 'grid', n) -> PIL RGB."""
+    if not layers:
+        return base
+    W, H = base.size
+    out = base.convert("RGBA")
+    for l in layers:
+        if not l.get("visible", True) or l["id"] == hide:
+            continue
+        n = l["n"]
+        grid = [(x * W, y * H) for x, y in l["grid"]]
+        patch = layer_rgba(l)
+        tw = max(math.dist(grid[0], grid[n]), math.dist(grid[n * (n + 1)], grid[-1]))
+        if 8 <= tw < patch.width:                         # no need for more pixels than are shown
+            patch = patch.resize((int(tw), max(1, int(round(tw * patch.height / patch.width)))), Image.Resampling.BILINEAR)
+        out = Image.alpha_composite(out, warp_layer(patch, (W, H), grid, n))
+    return out.convert("RGB")
+
+
+def checker(w, h, cell=10):
+    yy, xx = np.mgrid[0:h, 0:w]
+    c = (((yy // cell) + (xx // cell)) % 2).astype(np.float32)
+    v = 205.0 + 35.0 * c
+    return np.stack([v, v, v], -1)
+
+
+def show_alpha(rgb, alpha):
+    """Layer picture on a chess-board, for the layer editor.  rgb uint8 (H,W,3), alpha 'L' (any size)."""
+    H, W = rgb.shape[:2]
+    a = np.asarray(alpha.resize((W, H), Image.Resampling.BILINEAR), dtype=np.float32)[..., None] / 255.0
+    return np.clip(rgb.astype(np.float32) * a + checker(W, H) * (1 - a) + 0.5, 0, 255).astype(np.uint8)
 
 
 def remove_stamp(img, mask):
