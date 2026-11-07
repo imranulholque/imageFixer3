@@ -87,6 +87,11 @@ def main():
         except Exception:
             pass
     sys.excepthook = hook
+    try:                                          # 125 % / 150 % Windows scaling: exact size, no blurry rounding
+        from PySide6.QtGui import QGuiApplication
+        QGuiApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
+    except Exception:
+        pass
     app = QApplication(sys.argv)
     sys.setswitchinterval(0.001)                  # a busy worker thread hands the window thread back quickly: no freezing
     try:

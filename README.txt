@@ -9,10 +9,14 @@ Clean many text pictures (WhatsApp photos, scans) and print them. One big card p
  - Delete key:  deletes the selection (filled from the paper around it).   Fill color (Adjust tab) fills it with a color.
  - Move v:      drag = move, Alt + drag = copy, Ctrl+T = Transform (resize / rotate, Enter = apply).
  - Eyedropper:  click a color -> slider (fade / stronger) and "Change to..." (recolor, shading stays). Respects the selection.
- - Shadow tab:  one click, plus Strength / Paper whiteness / Text darkness / Shadow size / Color-Gray-B&W.
+ - Shadow tab:  One-click removal (Strength, Paper whiteness, Text darkness, Shadow size, Even out the light, Shadow depth,
+                Keep paper color, Clean the paper, Color-Gray-B&W) AND Manual shadow removal that works with no click:
+                Even out the light, Shadow size, Lift shadows, Whiten paper, Darken text. Select a part first = fix only that part.
  - Text tab:    Text sharpness, Line & shape sharpness, Faint strokes, Text darkness, Clean specks.
  - Erase v:     Brush / Box / Ellipse / Freehand: filled from around. Alt + click = copy from that spot.
- - Crop v:      Crop, Straighten (4 corners), Rotate left / right.
+ - Crop v:      Crop, Straighten (4 corners), Crop to circle / oval / rounded box / the selection shape, Rotate left / right.
+                A picture you placed (signature, stamp ...): select it, then pick any crop - it is cropped alone and becomes
+                transparent outside the shape. (Click outside the picture first to crop the page instead.)
 Slow work shows a progress bar at the bottom; the window stays usable.
 
 SAVING
@@ -68,3 +72,15 @@ NEW (round 4)
 - Photo detection now needs skin tones (a face), so watermarks / big stamps are not treated as photos.
   Photos get only a soft light correction in shadow removal, no ink / contrast changes.
 - Erase: the soft edge of removed writing is removed too (no grey ghost); the fill uses only real paper colour.
+
+NEW (round 4)
+- Thumbnails: click, Ctrl+click, Shift+click, drag a box, Ctrl+A to select. Del removes the selected pictures from the list
+  (files on the disk are never touched), Ctrl+C copies them, dragging takes all selected pictures to another program.
+  Right-click a thumbnail for the same as a menu.
+- Pictures open in the background (progress bar, window never freezes); adding / saving / copying many pictures is done in small
+  steps or in a worker thread. Settings > "Picture detail" sets how sharp the on-screen picture is (Automatic = from your screen);
+  Settings > "Interface size" scales the text and buttons. Toolbars wrap instead of being cut off on a small window.
+- Saturation is now a real saturation: 0 = gray picture, 100 = as it is, 200 = twice as strong; brightness and hue stay the same,
+  gray / black / white never change, strong colors do not burn out. New Vibrance slider (weak colors change more than strong ones).
+- Shadow: manual sliders work without the one-click button; the one-click got 4 more options. Existing settings are unchanged.
+- Placed pictures (signature, stamp ...) can be cropped to a circle, oval, rounded box, a box or any selected shape.

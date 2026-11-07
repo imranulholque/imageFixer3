@@ -131,3 +131,11 @@ QCheckBox::indicator:hover { border-color: #818cf8; }
 QCheckBox::indicator:checked { background: #6366f1; border-color: #a5b4fc; }
 QToolTip { background: #222836; color: #e8eaed; border: 1px solid #3a4260; padding: 5px 7px; }
 """
+
+
+def scaled_qss(factor):
+    """The style sheet with every font size multiplied (interface size setting)."""
+    import re
+    if abs(factor - 1.0) < 0.01:
+        return QSS
+    return re.sub(r"font-size:\s*(\d+)px", lambda m: "font-size: %dpx" % max(9, int(round(int(m.group(1)) * factor))), QSS)

@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QColorDial
 
 import core
 from canvas import ImageCanvas, np_to_qimage
+from flow import ElidedLabel, FlowLayout
 from jobs import _log, run_background
 
 EXPORT_DIR = os.path.join(tempfile.gettempdir(), "imagefixer_export")
@@ -30,17 +31,19 @@ TOOL_MODE = {
     "move": (ImageCanvas.MOVESEL, None), "copy": (ImageCanvas.MOVESEL, None),
     "transform": (ImageCanvas.TRANSFORM, None),
     "crop": (ImageCanvas.CROP, None), "persp": (ImageCanvas.PERSP, None),
+    "crop_circle": (ImageCanvas.CROP, None), "crop_oval": (ImageCanvas.CROP, None), "crop_round": (ImageCanvas.CROP, None),
     "erase_brush": (ImageCanvas.ERASE, "brush"), "erase_rect": (ImageCanvas.ERASE, "rect"),
     "erase_ellipse": (ImageCanvas.ERASE, "ellipse"), "erase_lasso": (ImageCanvas.ERASE, "lasso"),
 }
 SELECT_KEYS = ("quick", "brush", "rect", "ellipse", "lasso", "color")
 MOVE_KEYS = ("move", "copy", "transform")
 ERASE_KEYS = ("erase_brush", "erase_rect", "erase_ellipse", "erase_lasso")
-CROP_KEYS = ("crop", "persp")
+CROP_KEYS = ("crop", "persp", "crop_circle", "crop_oval", "crop_round")
+CROP_SHAPE = {"crop_circle": "circle", "crop_oval": "oval", "crop_round": "round"}     # canvas shape of the crop box
 NAMES = {"quick": "Quick select", "brush": "Brush select", "rect": "Box", "ellipse": "Ellipse", "lasso": "Freehand",
          "color": "Color range", "move": "Move", "copy": "Copy", "transform": "Transform",
          "erase_brush": "Brush", "erase_rect": "Box", "erase_ellipse": "Ellipse", "erase_lasso": "Freehand",
-         "crop": "Crop", "persp": "Straighten"}
+         "crop": "Crop", "persp": "Straighten", "crop_circle": "Circle", "crop_oval": "Oval", "crop_round": "Rounded box"}
 HINTS = {
     "view": "Hand: drag the picture.  (Hold Space and drag in any tool, or Ctrl + wheel to zoom)",
     "pick": "Click a color in the picture (ink, stamp, text): its slider appears in the Adjust tab.",
@@ -56,6 +59,9 @@ HINTS = {
                  "Enter = apply,  Esc = cancel.",
     "crop": "Drag the box or its handles, then Apply (Enter).",
     "persp": "Drag the 4 corner points onto the 4 corners of the page, then Apply (Enter).",
+    "crop_circle": "Drag the box: a circle fits in its shorter side.  Apply (Enter).  A picture (signature, stamp ...) becomes transparent outside the circle.",
+    "crop_oval": "Drag the box: an oval (ellipse) fits in it.  Apply (Enter).  A picture becomes transparent outside the oval.",
+    "crop_round": "Drag the box: its corners will be rounded.  Apply (Enter).  A picture becomes transparent outside.",
     "erase_brush": "Paint over what you want to remove: it is filled with what surrounds it.  Alt + click = copy from there.",
     "erase_rect": "Drag a box over what you want to remove.",
     "erase_ellipse": "Drag an ellipse over what you want to remove.",
@@ -64,6 +70,8 @@ HINTS = {
 COLOR_HINT = ("Eyedropper: click a color in the picture.\n"
               "Lower than 100%: it fades into the paper.  Higher: stronger.  'Change to' recolors it.")
 LOOK_TITLES = {"bright": "Brightness", "contrast": "Contrast", "sat": "Saturation", "hue": "Hue", "warm": "Warmth",
+               "vib": "Vibrance", "flat": "Even out the light", "flat_size": "Shadow size (manual)", "shlift": "Lift shadows",
+               "white": "Whiten paper", "black": "Darken text",
                "sharp": "Text sharpness", "objs": "Line & shape sharpness", "detail": "Faint strokes",
                "dark": "Text darkness", "clear": "Clean specks"}
 SHAPES = {"erase_brush": "brush", "erase_rect": "rect", "erase_ellipse": "ellipse", "erase_lasso": "lasso"}
@@ -516,6 +524,7 @@ class DragHandle(QPushButton):
 class Card(QWidget):
     editedChanged = Signal(object)
     removeRequested = Signal(object)
+    copyRequested = Signal(object)
     saveRequested = Signal(object)
     saveAsRequested = Signal(object)
     saveAllRequested = Signal()
@@ -562,6 +571,7 @@ class Card(QWidget):
         self.last_action = None                    # the last setting changed: what 'apply to all' copies
         self.keep_ink = True
         self._pending = None
+        self._auto_back = False                    # a picture was opened only to crop it: go back to the page afterwards
         self._focus_id = None
         self._hl_key = None
         self.clone_src = None
@@ -574,6 +584,8 @@ class Card(QWidget):
         self._cache = {}
         self._loaded = False
         self._failed = False
+        self._loading = False
+        self._dead = False                         # removed from the window: late results of background work are dropped
         self._tool = "view"
         self._ver = 0
         self._saved_ver = -1
@@ -725,7 +737,7 @@ class Card(QWidget):
         # --- row 1: name + history
         r1 = QHBoxLayout()
         r1.setSpacing(8)
-        self.lblName = QLabel(self.name)
+        self.lblName = ElidedLabel(self.name)
         self.lblName.setObjectName("title")
         self.lblInfo = self._label("")
         self.lblState = self._label("")
@@ -746,8 +758,7 @@ class Card(QWidget):
         root.addLayout(r1)
 
         # --- row 2: tool menus
-        r2 = QHBoxLayout()
-        r2.setSpacing(6)
+        r2 = FlowLayout(hspacing=6, vspacing=6)
         self.btnHand = QPushButton("Hand")
         self.btnHand.setCheckable(True)
         self.btnHand.setChecked(True)
@@ -772,8 +783,11 @@ class Card(QWidget):
             ("Fill selection with color", self.fill_selection)], "Remove things; the place is filled from around it")
         self.menuCrop = self._menu_button("Crop", [
             ("Crop      C", lambda: T("crop")), ("Straighten (4 corners)", lambda: T("persp")), None,
+            ("Crop to circle", lambda: T("crop_circle")), ("Crop to oval", lambda: T("crop_oval")),
+            ("Crop to rounded box", lambda: T("crop_round")), ("Crop to the selection shape", self.crop_to_selection), None,
             ("Rotate left", lambda: self.rotate(90.0)), ("Rotate right", lambda: self.rotate(-90.0))],
-            "Crop, straighten a photographed page, rotate")
+            "Crop (also a picture you placed: signature, stamp ...) to a box, circle, oval, rounded box or any selected shape; "
+            "straighten a photographed page; rotate")
         self.menus = {"select": self.menuSelect, "move": self.menuMove, "erase": self.menuErase, "crop": self.menuCrop}
         self.btnLayerDone = QPushButton("◀  Back to the page")
         self.btnLayerDone.setProperty("accent", True)
@@ -803,9 +817,7 @@ class Card(QWidget):
 
         # --- row 3: options of the chosen tool
         self.optsA = QWidget()
-        a = QHBoxLayout(self.optsA)
-        a.setContentsMargins(0, 0, 0, 0)
-        a.setSpacing(8)
+        a = FlowLayout(self.optsA, hspacing=8, vspacing=6)
         self.modeBox = QWidget()
         mb = QHBoxLayout(self.modeBox)
         mb.setContentsMargins(0, 0, 0, 0)
@@ -826,9 +838,7 @@ class Card(QWidget):
         self.modeBtns[1].setChecked(True)
         a.addWidget(self.modeBox)
         self.tfBox = QWidget()
-        tfl = QHBoxLayout(self.tfBox)
-        tfl.setContentsMargins(0, 0, 0, 0)
-        tfl.setSpacing(4)
+        tfl = FlowLayout(self.tfBox, hspacing=4, vspacing=4)
         self.tfGroup = QButtonGroup(self)
         self.tfGroup.setExclusive(True)
         self.tfBtns = {}
@@ -890,9 +900,7 @@ class Card(QWidget):
         root.addWidget(self.optsA)
 
         self.optsB = QWidget()
-        b_ = QHBoxLayout(self.optsB)
-        b_.setContentsMargins(0, 0, 0, 0)
-        b_.setSpacing(6)
+        b_ = FlowLayout(self.optsB, hspacing=6, vspacing=6)
         self.btnSelAll = QPushButton("All")
         self.btnSelAll.setToolTip("Select the whole picture (Ctrl+A)")
         self.btnDeselect = QPushButton("None")
@@ -985,11 +993,20 @@ class Card(QWidget):
         self._sel_label()
         self._update_buttons()
 
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        side = getattr(self, "_side", None)
+        if side is not None:                      # the tab panel is a share of the window: never too wide on a small screen
+            w = int(max(300, min(460, self.width() * 0.27)))
+            if side.width() != w:
+                side.setFixedWidth(w)
+
     def _build_side(self):
         side = QWidget()
         side.setObjectName("panel")
         side.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         side.setFixedWidth(344)
+        self._side = side
         v = QVBoxLayout(side)
         v.setContentsMargins(12, 8, 6, 8)
         v.setSpacing(6)
@@ -1016,9 +1033,13 @@ class Card(QWidget):
                                     "Lighter or darker. White paper stays white-ish when you go up.", ""))
         gl.addWidget(self._look_row("contrast", "Contrast", -100, 100, ("flatter", "", "stronger"),
                                     "Difference between light and dark parts.", ""))
-        gl.addWidget(self._look_row("sat", "Saturation", 0, 200, ("whiter", "original", "more vivid"),
-                                    "Up: colors get stronger, white and gray never change.\n"
-                                    "Down: colors get lighter, up to white."))
+        gl.addWidget(self._look_row("sat", "Saturation", 0, 200, ("gray", "original", "very vivid"),
+                                    "How strong all colors are.  100 = as it is, 0 = a gray picture, 200 = twice as strong.\n"
+                                    "Brightness and hue stay the same; black, white and gray never change; strong colors\n"
+                                    "are eased in so they do not burn out."))
+        gl.addWidget(self._look_row("vib", "Vibrance", -100, 100, ("muted", "", "punchy"),
+                                    "Like saturation, but weak colors change more than colors that are already strong\n"
+                                    "(skin and strong inks are protected).", ""))
         gl.addWidget(self._look_row("hue", "Hue (turn the colors)", -180, 180, ("", "", ""),
                                     "Turns every color around the color wheel. Select only the red part, then +120 "
                                     "makes red into green.", "°"))
@@ -1061,7 +1082,7 @@ class Card(QWidget):
         # ---------------- Shadow
         pg, lay = self._page()
         lay.addWidget(self._scope_label())
-        g, gl = self._group_box("Shadow removal")
+        g, gl = self._group_box("One-click shadow removal")
         self.btnShadow = QPushButton("Remove shadow  (one click)")
         self.btnShadow.setProperty("accent", True)
         self.btnShadow.setMinimumHeight(40)
@@ -1074,7 +1095,16 @@ class Card(QWidget):
                 ("white", "Paper whiteness", ("greyer", "", "whiter"), "How white the paper gets."),
                 ("ink", "Text darkness", ("lighter", "", "darker"), "How dark the writing gets."),
                 ("scale", "Shadow size", ("small", "", "large"),
-                 "Small = follows small shadows (a pen, folds). Large = only wide, soft shadows.")):
+                 "Small = follows small shadows (a pen, folds). Large = only wide, soft shadows."),
+                ("even", "Even out the light", ("a little", "", "fully"),
+                 "How much of the uneven light is evened out.  Lower keeps some of the natural light and shade."),
+                ("depth", "Shadow depth", ("light only", "", "very dark too"),
+                 "How dark a shadow may be and still be lifted.  Raise it for deep shadows (a hand, a fold).\\n"
+                 "Lower it if dark parts of the picture (a black box) start to turn grey."),
+                ("tint", "Keep paper color", ("white", "", "keep tint"),
+                 "0 = the paper becomes neutral white.  Higher keeps its own color (cream, blue-ish ...)."),
+                ("clean", "Clean the paper", ("off", "", "strong"),
+                 "Almost-white paper (grain, faint stains, noise) becomes clean white.  Text is not touched.")):
             row = SliderRow(title, 0, 100, self.shadow_opts[key], caps, tip)
             row.changed.connect(lambda v, k=key: self._shadow_opt(k, int(v)))
             self.shadowRows[key] = row
@@ -1100,6 +1130,30 @@ class Card(QWidget):
         self.chkProtect.toggled.connect(lambda on: self._shadow_opt("protect", 1 if on else 0))
         gl.addWidget(self.chkProtect)
         lay.addWidget(g)
+        g2, gl2 = self._group_box("Manual shadow removal")
+        info = QLabel("Works at once - no click needed.  Select a part of the picture first (Select menu) to fix only "
+                      "that part, for example a shadow in one corner.  After the one-click button it fine-tunes the result.")
+        info.setObjectName("hint")
+        info.setWordWrap(True)
+        gl2.addWidget(info)
+        gl2.addWidget(self._look_row("flat", "Even out the light", 0, 100, ("off", "", "full"),
+                                     "Measures how light the paper is everywhere and brightens the dark parts to match.\n"
+                                     "Best for uneven light: one side darker, a window shadow, a curved page.", ""))
+        gl2.addWidget(self._look_row("flat_size", "Shadow size", 0, 100, ("small", "", "wide"),
+                                     "Small = follows small shadows (a finger, a fold).  Wide = only large soft shadows.\n"
+                                     "Used by 'Even out the light'.", ""))
+        gl2.addWidget(self._look_row("shlift", "Lift shadows", 0, 100, ("off", "", "strong"),
+                                     "Dull, shaded paper gets lighter.  Real black writing stays dark.\n"
+                                     "Use it for what is left after 'Even out the light'.", ""))
+        gl2.addWidget(self._look_row("white", "Whiten paper", 0, 100, ("off", "", "whiter"),
+                                     "Light grey paper becomes white.  Raise it until the paper is clean white.", ""))
+        gl2.addWidget(self._look_row("black", "Darken text", 0, 100, ("off", "", "darker"),
+                                     "Makes writing and lines darker (use it after 'Whiten paper').", ""))
+        self.btnShadowReset = QPushButton("Reset manual shadow")
+        self.btnShadowReset.setToolTip("Sets the five sliders above back to 'off'")
+        self.btnShadowReset.clicked.connect(self._reset_manual_shadow)
+        gl2.addWidget(self.btnShadowReset)
+        lay.addWidget(g2)
         lay.addStretch(1)
         self.stackPages.addWidget(pg)
 
@@ -1300,7 +1354,60 @@ class Card(QWidget):
             return
         self.runner.run(label, work, done, failed)
 
+    def dispose(self):
+        """The picture is being removed: stop timers, ignore everything that is still being computed for it."""
+        self._dead = True
+        for t in ("_timer", "_focus_timer", "_gest_timer", "_bg_timer", "_shadow_timer"):
+            tm = getattr(self, t, None)
+            if tm is not None:
+                tm.stop()
+        self.base = self.prev = self._lab = None
+        self.undo = []
+        self.redo = []
+        self._cache = {}
+
     # ------------------------------------------------------------- loading
+    def load_async(self, foreground=False):
+        """Open the picture in a worker thread (reading + preview), so sliding to it never freezes the window.
+        foreground = the picture the user is looking at: shows the progress bar.  Otherwise it is a quiet pre-load."""
+        if self._dead or self._loaded or self._failed or self._loading:
+            return
+        self._loading = True
+        self.canvas.set_message("Opening %s ..." % self.name)
+        path, adjs, look = self.path, copy.deepcopy(self.adjs), dict(self.look)
+
+        def work(progress):
+            progress(0.15, "reading")
+            base = core.load_image(path)
+            progress(0.7, "preparing the view")
+            return base, self._build_view(base, adjs, look, None, None)
+
+        def done(r):
+            self._loading = False
+            if self._dead or self._loaded or self._failed:
+                return
+            base, v = r
+            self.base = base
+            self._loaded = True
+            self._enable_tools(True)
+            self._adopt_view(v, True)
+            self._cur_snap = self._snap()
+            self._sel_label()
+            if self._pending is not None:             # settings copied from another picture while this one was not open
+                st, self._pending = self._pending, None
+                self._apply_now(st, rebuild=True)
+
+        def fail(msg):
+            self._loading = False
+            if self._dead:
+                return
+            self._failed = True
+            self.canvas.set_message("This picture cannot be opened\n%s" % msg.splitlines()[0])
+        if foreground and self.runner is not None:
+            self.runner.run("Opening " + self.name, work, done, fail, light=True)
+        else:
+            run_background(work, done, fail)
+
     def ensure_loaded(self):
         if self._loaded or self._failed:
             return
@@ -1332,7 +1439,7 @@ class Card(QWidget):
                           sel=sel if (sel is not None and sel.shape == prev.shape[:2]) else None)
         if deco is not None:
             out = deco(out)
-        return {"prev": prev, "scale": scale, "lab": lab, "cache": cache, "out": out}
+        return {"prev": prev, "scale": scale, "lab": lab, "cache": cache, "out": out, "qimg": np_to_qimage(out)}
 
     @staticmethod
     def _deco_from(ctx, alpha, layers, hide=None):
@@ -1361,7 +1468,7 @@ class Card(QWidget):
             self.sizeSlider.setValue(size)
             self.sizeSlider.blockSignals(False)
         self._sync_brush()
-        qimg = np_to_qimage(v["out"])
+        qimg = v.get("qimg") or np_to_qimage(v["out"])
         if refit:
             self.canvas.set_images(qimg, self.prev)
         else:
@@ -1430,15 +1537,17 @@ class Card(QWidget):
             if deco is not None:
                 out = deco(out)
             hl = None if focus is None else core.get_mask(prev, focus, lab, cache)
-            return out, hl, lab
+            return np_to_qimage(out), hl, lab
 
         def done(res):
             self._rendering = False
+            if self._dead:
+                return
             if gen == self._view_gen:
                 out, hl, lab = res
                 if self._lab is None and lab is not None:
                     self._lab = lab
-                self.canvas.set_display(np_to_qimage(out))
+                self.canvas.set_display(out)
                 self._show_highlight(focus, hl)
             if self._again:
                 self._again = False
@@ -1446,6 +1555,8 @@ class Card(QWidget):
 
         def fail(msg):
             self._rendering = False
+            if self._dead:
+                return
             self.message.emit("Preview problem: " + msg.splitlines()[0])
         run_background(work, done, fail)
 
@@ -1494,6 +1605,26 @@ class Card(QWidget):
 
     def result_image(self):
         return core.render_full(*self.render_args())
+
+    def render_source(self):
+        """A function that makes the final picture; call it in a worker thread.  A picture that was never opened is read
+        there too (with the settings copied to it), so saving many pictures does not freeze the window."""
+        if self._loaded or self._failed:
+            args = self.render_args()
+            return lambda: core.render_full(*args)
+        path, st = self.path, copy.deepcopy(self._pending)
+
+        def make():
+            base = core.load_image(path)
+            if st is None:
+                return base
+            look = core.new_look(**st["look"])
+            if st.get("shadow"):
+                opts = dict(core.SHADOW_DEFAULTS)
+                opts.update(st.get("shadow_opts") or {})
+                base = core.remove_shadow(base, opts["strength"] / 100.0, None, opts)
+            return core.render_full(base, copy.deepcopy(st["adjs"]), look, None, [])
+        return make
 
     def out_name(self):
         stem = os.path.splitext(self.name)[0]
@@ -1862,15 +1993,17 @@ class Card(QWidget):
         else:
             self.rotate(deg_ccw)
 
-    def edit_layer(self, lid):
+    def edit_layer(self, lid, then=None):
         """Work on ONE picture alone: Adjust / Shadow / Text / Select / Erase / Crop then change only this picture."""
         l = self._layer(lid)
         if l is None or not self._loaded:
             return
         if self.ctx == lid:
+            if then:
+                then()
             return
         if self.ctx is not None:
-            self.leave_layer(lambda: self.edit_layer(lid))
+            self.leave_layer(lambda: self.edit_layer(lid, then))
             return
         if self._tool in CROP_KEYS or self._tool == "transform":
             self._place_id = None
@@ -1898,7 +2031,10 @@ class Card(QWidget):
             self._adopt_view(v, True)
             self._touch()
             self._refresh_layers_ui()
-            self.message.emit("Editing this picture alone. All tools work on it only. Click 'Back to the page' when done.")
+            if then:
+                then()
+            else:
+                self.message.emit("Editing this picture alone. All tools work on it only. Click 'Back to the page' when done.")
         self._job("Opening picture", work, done)
 
     def leave_layer(self, then=None):
@@ -2071,10 +2207,19 @@ class Card(QWidget):
     # ------------------------------------------- settings shared by all pictures
     def apply_action(self, act):
         """'Apply last setting to all': copies only the LAST changed setting from another picture (never crop, erase ...)."""
-        self.ensure_loaded()
-        if not self._loaded:
-            return
         k = act["kind"]
+        if not self._loaded:                          # not opened yet: remember it, it is applied when the picture opens
+            st = self._pending or {"adjs": [], "look": dict(self.look), "shadow_opts": dict(self.shadow_opts), "shadow": False}
+            if k == "look":
+                st["look"][act["key"]] = act["value"]
+            elif k == "adjs":
+                st["adjs"] = copy.deepcopy(act["adjs"])
+            elif k == "shadow":
+                st["shadow_opts"] = dict(act["opts"])
+                st["shadow"] = True
+            self._pending = st
+            self._touch()
+            return
         if k == "look":
             self._checkpoint()
             self.look[act["key"]] = act["value"]
@@ -2450,6 +2595,15 @@ class Card(QWidget):
         """From a menu, a button or a key. Transform needs a selection, so it has its own start."""
         if key == "transform":
             self.start_transform()
+        elif key in CROP_KEYS and self.ctx is None and self._place_id is not None and self._layer(self._place_id) is not None:
+            # a picture (signature, stamp ...) is selected on the page: crop THAT picture, then go back to the page
+            lid = self._place_id
+
+            def start():
+                self._auto_back = True                       # set only now: opening the picture resets it
+                self._set_tool(key)
+                self.message.emit("Cropping the selected picture. (Click outside the picture first to crop the page instead.)")
+            self.edit_layer(lid, then=start)
         else:
             self._set_tool(key)
 
@@ -2459,7 +2613,9 @@ class Card(QWidget):
     def _set_tool(self, key):
         if not self._loaded and key != "view":
             return
-        if self.ctx is not None and key in ("persp", "transform", "copy"):
+        if key not in CROP_KEYS:
+            self._auto_back = False
+        if self.ctx is not None and key in ("transform", "copy"):
             self._warn("Not inside a picture. Use 'Move / resize' on the picture in the Picture tab to place it.")
             return
         if key != "transform" and self._place_id is not None:      # a picture was not placed: it stays where it was
@@ -2470,6 +2626,7 @@ class Card(QWidget):
         self._tool = key
         self.canvas.copy_mode = key == "copy"
         self.canvas.set_mode(mode, shape)
+        self.canvas.set_crop_shape(CROP_SHAPE.get(key, "rect"))
         if key in ERASE_KEYS:
             self.canvas.set_erase(SHAPES[key])
         self.btnHand.setChecked(key == "view")
@@ -2533,7 +2690,11 @@ class Card(QWidget):
         if self._tool in ERASE_KEYS:
             self._clear_clone()
         elif self._tool in CROP_KEYS or self._tool == "transform":
+            back = self._auto_back
             self._go_move()
+            if back and self.ctx is not None:                  # the picture was opened only for this crop
+                self._auto_back = False
+                self.leave_layer()
 
     def _sync_brush(self):
         size = self.sizeSlider.value()
@@ -2597,26 +2758,88 @@ class Card(QWidget):
         c = self.canvas
         s = self.scale
         base = self.base
+        alpha = self.alpha
+        inlayer = self.ctx is not None
+        back = self._auto_back
+        alpha_make = None
         if self._tool == "crop":
             l, t, r, b = c.crop_rect_img()
             box = (l / s, t / s, r / s, b / s)
 
             def make(progress):
                 return core.crop_box(base, box)
-            alpha_make = (lambda progress: core.crop_box(self.alpha.convert("RGB"), box).convert("L")) if self.ctx is not None else None
+            if inlayer:
+                alpha_make = lambda progress: core.crop_box(alpha.convert("RGB"), box).convert("L")
         elif self._tool == "persp":
             quad = [(x / s, y / s) for x, y in c.quad_img()]
 
             def make(progress):
                 return core.warp_quad(base, quad)
+            if inlayer:                                       # the transparency is straightened the same way
+                alpha_make = lambda progress: core.warp_quad(alpha.convert("RGB"), quad).convert("L")
+        elif self._tool in CROP_SHAPE:                        # circle / oval / rounded box
+            l, t, r, b = [v / s for v in c.crop_rect_img()]
+            shape = "round" if self._tool == "crop_round" else "oval"
+            if self._tool == "crop_circle":                   # a circle fits in the shorter side, centred in the box
+                side = min(r - l, b - t)
+                cx, cy = (l + r) / 2.0, (t + b) / 2.0
+                l, t, r, b = cx - side / 2.0, cy - side / 2.0, cx + side / 2.0, cy + side / 2.0
+            box = (l, t, r, b)
+            cache = {}
+
+            def shaped():
+                if "v" not in cache:
+                    cache["v"] = core.crop_to_shape(base, alpha if inlayer else None, box, shape)
+                return cache["v"]
+
+            def make(progress):
+                return shaped()[0]
+            if inlayer:
+                alpha_make = lambda progress: shaped()[1]
         else:
             return
 
         def after():
             self._clear_clone()
             self._go_move()
-        self._edit_base("Cropping", make, keep_sel=False, refit=True, after=after,
-                        alpha_make=locals().get("alpha_make"))
+            if back:                                          # a picture was opened only for this crop
+                self._auto_back = False
+                self.leave_layer()
+        self._edit_base("Cropping", make, keep_sel=False, refit=True, after=after, alpha_make=alpha_make)
+
+    def crop_to_selection(self):
+        """Keeps only what is inside the current selection (any shape: box, ellipse, freehand, color range).
+        A picture (signature, stamp ...) becomes transparent outside the shape; on the page the outside gets the paper color."""
+        if not self._loaded:
+            return
+        if self.ctx is None and self._place_id is not None and self._layer(self._place_id) is not None:
+            lid = self._place_id                              # a picture is selected: draw the shape on that picture
+            self.edit_layer(lid, then=lambda: self.message.emit(
+                "Now select the shape you want to keep (Select menu: Box, Ellipse, Freehand ...), then choose "
+                "Crop > Crop to the selection shape again."))
+            return
+        if self.sel is None:
+            self._warn("First select the shape you want to keep (Select menu: Box, Ellipse, Freehand, Color range), "
+                       "then choose this again.")
+            return
+        bb = core.sel_bbox(self.sel, pad=0)
+        if bb is None:
+            self._warn("The selection is empty.")
+            return
+        y0, y1, x0, x1 = bb
+        s = self.scale
+        box = (x0 / s, y0 / s, x1 / s, y1 / s)
+        base, alpha, inlayer = self.base, self.alpha, self.ctx is not None
+        mask = self._mask_img(self.sel, base.size)
+        cache = {}
+
+        def shaped():
+            if "v" not in cache:
+                cache["v"] = core.crop_to_shape(base, alpha if inlayer else None, box, None, mask=mask)
+            return cache["v"]
+        self._edit_base("Cropping to the shape", lambda progress: shaped()[0], keep_sel=False, refit=True,
+                        alpha_make=(lambda progress: shaped()[1]) if inlayer else None,
+                        msg="Cropped to the selected shape.")
 
     def _apply_transform(self):
         p = self.canvas.transform_params()
@@ -2699,6 +2922,18 @@ class Card(QWidget):
         self._edit_base("Removing shadows", make, after=after, shadow_src=src, merge=live, fail=lambda m: finish(),
                         msg=None if live else "Shadow removed. Move the sliders to change it, Ctrl+Z to undo.")
 
+    MANUAL_SHADOW = ("flat", "flat_size", "shlift", "white", "black")
+
+    def _reset_manual_shadow(self):
+        if not self._loaded:
+            return
+        self._begin_change()
+        for k in self.MANUAL_SHADOW:
+            self.look[k] = core.DEFAULT_LOOK[k]
+        self._sync_sliders()
+        self._timer.start()
+        self._touch()
+
     def _shadow_opt(self, key, v):
         self.shadow_opts[key] = v
         if self.shadow_src is not None:              # shadow already applied: follow the slider live
@@ -2707,19 +2942,11 @@ class Card(QWidget):
     def reset_image(self):
         if not self._loaded:
             return
-        try:
-            base = core.load_image(self.path)
-        except Exception as ex:
-            self.message.emit("Cannot reload: %s" % ex)
-            return
+        path = self.path
         self._checkpoint()                           # Reset can be undone too
-        self.base = base
         self.adjs = []
         self.look = core.new_look()
         self.shadow_opts = dict(core.SHADOW_DEFAULTS)
-        self.ops = 0
-        self.sel = None
-        self._sel_ver += 1
         self._shadow_done = False
         self.shadow_src = None
         self._pending = None
@@ -2727,8 +2954,18 @@ class Card(QWidget):
         self._sync_sliders()
         self._clear_clone()
         self._go_move()
-        self._rebuild_preview(refit=True)
-        self._touch()
+
+        def make(progress):
+            progress(0.2, "reading the original")
+            return core.load_image(path)
+
+        def after():
+            self.ops = 0
+            self.sel = None
+            self._sel_ver += 1
+            self._touch()
+        self._edit_base("Resetting " + self.name, make, keep_sel=False, refit=True, checkpoint=False, after=after,
+                        fail=lambda msg: self.message.emit("Cannot reload: " + msg.splitlines()[0]))
 
     # ------------------------------------------------------ copy / drag out
     def export_ready(self):
@@ -2755,12 +2992,16 @@ class Card(QWidget):
 
         def done(path):
             self._exporting = False
+            if self._dead:
+                return
             self._export = (ver, path)
             self.exportReady.emit()
 
         def fail(msg):
             self._exporting = False
             self._drag_wait = None
+            if self._dead:
+                return
             self.message.emit("Could not prepare the picture: " + msg.splitlines()[0])
         run_background(work, done, fail)
 
@@ -2788,17 +3029,10 @@ class Card(QWidget):
         return md, path
 
     def copy_image(self):
+        """Ctrl+C / the Copy button: the window makes the file in a worker thread and fills the clipboard."""
         if not self._loaded:
             return
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            md, _ = self.make_mime()
-            QApplication.clipboard().setMimeData(md)
-            self.message.emit("Copied. Paste it anywhere with Ctrl+V.")
-        except Exception as ex:
-            self.message.emit("Could not copy: %s" % ex)
-        finally:
-            QApplication.restoreOverrideCursor()
+        self.copyRequested.emit(self)
 
     def begin_drag(self, source):
         """Starts the drag. If the file is not ready yet, waits for it while the mouse button stays down."""

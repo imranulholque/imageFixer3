@@ -4,20 +4,20 @@ import tempfile
 import time
 
 from PIL import Image, ImageOps
-from PySide6.QtCore import (QEasingCurve, QObject, QRunnable, QSettings, QSize, Qt, QThreadPool, QTimer, QUrl,
-                            QVariantAnimation, Signal)
+from PySide6.QtCore import (QEasingCurve, QEvent, QItemSelectionModel, QObject, QRect, QRunnable, QSettings, QSize, Qt, QThreadPool, QTimer,
+                            QUrl, QVariantAnimation, Signal)
 from PySide6.QtCore import QMimeData
-from PySide6.QtGui import (QAction, QDesktopServices, QDrag, QFontMetrics, QIcon, QImage, QKeySequence, QPixmap,
-                           QShortcut)
+from PySide6.QtGui import (QAction, QActionGroup, QColor, QDesktopServices, QDrag, QFontMetrics, QIcon, QImage,
+                           QKeySequence, QPainter, QPixmap, QShortcut)
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel,
                                QListView, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QProgressBar,
-                               QPushButton, QStackedLayout, QSystemTrayIcon, QVBoxLayout, QWidget)
+                               QPushButton, QSizePolicy, QStackedLayout, QSystemTrayIcon, QVBoxLayout, QWidget)
 
 import core
 import winutil
-from card import Card
+from card import EXPORT_DIR, Card
 from jobs import JobRunner
-from theme import logo_pixmap, make_icon
+from theme import logo_pixmap, make_icon, scaled_qss
 
 FILTER = "Pictures (%s);;All files (*)" % " ".join("*" + e for e in sorted(core.IMG_EXT))
 
@@ -55,21 +55,93 @@ class ThumbJob(QRunnable):
 
 
 class Strip(QListWidget):
-    """Thumbnails. Dragging one out gives that picture (with its edits) to other programs."""
+    """Thumbnails, selected like files in Explorer: click, Ctrl+click, Shift+click, drag a box, Ctrl+A.
+    Delete removes the selected pictures, Ctrl+C copies them, dragging them out gives the files (with their edits)
+    to other programs."""
+    removeRequested = Signal(list)      # uids of the selected pictures
+    copyRequested = Signal(list)
 
     def __init__(self):
         super().__init__()
-        self.provider = None
-        self.preparer = None
+        self.provider = None            # provider(list of uids) -> QMimeData
+        self.preparer = None            # preparer(uid): make the edited file in the background
         self._press = None
         self._press_item = None
         self.setMouseTracking(True)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._context_menu)
         self.itemEntered.connect(lambda it: self.preparer(it.data(Qt.ItemDataRole.UserRole)) if self.preparer else None)
 
+    def uids(self):
+        """Selected pictures, in the order of the strip."""
+        return [self.item(r).data(Qt.ItemDataRole.UserRole) for r in range(self.count()) if self.item(r).isSelected()]
+
+    # ---- keys.  The window has its own Delete / Ctrl+A / Ctrl+C (for the picture): while the thumbnails have the
+    # focus (after a click on them) these keys belong to the thumbnails.
+    def event(self, e):
+        if e.type() == QEvent.Type.ShortcutOverride:
+            k = e.key()
+            ctrl = bool(e.modifiers() & Qt.KeyboardModifier.ControlModifier)
+            if k in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace) or (ctrl and k in (Qt.Key.Key_A, Qt.Key.Key_C)):
+                e.accept()
+                return True
+        return super().event(e)
+
+    def keyPressEvent(self, e):
+        k = e.key()
+        ctrl = bool(e.modifiers() & Qt.KeyboardModifier.ControlModifier)
+        if k in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            u = self.uids()
+            if u:
+                self.removeRequested.emit(u)
+            e.accept()
+            return
+        if ctrl and k == Qt.Key.Key_A:
+            self.selectAll()
+            e.accept()
+            return
+        if ctrl and k == Qt.Key.Key_C:
+            u = self.uids()
+            if u:
+                self.copyRequested.emit(u)
+            e.accept()
+            return
+        super().keyPressEvent(e)
+
+    def _context_menu(self, pos):
+        it = self.itemAt(pos)
+        if it is not None and not it.isSelected():
+            self.clearSelection()
+            it.setSelected(True)
+        u = self.uids()
+        n = len(u)
+        what = "this picture" if n == 1 else "%d pictures" % n
+        m = QMenu(self)
+        a_rm = m.addAction("Remove %s from the list      Del" % what)
+        a_cp = m.addAction("Copy %s      Ctrl+C" % what)
+        a_rm.setEnabled(n > 0)
+        a_cp.setEnabled(n > 0)
+        m.addSeparator()
+        a_all = m.addAction("Select all      Ctrl+A")
+        act = m.exec(self.viewport().mapToGlobal(pos))
+        if act is a_rm:
+            self.removeRequested.emit(u)
+        elif act is a_cp:
+            self.copyRequested.emit(u)
+        elif act is a_all:
+            self.selectAll()
+
+    # ---- mouse: Qt does the selection; we start the drag ourselves
     def mousePressEvent(self, e):
         self._press = e.position().toPoint() if e.button() == Qt.MouseButton.LeftButton else None
         self._press_item = self.itemAt(e.position().toPoint())
         super().mousePressEvent(e)
+        if self._press is not None and self.preparer is not None:
+            for u in self.uids():                       # the edited files are made now, so a drag can start at once
+                self.preparer(u)
+            if self._press_item is not None:
+                self.preparer(self._press_item.data(Qt.ItemDataRole.UserRole))
 
     def mouseMoveEvent(self, e):
         """Our own drag start (Qt's list drag does not start in this layout): press a thumbnail, move a little."""
@@ -78,7 +150,7 @@ class Strip(QListWidget):
             it = self._press_item
             self._press = None
             self._press_item = None
-            self._drag_item(it)
+            self._drag_items(it)
             return
         super().mouseMoveEvent(e)
 
@@ -87,21 +159,42 @@ class Strip(QListWidget):
         self._press_item = None
         super().mouseReleaseEvent(e)
 
-    def _drag_item(self, it):
-        """Always COPY: a move would take the user's original file away."""
+    def _drag_pixmap(self, it, n):
+        ic = it.icon()
+        pm = ic.pixmap(96, 96) if not ic.isNull() else QPixmap()
+        if pm.isNull():
+            pm = QPixmap(96, 96)
+            pm.fill(QColor("#222836"))
+        if n > 1:                                       # a badge with the number of pictures that are dragged
+            pm = pm.copy()
+            p = QPainter(pm)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            r = QRect(max(0, pm.width() - 36), 0, 36, 26)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor("#6366f1"))
+            p.drawRoundedRect(r, 13, 13)
+            p.setPen(QColor("white"))
+            p.drawText(r, int(Qt.AlignmentFlag.AlignCenter), str(n))
+            p.end()
+        return pm
+
+    def _drag_items(self, it):
+        """Always COPY: a move would take the user's original file away.  Dragging one of several selected
+        thumbnails takes all of them; dragging an unselected one takes only that one."""
         if self.provider is None:
             return
+        uids = self.uids() if it.isSelected() else [it.data(Qt.ItemDataRole.UserRole)]
         try:
-            md = self.provider(it.data(Qt.ItemDataRole.UserRole))
+            md = self.provider(uids)
         except Exception:
             md = None
         if md is None:
             return
         d = QDrag(self)
         d.setMimeData(md)
-        ic = it.icon()
-        if not ic.isNull():
-            d.setPixmap(ic.pixmap(96, 96))
+        pm = self._drag_pixmap(it, len(uids))
+        d.setPixmap(pm)
+        d.setHotSpot(pm.rect().center())
         d.exec(Qt.DropAction.CopyAction, Qt.DropAction.CopyAction)
 
     def startDrag(self, supportedActions):
@@ -110,7 +203,7 @@ class Strip(QListWidget):
     def mimeData(self, items):
         if self.provider is not None and items:
             try:
-                md = self.provider(items[0].data(Qt.ItemDataRole.UserRole))
+                md = self.provider([i.data(Qt.ItemDataRole.UserRole) for i in items])
             except Exception:
                 md = None
             if md is not None:
@@ -146,19 +239,32 @@ class Carousel(QWidget):
         self._layout()
 
     def remove_card(self, card):
-        i = self.cards.index(card)
-        self.cards.remove(card)
-        card.hide()
-        card.setParent(None)
-        card.deleteLater()
+        self.remove_cards([card])
+
+    def remove_cards(self, cards):
+        """Several pictures at once: one re-layout, one signal.  The picture next to the removed place is shown."""
+        gone = [c for c in cards if c in self.cards]
+        if not gone:
+            return
+        old_idx = self._idx
+        removed_before = sum(1 for c in gone if self.cards.index(c) < old_idx)
+        cur_removed = self.cards[old_idx] in gone if self.cards else False
+        for c in gone:
+            self.cards.remove(c)
+            if hasattr(c, "dispose"):
+                c.dispose()
+            c.hide()
+            c.setParent(None)
+            c.deleteLater()
         self._anim.stop()
-        if i < self._idx:
-            self._idx -= 1
+        self._idx = old_idx - removed_before
+        if cur_removed:
+            pass                                         # the next picture moved into this place
         self._idx = max(0, min(self._idx, len(self.cards) - 1))
         self._pos = float(self._idx)
         self._layout()
         if self.cards:
-            self.cards[self._idx].ensure_loaded()
+            self.cards[self._idx].load_async(foreground=True)
         self.currentChanged.emit(self._idx)
 
     def current(self):
@@ -179,7 +285,7 @@ class Carousel(QWidget):
         if not self.cards:
             return
         i = max(0, min(i, len(self.cards) - 1))
-        self.cards[i].ensure_loaded()
+        self.cards[i].load_async(foreground=True)
         changed = i != self._idx
         self._idx = i
         self._anim.stop()
@@ -193,8 +299,8 @@ class Carousel(QWidget):
         if changed:
             self.currentChanged.emit(i)
             nxt = i + 1
-            if nxt < len(self.cards):
-                QTimer.singleShot(400, self.cards[nxt].ensure_loaded)
+            if nxt < len(self.cards):                    # the next picture is opened quietly in the background
+                QTimer.singleShot(600, self.cards[nxt].load_async)
 
     def next(self):
         self.go_to(self._idx + 1)
@@ -259,7 +365,18 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Image Fixer")
         self.setWindowIcon(make_icon())
         self.setAcceptDrops(True)
-        self.setMinimumSize(940, 600)
+        scr = QApplication.primaryScreen()
+        geo = scr.availableGeometry() if scr is not None else QRect(0, 0, 1366, 768)
+        self._screen_long = max(geo.width(), geo.height()) * (scr.devicePixelRatio() if scr is not None else 1.0)
+        self._ui_scale = 1.0
+        self._add_queue = []                       # pictures waiting to get their card (added in small slices)
+        self._add_total = 0
+        self._add_done = 0
+        self._add_first = None
+        self._adding = False
+        # a small screen must never be forced wider / taller than it is
+        self.setMinimumSize(min(940, int(geo.width() * 0.92)), min(600, int(geo.height() * 0.88)))
+        self._apply_quality(self.settings.value("quality", "auto", type=str), say=False)
 
         central = QWidget()
         central.setObjectName("root")
@@ -278,6 +395,8 @@ class MainWindow(QMainWindow):
         self.thumbs.done.connect(self._thumb_done)
         self._build_tray()
         self._build_shortcuts()
+        self._apply_ui_size(self.settings.value("ui_size", "auto", type=str), say=False)
+        self._fit_layout()
         self._refresh_dir()
         self._refresh_counts()
 
@@ -292,6 +411,7 @@ class MainWindow(QMainWindow):
         logo.setPixmap(logo_pixmap(30))
         brand = QLabel("Image Fixer")
         brand.setObjectName("brand")
+        self.lblBrand = brand
         l.addWidget(logo)
         l.addWidget(brand)
         l.addSpacing(14)
@@ -310,6 +430,7 @@ class MainWindow(QMainWindow):
         l.addWidget(self.btnPhone)
         l.addStretch(1)
         self.btnFolder = QPushButton("Save folder: not set")
+        self.btnFolder.setMinimumWidth(60)
         self.btnFolder.setToolTip("Edited pictures are saved here. Click to change.")
         self.btnFolder.clicked.connect(self.choose_dir)
         self.btnOpenDir = QPushButton("Open")
@@ -340,10 +461,30 @@ class MainWindow(QMainWindow):
         a.triggered.connect(self.choose_dir)
         m.addAction(a)
         m.addSeparator()
+        self._radio_menu(m, "Picture detail (sharpness on screen)", "quality", self._apply_quality,
+                         (("auto", "Automatic (best for this screen)"), ("fast", "Fast  (slow computers)"),
+                          ("balanced", "Balanced"), ("sharp", "Sharp"), ("max", "Maximum  (big screens)")))
+        self._radio_menu(m, "Interface size", "ui_size", self._apply_ui_size,
+                         (("auto", "Automatic"), ("small", "Small"), ("normal", "Normal"), ("large", "Large"),
+                          ("xl", "Extra large")))
+        m.addSeparator()
         q = QAction("Exit Image Fixer", self)
         q.triggered.connect(self.quit_app)
         m.addAction(q)
         return m
+
+    def _radio_menu(self, menu, title, key, fn, choices):
+        sub = menu.addMenu(title)
+        grp = QActionGroup(self)
+        grp.setExclusive(True)
+        cur = self.settings.value(key, "auto", type=str)
+        for val, text in choices:
+            a = QAction(text, self)
+            a.setCheckable(True)
+            a.setChecked(val == cur)
+            grp.addAction(a)
+            a.triggered.connect(lambda _=False, v=val: (self.settings.setValue(key, v), fn(v)))
+            sub.addAction(a)
 
     def _build_empty(self):
         w = QWidget()
@@ -399,6 +540,8 @@ class MainWindow(QMainWindow):
         self.strip = Strip()
         self.strip.provider = self._mime_for
         self.strip.preparer = self._prepare_for
+        self.strip.removeRequested.connect(self.remove_by_uids)
+        self.strip.copyRequested.connect(self.copy_by_uids)
         self.strip.setDragEnabled(False)
         self.strip.setDragDropMode(QAbstractItemView.DragDropMode.NoDragDrop)
         self.strip.setDefaultDropAction(Qt.DropAction.CopyAction)
@@ -407,12 +550,14 @@ class MainWindow(QMainWindow):
         self.strip.setFlow(QListView.Flow.LeftToRight)
         self.strip.setWrapping(False)
         self.strip.setMovement(QListView.Movement.Static)
-        self.strip.setIconSize(QSize(64, 64))
         self.strip.setSpacing(4)
-        self.strip.setFixedHeight(104)
         self.strip.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
-        self.strip.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.strip.currentRowChanged.connect(self._strip_changed)
+        self.strip.setFocusPolicy(Qt.FocusPolicy.ClickFocus)     # a click on the thumbnails gives them the keyboard (Delete ...)
+        self.strip.setToolTip("Click = select.  Ctrl + click / Shift + click = select several.  Del = remove, Ctrl+C = copy.\n"
+                              "Drag the selected pictures out to take them to another program.")
+        self.strip.itemSelectionChanged.connect(self._strip_selection)
+        self._thumb_px = 64
+        self._apply_thumb_size()
         self.btnPageL = QPushButton("\u21e0")
         self.btnPageR = QPushButton("\u21e2")
         for pb, d, tip in ((self.btnPageL, -1, "Move this page earlier (page order in the PDF)"),
@@ -421,16 +566,17 @@ class MainWindow(QMainWindow):
             pb.setProperty("flat", True)
             pb.clicked.connect(lambda _=False, d=d: self.move_page(d))
         self.progress = QProgressBar()
-        self.progress.setFixedWidth(170)
+        self.progress.setFixedWidth(130)
         self.progress.setTextVisible(False)
         self.progress.hide()
         self.lblCount = QLabel("")
         self.lblCount.setObjectName("muted")
-        self.lblCount.setMinimumWidth(70)
+        self.lblCount.setMinimumWidth(96)
         self.lblStatus = QLabel("")
         self.lblStatus.setObjectName("muted")
-        self.lblStatus.setMinimumWidth(260)
+        self.lblStatus.setMinimumWidth(120)
         self.lblStatus.setMaximumWidth(420)
+        self.lblStatus.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
         self.lblStatus.setWordWrap(True)
         b.addWidget(self.btnPrev)
         b.addWidget(self.strip, 1)
@@ -501,7 +647,7 @@ class MainWindow(QMainWindow):
         sc("R", lambda: self._with_current(lambda c: c.rotate_key(-90.0)))      # 90° right: the selected picture, else the page
         sc("Shift+R", lambda: self._with_current(lambda c: c.rotate_key(90.0)))   # 90° left
         sc("Ctrl+V", self.paste)
-        sc("Ctrl+C", cur(lambda c: c.copy_image()))
+        sc("Ctrl+C", cur(lambda c: self.copy_cards([c])))
         sc("Ctrl+O", self.choose_files)
         sc("Ctrl+S", cur(self.save_card))
         sc("Ctrl+Shift+S", self.save_all)
@@ -551,10 +697,68 @@ class MainWindow(QMainWindow):
             self.lblStatus.setText("")                  # the work is finished: remove "Selecting" etc.
 
     def _busy(self):
-        if self.runner.busy:
+        if self.runner.heavy_busy:
             self.say("Please wait until the current work is finished.")
             return True
         return False
+
+    # ------------------------------------------------------------ layout that follows the window / screen
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._fit_layout()
+
+    def _fit_layout(self):
+        """Small window: shorter texts, thumbnails that fit the height.  Nothing is cut off or pushed out."""
+        if not hasattr(self, "btnChoose"):
+            return
+        w, h = self.width(), self.height()
+        self.lblBrand.setVisible(w >= 1050)
+        self.btnOpenDir.setVisible(w >= 880)
+        self.btnPhone.setText("Add from phone" if w >= 1000 else "Phone")
+        self.btnChoose.setText("+  Choose files" if w >= 900 else "+  Files")
+        self._refresh_dir()
+        px = int(round((56 if h < 720 else 64 if h < 1000 else 80) * self._ui_scale))
+        if px != self._thumb_px:
+            self._thumb_px = px
+            self._apply_thumb_size()
+
+    def _thumb_hint(self):
+        return QSize(self._thumb_px + 32, self._thumb_px + 26)
+
+    def _apply_thumb_size(self):
+        px = self._thumb_px
+        self.strip.setIconSize(QSize(px, px))
+        hint = self._thumb_hint()
+        self.strip.setFixedHeight(hint.height() + 16)
+        for r in range(self.strip.count()):
+            self.strip.item(r).setSizeHint(hint)
+        for c in getattr(self.carousel, "cards", []):
+            it = self.items.get(c.uid)
+            if it is not None:
+                it.setText(self._label(c))
+
+    def _apply_quality(self, level, say=True):
+        """How big the working copy on the screen is.  Bigger = sharper when zoomed in (a little slower on old computers)."""
+        n = core.quality_preview_max(level, self._screen_long)
+        core.set_preview_max(n)
+        if say:
+            self.say("Picture detail set. It is used for pictures opened from now on (up to %d px on the long side)." % n)
+
+    def _apply_ui_size(self, mode, say=True):
+        """Text / button size: automatic = from the screen (small laptop screens a bit smaller, 4K a bit larger)."""
+        scr = QApplication.primaryScreen()
+        geo = scr.availableGeometry() if scr is not None else QRect(0, 0, 1366, 768)
+        if mode == "auto":
+            f = 0.92 if geo.height() < 800 else (1.2 if geo.width() >= 2500 else 1.0)
+        else:
+            f = {"small": 0.9, "normal": 1.0, "large": 1.15, "xl": 1.3}.get(mode, 1.0)
+        self._ui_scale = f
+        QApplication.instance().setStyleSheet(scaled_qss(f))
+        if hasattr(self, "strip"):
+            self._thumb_px = int(round((56 if self.height() < 720 else 64 if self.height() < 1000 else 80) * f))
+            self._apply_thumb_size()
+        if say:
+            self.say("Interface size changed.")
 
     # ------------------------------------------------------------ show/hide
     def show_front(self):
@@ -658,18 +862,52 @@ class MainWindow(QMainWindow):
         return [p for p in out if os.path.isfile(p) and os.path.splitext(p)[1].lower() in core.IMG_EXT]
 
     def add_files(self, paths):
-        have = {c.path for c in self.carousel.cards}
-        files = [p for p in self._expand(paths) if p not in have]
+        have = {c.path for c in self.carousel.cards} | set(self._add_queue)
+        files = []
+        for p in self._expand(paths):
+            if p not in have:
+                have.add(p)
+                files.append(p)
         if not files:
             self.say("No new pictures found.")
             return
-        first = len(self.carousel.cards)
-        for p in files:
-            self._add_one(p)
-        self.stack.setCurrentIndex(1)
-        self.carousel.go_to(first, animate=False)
-        self._current_changed(self.carousel.index)
-        self.say("Added %d picture(s)." % len(files))
+        self._add_queue.extend(files)
+        self._add_total += len(files)
+        if not self._adding:
+            self._adding = True
+            self._add_first = None
+            self.stack.setCurrentIndex(1)
+            QTimer.singleShot(0, self._add_tick)
+
+    def _add_tick(self):
+        """Makes the cards a few at a time (about 30 ms of work, then the window may repaint and react)."""
+        t0 = time.monotonic()
+        while self._add_queue and (time.monotonic() - t0) < 0.03:
+            first = self._add_first is None
+            if first:
+                self._add_first = len(self.carousel.cards)
+            self._add_one(self._add_queue.pop(0))
+            self._add_done += 1
+            if first:                                                      # the first new picture opens at once
+                self.carousel.go_to(self._add_first, animate=False)
+                self._current_changed(self.carousel.index)
+        if self._add_total > 6:                                             # a long list: show how far it is
+            self.progress.setVisible(True)
+            self.progress.setRange(0, max(1, self._add_total))
+            self.progress.setValue(self._add_done)
+            self.lblStatus.setText("Adding pictures  %d / %d" % (self._add_done, self._add_total))
+        self._refresh_counts()
+        if self._add_queue:
+            QTimer.singleShot(0, self._add_tick)
+            return
+        n = self._add_total
+        self._adding = False
+        self._add_total = self._add_done = 0
+        if not self.runner.busy:
+            self.progress.setVisible(False)
+        if self._add_first is not None and self.carousel.cards:
+            self._current_changed(self.carousel.index)
+        self.say("Added %d picture(s)." % n)
         self._refresh_counts()
 
     def _add_one(self, path):
@@ -677,6 +915,7 @@ class MainWindow(QMainWindow):
         c.runner = self.runner
         c.editedChanged.connect(self._card_edited)
         c.removeRequested.connect(self.remove_card)
+        c.copyRequested.connect(lambda card: self.copy_cards([card]))
         c.saveRequested.connect(self.save_card)
         c.saveAsRequested.connect(self.save_card_as)
         c.saveAllRequested.connect(self.save_all)
@@ -685,7 +924,7 @@ class MainWindow(QMainWindow):
         c.message.connect(self.say)
         self.carousel.add_card(c)
         it = QListWidgetItem(self._label(c))
-        it.setSizeHint(QSize(96, 90))
+        it.setSizeHint(self._thumb_hint())
         it.setToolTip(path + "\n(drag it out to take the picture to another program)")
         it.setData(Qt.ItemDataRole.UserRole, c.uid)
         it.setTextAlignment(Qt.AlignmentFlag.AlignHCenter)
@@ -705,19 +944,23 @@ class MainWindow(QMainWindow):
         if c.is_edited():
             mark = "\u25cf " if c.is_unsaved() else "\u2713 "
         fm = QFontMetrics(self.font())
-        return mark + fm.elidedText(c.name, Qt.TextElideMode.ElideMiddle, 84)
+        return mark + fm.elidedText(c.name, Qt.TextElideMode.ElideMiddle, self._thumb_px + 20)
 
     # ------------------------------------------------------------ navigation
-    def _strip_changed(self, row):
-        if self._sync or row < 0:
+    def _strip_selection(self):
+        """One thumbnail selected = show that picture.  Several (Ctrl / Shift) = just a selection, nothing slides."""
+        if self._sync:
             return
-        self.carousel.go_to(row)
+        rows = [self.strip.row(i) for i in self.strip.selectedItems()]
+        if len(rows) == 1:
+            self.carousel.go_to(rows[0])
+        self._refresh_counts()
 
     def _current_changed(self, i):
         prev = self._sync
         self._sync = True
         if 0 <= i < self.strip.count():
-            self.strip.setCurrentRow(i)
+            self.strip.setCurrentRow(i, QItemSelectionModel.SelectionFlag.ClearAndSelect)   # just this one is selected
             self.strip.scrollToItem(self.strip.item(i))
         self._sync = prev
         self._refresh_counts()
@@ -725,7 +968,11 @@ class MainWindow(QMainWindow):
     def _refresh_counts(self):
         n = len(self.carousel.cards) if hasattr(self, "carousel") else 0
         i = self.carousel.index if n else 0
-        self.lblCount.setText("%d / %d" % (i + 1, n) if n else "")
+        sel = len(self.strip.selectedItems()) if hasattr(self, "strip") and n else 0
+        if n and sel > 1:
+            self.lblCount.setText("%d selected  (%d)" % (sel, n))
+        else:
+            self.lblCount.setText("%d / %d" % (i + 1, n) if n else "")
         self.btnPrev.setEnabled(n > 1 and i > 0)
         self.btnNext.setEnabled(n > 1 and i < n - 1)
         unsaved = sum(1 for c in self.carousel.cards if c.is_unsaved()) if n else 0
@@ -779,15 +1026,70 @@ class MainWindow(QMainWindow):
         if c is not None and not self.runner.busy:
             c.prepare_export()
 
-    def _mime_for(self, uid):
-        c = self._card(uid)
-        if c is None:
+    def _mime_for(self, uids):
+        """The files of one or several pictures (with their edits) for a drag."""
+        if isinstance(uids, str):
+            uids = [uids]
+        cards = [c for c in (self._card(u) for u in uids) if c is not None]
+        if not cards:
             return None
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            return c.make_mime(with_image=False)[0]      # files only (the file was prepared while hovering)
+            urls = []
+            for c in cards:
+                path = c.make_mime(with_image=False)[1]       # the file was prepared in the background while pointing
+                urls.append(QUrl.fromLocalFile(path))
         finally:
             QApplication.restoreOverrideCursor()
+        md = QMimeData()
+        md.setUrls(urls)
+        return md
+
+    # ------------------------------------------------------------ copy (one or many pictures)
+    def copy_by_uids(self, uids):
+        self.copy_cards([c for c in (self._card(u) for u in uids) if c is not None])
+
+    def copy_cards(self, cards):
+        """Ctrl+C: the pictures (with their edits) go to the clipboard.  Rendering happens in a worker thread."""
+        cards = [c for c in cards if c is not None]
+        if not cards:
+            return
+        if self._busy():
+            return
+        entries = []
+        for c in cards:
+            p = c.export_ready()
+            if p is not None:
+                entries.append((c, p, None, None, None, None))
+            else:
+                stem, ext = c.out_name()
+                entries.append((c, None, c.render_source(), stem, ext, c._ver))
+
+        def work(progress):
+            os.makedirs(EXPORT_DIR, exist_ok=True)
+            out = []
+            for i, (c, p, src, stem, ext, ver) in enumerate(entries):
+                progress(i / len(entries), "%d / %d" % (i + 1, len(entries)))
+                if p is None:
+                    p = core.unique_path(EXPORT_DIR, stem, ext)
+                    core.save_image(src(), p)
+                out.append(p)
+            qimg = QImage(out[0]) if len(out) == 1 else None
+            return out, qimg
+
+        def done(r):
+            paths, qimg = r
+            md = QMimeData()
+            md.setUrls([QUrl.fromLocalFile(p) for p in paths])
+            if qimg is not None and not qimg.isNull():
+                md.setImageData(qimg)
+            QApplication.clipboard().setMimeData(md)
+            for (c, p, src, stem, ext, ver), path in zip(entries, paths):
+                if p is None and not c._dead:
+                    c._export = (ver, path)
+            self.say("Copied %d picture(s). Paste them anywhere with Ctrl+V." % len(paths))
+        self.runner.run("Copying %d picture(s)" % len(entries) if len(entries) > 1 else "Copying " + cards[0].name,
+                        work, done, lambda msg: self.say("Could not copy: " + msg.splitlines()[0]))
 
     # ------------------------------------------------------------ page order
     def move_page(self, d):
@@ -807,21 +1109,40 @@ class MainWindow(QMainWindow):
 
     # ----------------------------------------------------------- removing
     def remove_card(self, c):
-        if self._busy():
+        self.remove_cards([c])
+
+    def remove_by_uids(self, uids):
+        self.remove_cards([c for c in (self._card(u) for u in uids) if c is not None])
+
+    def remove_cards(self, cards):
+        """Removes pictures from the list (the files on the disk are never touched).  One question at most, only when
+        some of them have edits that are not saved."""
+        cards = [c for c in dict.fromkeys(cards) if c in self.carousel.cards]
+        if not cards or self._busy():
             return
-        if c.is_unsaved():
-            ans = QMessageBox.question(self, "Remove", "This picture has edits that are not saved. Remove it anyway?",
-                                       QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        unsaved = [c for c in cards if c.is_unsaved()]
+        if unsaved:
+            if len(cards) == 1:
+                msg = "This picture has edits that are not saved. Remove it anyway?"
+            else:
+                msg = "%d of the %d pictures have edits that are not saved. Remove them anyway?" % (len(unsaved), len(cards))
+            ans = QMessageBox.question(self, "Remove", msg, QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             if ans != QMessageBox.StandardButton.Yes:
                 return
-        row = self.carousel.cards.index(c)
-        it = self.items.pop(c.uid, None)
+        rows = sorted(self.carousel.cards.index(c) for c in cards)
         self._sync = True
-        self.carousel.remove_card(c)
-        if it is not None:
-            self.strip.takeItem(row)
-        self._sync = False
+        self.strip.setUpdatesEnabled(False)
+        try:
+            for r in reversed(rows):                       # from the back, so the other rows keep their number
+                it = self.strip.takeItem(r)
+                if it is not None:
+                    self.items.pop(it.data(Qt.ItemDataRole.UserRole), None)
+            self.carousel.remove_cards(cards)
+        finally:
+            self.strip.setUpdatesEnabled(True)
+            self._sync = False
         self._current_changed(self.carousel.index)
+        self.say("Removed %d picture(s)." % len(cards))
 
     def clear_all(self):
         if self._busy():
@@ -833,8 +1154,8 @@ class MainWindow(QMainWindow):
             if ans != QMessageBox.StandardButton.Yes:
                 return
         self._sync = True
-        for c in list(self.carousel.cards):
-            self.carousel.remove_card(c)
+        self._add_queue.clear()
+        self.carousel.remove_cards(list(self.carousel.cards))
         self.strip.clear()
         self.items.clear()
         self._sync = False
@@ -846,11 +1167,15 @@ class MainWindow(QMainWindow):
 
     def _refresh_dir(self):
         d = self._dir()
+        room = int(max(80, min(340, self.width() * 0.2)))
+        narrow = self.width() < 1100
+        fm = QFontMetrics(self.font())
         if d:
-            fm = QFontMetrics(self.font())
-            self.btnFolder.setText("Save folder: " + fm.elidedText(d, Qt.TextElideMode.ElideMiddle, 300))
+            self.btnFolder.setText(("Folder: " if narrow else "Save folder: ") + fm.elidedText(d, Qt.TextElideMode.ElideMiddle, room))
+            self.btnFolder.setToolTip("Edited pictures are saved in:\n" + d + "\nClick to change.")
         else:
-            self.btnFolder.setText("Save folder: not set (click to choose)")
+            self.btnFolder.setText("Save folder: not set" if not narrow else "Folder: not set")
+            self.btnFolder.setToolTip("Edited pictures are saved here. Click to choose the folder.")
         self.btnOpenDir.setEnabled(bool(d))
 
     def choose_dir(self):
@@ -877,14 +1202,14 @@ class MainWindow(QMainWindow):
 
     def _save_job(self, card, path):
         """Render + write in a worker thread (progress bar); PDF is chosen by the file name."""
-        args = card.render_args()
+        src = card.render_source()
         mode = self._pdf_mode() if path.lower().endswith(".pdf") else None
         if path.lower().endswith(".pdf") and mode is None:
             return
 
         def work(progress):
             progress(0.1, "rendering")
-            img = core.render_full(*args)
+            img = src()
             progress(0.7, "writing")
             if mode is not None:
                 core.save_pdf([img], path, mode)
@@ -932,14 +1257,14 @@ class MainWindow(QMainWindow):
                 p = os.path.join(d, "%s (%d)%s" % (stem, n, ext))
                 n += 1
             used.add(p)
-            jobs.append((c, p, c.render_args()))
+            jobs.append((c, p, c.render_source()))
 
         def work(progress):
             ok, failed = [], []
-            for i, (c, p, args) in enumerate(jobs):
+            for i, (c, p, src) in enumerate(jobs):
                 progress(i / len(jobs), "%d / %d" % (i + 1, len(jobs)))
                 try:
-                    core.save_image(core.render_full(*args), p)
+                    core.save_image(src(), p)
                     ok.append((c, p))
                 except Exception as ex:
                     failed.append("%s: %s" % (c.name, ex))
@@ -984,12 +1309,7 @@ class MainWindow(QMainWindow):
         mode = self._pdf_mode()
         if mode is None:
             return
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            argl = [c.render_args() for c in cards]
-        finally:
-            QApplication.restoreOverrideCursor()
-        sources = [(lambda a=a: core.render_full(*a)) for a in argl]
+        sources = [c.render_source() for c in cards]       # made and written one by one in the worker thread
 
         def work(progress):
             core.save_pdf(sources, path, mode, progress=progress)

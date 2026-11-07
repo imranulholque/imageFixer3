@@ -42,7 +42,31 @@ try:  # iPhone photos (optional)
 except Exception:
     pass
 
-PREVIEW_MAX = 2400          # long side of the on-screen working copy
+PREVIEW_MAX = 2400          # long side of the on-screen working copy (set at start-up from the screen, see below)
+QUALITY_LEVELS = {"fast": 1800, "balanced": 2400, "sharp": 3200, "max": 4096}
+
+
+def set_preview_max(n):
+    """Size of the on-screen working copy.  Bigger = sharper when zoomed in, a little slower to adjust."""
+    global PREVIEW_MAX
+    PREVIEW_MAX = int(max(800, min(8192, n)))
+
+
+def auto_preview_max(screen_long_px, cpus=None):
+    """A working copy that is a bit larger than the screen can show: sharp on this machine, not wasteful on a small one."""
+    cpus = cpus or os.cpu_count() or 4
+    n = int(max(1.0, float(screen_long_px)) * 1.15)
+    n = max(2400, min(n, 3600))                  # never below the old default, larger on big / sharp screens
+    if cpus <= 4:
+        n = min(n, 2800)
+    return n
+
+
+def quality_preview_max(level, screen_long_px=1920, cpus=None):
+    """'auto' (from the screen and the number of processor cores) or one of QUALITY_LEVELS."""
+    if level in QUALITY_LEVELS:
+        return QUALITY_LEVELS[level]
+    return auto_preview_max(screen_long_px, cpus)
 NEUTRAL_C = 14.0            # chroma below this counts as black / gray
 NEUTRAL_SOFT = 12.0
 BAND_EDGE = 4.0             # softness between two neighbouring gray bands (L units)
@@ -352,19 +376,34 @@ def get_fill(rgb, masks, keys, cache=None):
 
 
 # ------------------------------------------------------- saturation / clarity
-def _saturate(x, sat):
-    """Saturation of the whole picture. White and gray never change when it goes up;
-    when it goes down, colours get lighter and lighter until they are white."""
-    if sat == 100:
+def _saturate(x, sat, vib=0):
+    """General saturation, the way a picture editor does it.
+    sat 100 = unchanged, 0 = a true gray picture (same brightness), 200 = twice the colour strength.
+    Brightness and hue never change: the colour is scaled away from / towards the gray of the same brightness.
+    Going up, a colour that would run out of range (clip, change hue) is eased in smoothly instead.
+    Gray, black and white (text, paper) are never touched.
+    vib = vibrance -100..100: the same, but weak colours move more than already strong ones."""
+    if sat == 100 and not vib:
         return x
-    if sat > 100:
-        g = (x[..., 0] * 0.299 + x[..., 1] * 0.587 + x[..., 2] * 0.114)[..., None]
-        return g + (x - g) * (sat / 100.0)
-    mx, mn = x.max(2), x.min(2)
-    S = (mx - mn) / np.maximum(mx, 1.0)
-    w = _smooth(S / 0.35)                          # grays (black text, paper) stay as they are
-    f = (100 - sat) / 100.0
-    return x + (255.0 - x) * (f * w)[..., None]
+    gray = (x[..., 0] * 0.299 + x[..., 1] * 0.587 + x[..., 2] * 0.114)[..., None]
+    d = x - gray
+    s = np.float32(max(0.0, sat / 100.0))
+    if vib:
+        mx, mn = x.max(2), x.min(2)
+        S = np.clip((mx - mn) / np.maximum(mx, 1.0), 0.0, 1.0)
+        v = vib / 100.0
+        s = s * (1.0 + v * (1.0 - S) * 1.5 if v > 0 else 1.0 + v * S)       # weak colours first / strong ones first
+    s = np.asarray(s, np.float32)
+    if s.ndim == 0:
+        s = np.full(x.shape[:2], float(s), np.float32)
+    if float(s.max()) > 1.0:                                                 # room left before a channel clips
+        inv = np.float32(1.0) / np.maximum(np.abs(d), np.float32(1e-3))
+        lim = np.where(d > 0, np.float32(255.0) - gray, gray) * inv               # how far each channel may still go
+        m = np.maximum(lim.min(2), 1.0)
+        m2, s2 = m * m, s * s
+        soft = s * m / np.sqrt(np.sqrt(s2 * s2 + m2 * m2))                    # smooth minimum of the wish and the room
+        s = np.where(s > 1.0, np.maximum(soft, 1.0), s).astype(np.float32)      # never weaker than the original
+    return gray + d * s[..., None]
 
 
 # ---- rank filters in pure numpy.  Pillow's Min / Max / Median filters keep the Python lock while they run, so the whole
@@ -495,8 +534,10 @@ def active_adjs(adjs):
 
 # ----------------------------------------------------------------- look (global sliders)
 # Every value is "0 = unchanged" except sat (100 = unchanged).  They act ONLY inside the selection (if there is one).
-DEFAULT_LOOK = {"sat": 100, "bright": 0, "contrast": 0, "hue": 0, "warm": 0,
-                "sharp": 0, "objs": 0, "detail": 0, "dark": 0, "clear": 0}
+DEFAULT_LOOK = {"sat": 100, "bright": 0, "contrast": 0, "hue": 0, "warm": 0, "vib": 0,
+                "sharp": 0, "objs": 0, "detail": 0, "dark": 0, "clear": 0,
+                # manual shadow removal (works without the one-click button)
+                "flat": 0, "flat_size": 50, "shlift": 0, "white": 0, "black": 0}
 
 
 def new_look(**kw):
@@ -506,7 +547,13 @@ def new_look(**kw):
 
 
 def tone_active(l):
-    return l["sat"] != 100 or l["bright"] != 0 or l["contrast"] != 0 or l["hue"] != 0 or l["warm"] != 0
+    return (l["sat"] != 100 or l["bright"] != 0 or l["contrast"] != 0 or l["hue"] != 0 or l["warm"] != 0
+            or l.get("vib", 0) != 0)
+
+
+def shadow_active(l):
+    """Manual shadow removal in use ('flat_size' alone does nothing)."""
+    return bool(l.get("flat", 0) or l.get("shlift", 0) or l.get("white", 0) or l.get("black", 0))
 
 
 def clarity_active(l):
@@ -514,7 +561,7 @@ def clarity_active(l):
 
 
 def look_edited(l):
-    return tone_active(l) or clarity_active(l)
+    return tone_active(l) or clarity_active(l) or shadow_active(l)
 
 
 def apply_tone(x, l):
@@ -530,7 +577,7 @@ def apply_tone(x, l):
         Q = x[..., 0] * 0.211 - x[..., 1] * 0.523 + x[..., 2] * 0.312
         I2, Q2 = I * c - Q * s_, I * s_ + Q * c
         x = np.stack([Y + 0.956 * I2 + 0.621 * Q2, Y - 0.272 * I2 - 0.647 * Q2, Y - 1.106 * I2 + 1.703 * Q2], -1)
-    x = _saturate(x, l["sat"])
+    x = _saturate(x, l["sat"], l.get("vib", 0))
     if l["bright"]:
         t = np.clip(x, 0, 255) / 255.0
         x = (t ** (2.0 ** (-l["bright"] / 50.0))) * 255.0
@@ -538,6 +585,54 @@ def apply_tone(x, l):
         c = l["contrast"]
         f = (100.0 + c) / 100.0 if c < 0 else 1.0 + c / 50.0
         x = (x - 128.0) * f + 128.0
+    return x
+
+
+def shadow_gain(rgb, size, cache=None):
+    """How much brighter every spot of the paper must get to be as bright as the paper's lightest parts (low
+    resolution, float32 h,w,3).  'size' 0..100: small shadows ... wide soft shadows.  Cached for the live preview."""
+    key = ("sg", int(size))
+    if cache is not None and key in cache:
+        return cache[key]
+    H, W = rgb.shape[:2]
+    ws = 1400.0 / max(H, W)
+    small = np.asarray(Image.fromarray(rgb).resize((max(8, round(W * ws)), max(8, round(H * ws))), Image.Resampling.BOX)) \
+        if ws < 1.0 else rgb
+    bg = paper_light(small, None, 0.022 * 2.0 ** ((size - 50) / 40.0))
+    gain = np.clip(255.0 / np.maximum(bg, 1.0), 1.0, 6.0).astype(np.float32)
+    if cache is not None:
+        cache[key] = gain
+    return gain
+
+
+def gain_rows(gain, y0, y1, H, W):
+    """The low resolution gain map, stretched over rows y0..y1 of the picture."""
+    gh, gw = gain.shape[:2]
+    box = (0.0, y0 * gh / H, float(gw), y1 * gh / H)
+    return np.stack([np.asarray(Image.fromarray(np.ascontiguousarray(gain[..., c])).resize(
+        (W, y1 - y0), Image.Resampling.BILINEAR, box=box), dtype=np.float32) for c in range(3)], -1)
+
+
+def apply_shadow_manual(x, g, l):
+    """Hand-made shadow removal on float32 (...,3) 0..255.
+    flat   = even out the light (uses the measured paper light 'g'), flat_size = how wide the shadows are
+    shlift = lift shadows: dull / shaded paper gets lighter, real black writing stays
+    white  = paper whiteness (the paper's grey becomes white)    black = text darkness"""
+    f = l.get("flat", 0)
+    if f and g is not None:
+        x = np.minimum(x * (1.0 + (g - 1.0) * (f / 100.0)), 255.0)
+    k = l.get("shlift", 0) / 100.0
+    if k > 0:
+        v = x.max(2) / 255.0
+        w = _smooth((v - 0.16) / 0.34)                      # deep ink (dark) is left alone
+        x = x + (255.0 - x) * (k * w)[..., None]
+    wh = l.get("white", 0)
+    if wh:
+        x = np.minimum(x * (255.0 / (255.0 - wh * 0.9)), 255.0)
+    bl = l.get("black", 0)
+    if bl:
+        bp = bl * 0.6
+        x = np.clip((x - bp) * (255.0 / (255.0 - bp)), 0.0, 255.0)
     return x
 
 
@@ -563,12 +658,15 @@ def render(rgb, adjs, look=None, lab=None, cache=None, chunk_rows=0, sel=None):
         keep = {("m",) + adj_key(a) for a in adjs}
         keep.add(("f",) + tuple(adj_key(a) for a in dec))
         keep |= {("g",) + adj_key(a) for a in dec}
+        if look.get("flat", 0):
+            keep.add(("sg", int(look.get("flat_size", 50))))
         for k in [k for k in cache if k not in keep]:
             del cache[k]
-    tone_on, clar_on = tone_active(look), clarity_active(look)
-    if not act and not tone_on and not clar_on:
+    tone_on, clar_on, shad_on = tone_active(look), clarity_active(look), shadow_active(look)
+    if not act and not tone_on and not clar_on and not shad_on:
         return rgb
     H, W = rgb.shape[:2]
+    gainmap = shadow_gain(rgb, look.get("flat_size", 50), cache) if (shad_on and look.get("flat", 0)) else None
     masks = {a["id"]: get_mask(rgb, a, lab, cache) for a in act}
     # the fill must avoid ALL matching pixels, also the ones outside the selection
     F = get_fill(rgb, [masks[a["id"]] for a in dec], [adj_key(a) for a in dec], cache) if dec else None
@@ -588,7 +686,7 @@ def render(rgb, adjs, look=None, lab=None, cache=None, chunk_rows=0, sel=None):
     rows = chunk_rows or 256
     for y0 in range(0, H, rows):
         y1 = min(H, y0 + rows)
-        touched = tone_on or any(float(r[y0:y1].max()) > 0.004 for r in rowmax.values())
+        touched = tone_on or shad_on or any(float(r[y0:y1].max()) > 0.004 for r in rowmax.values())
         if touched and sel_rows is not None and float(sel_rows[y0:y1].max()) <= 0.004:
             touched = False
         if not touched:
@@ -619,8 +717,12 @@ def render(rgb, adjs, look=None, lab=None, cache=None, chunk_rows=0, sel=None):
                     x *= (1.0 - 0.28 * mm)
                 else:                          # black / gray shade: darker
                     x *= (1.0 - mm)
-        if tone_on:
-            xt = apply_tone(x, look)
+        if tone_on or shad_on:
+            xt = x
+            if shad_on:
+                xt = apply_shadow_manual(xt, None if gainmap is None else gain_rows(gainmap, y0, y1, H, W), look)
+            if tone_on:
+                xt = apply_tone(xt, look)
             x = xt if s is None else x + (xt - x) * s[..., None]
         out8[y0:y1] = np.clip(x + 0.5, 0, 255).astype(np.uint8)
     if clar_on:
@@ -924,14 +1026,17 @@ def photo_mask(img):
     return np.asarray(big, dtype=np.float32) / 255.0
 
 
-SHADOW_DEFAULTS = {"strength": 100, "white": 50, "ink": 50, "scale": 50, "mode": "color", "protect": 1}
+SHADOW_DEFAULTS = {"strength": 100, "white": 50, "ink": 50, "scale": 50, "mode": "color", "protect": 1,
+                   "even": 100, "depth": 60, "tint": 0, "clean": 0}
 
 
 def remove_shadow(img, strength=1.0, progress=None, opts=None):
     """'Scan' look: shadows and grey paper become white, writing / lines / shapes stay and get clearer.
     strength 0..1: how far the paper is pushed to white and the ink darkened.
     opts: white 0..100 (paper whiteness), ink 0..100 (text darkness), scale 0..100 (small shadows ... big shadows),
-          mode 'color' | 'gray' | 'bw'."""
+          mode 'color' | 'gray' | 'bw',
+          even 0..100 (how much of the uneven light is evened out), depth 0..100 (how dark a shadow may be and still
+          be lifted), tint 0..100 (keep the paper's own colour), clean 0..100 (snap the almost-white paper to clean white)."""
     o = dict(SHADOW_DEFAULTS)
     o.update(opts or {})
     arr = np.asarray(img)
@@ -943,7 +1048,13 @@ def remove_shadow(img, strength=1.0, progress=None, opts=None):
         progress(0.1, "Measuring the light")
     bg = paper_light(small, progress, 0.022 * 2.0 ** ((o["scale"] - 50) / 40.0))
     s = float(max(0.0, min(1.0, strength)))
-    gain = np.clip(255.0 / bg, 1.0, 6.0).astype(np.float32)
+    maxg = float(np.clip(6.0 * 2.0 ** ((o["depth"] - 60) / 30.0), 1.5, 14.0))
+    gain = np.clip(255.0 / np.maximum(bg, 1.0), 1.0, maxg).astype(np.float32)
+    if o["even"] < 100:                                        # only part of the uneven light is removed
+        gain = 1.0 + (gain - 1.0) * (o["even"] / 100.0)
+    if o["tint"] > 0:                                          # keep (some of) the paper's colour: same gain for r, g, b
+        mg = gain.mean(2, keepdims=True)
+        gain = gain + (mg - gain) * (o["tint"] / 100.0)
     gh, gw = gain.shape[:2]
     lum_small = small.astype(np.float32).mean(2) * 255.0 / np.maximum(bg.mean(2), 1.0)
     bp = float(np.clip(np.percentile(lum_small, 0.5), 0, 90))
@@ -967,6 +1078,9 @@ def remove_shadow(img, strength=1.0, progress=None, opts=None):
             if o["mode"] == "bw":
                 gray = np.clip((gray - 0.45) / 0.12 + 0.5, 0.0, 1.0)      # hard but anti-aliased threshold
             x = np.repeat(gray[..., None], 3, 2)
+        if o["clean"] > 0:                                     # almost-white paper (grain, faint stains) becomes clean white
+            lo = 1.0 - 0.02 - 0.16 * (o["clean"] / 100.0)
+            x = x + (1.0 - x) * _smooth((x - lo) / max(1e-3, 1.0 - lo))
         res = np.clip(x * 255.0 + 0.5, 0, 255)
         if pm is not None and float(pm[y0:y1].max()) > 0.01:
             gp = np.minimum(1.0 + 0.6 * (g - 1.0), 1.3)           # soft correction: no contrast / ink changes
@@ -1016,6 +1130,40 @@ def warp_quad(img, pts):
     except np.linalg.LinAlgError:
         raise ValueError("The 4 points do not make a proper shape")
     return img.transform((w, h), Image.Transform.PERSPECTIVE, co, Image.Resampling.BICUBIC)
+
+
+def outline_mask(size, shape, radius=0.22):
+    """Soft-edged mask (PIL 'L', 255 inside) of a shape that fills the whole picture:
+    'rect', 'oval' (an ellipse; a circle when the picture is square), 'round' (rounded corners)."""
+    W, H = int(size[0]), int(size[1])
+    ss = max(1, min(4, int(math.sqrt(36_000_000.0 / max(1, W * H)))))
+    big = Image.new("L", (W * ss, H * ss), 0)
+    d = ImageDraw.Draw(big)
+    box = (0, 0, W * ss - 1, H * ss - 1)
+    if shape == "oval":
+        d.ellipse(box, fill=255)
+    elif shape == "round":
+        d.rounded_rectangle(box, int(min(W, H) * ss * radius), fill=255)
+    else:
+        d.rectangle(box, fill=255)
+    return big.resize((W, H), Image.Resampling.LANCZOS) if ss > 1 else big
+
+
+def crop_to_shape(img, alpha, box, shape, mask=None, fill=None):
+    """Cut 'box' out of the picture in a shape.  Returns (rgb, alpha).
+    alpha (PIL 'L' or None) = the picture's transparency: outside the shape it becomes transparent.
+    With alpha None the outside is filled with 'fill' (the paper colour) instead.
+    mask = an own mask of the whole picture (selection shape) instead of a ready-made shape."""
+    rgb = crop_box(img, box)
+    if mask is not None:
+        m = crop_box(mask.convert("L"), box).convert("L")
+    else:
+        m = outline_mask(rgb.size, shape)
+    if alpha is not None:
+        a = crop_box(alpha.convert("L"), box).convert("L")
+        return rgb, ImageChops.multiply(a, m)
+    bg = Image.new("RGB", rgb.size, fill or border_color(img))
+    return Image.composite(rgb, bg, m), None
 
 
 def crop_box(img, box):
@@ -1484,6 +1632,8 @@ def warp_layer(patch, size, grid, n):
     pw, ph = patch.size
     W, H = size
     layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    if patch.mode == "RGBA":
+        patch = patch.convert("RGBa")                    # premultiplied: no pale halo from the colour under transparent pixels
     g = [[grid[i * (n + 1) + j] for j in range(n + 1)] for i in range(n + 1)]
     for i in range(n):
         for j in range(n):
@@ -1508,8 +1658,31 @@ def warp_layer(patch, size, grid, n):
             Hm = Hm / Hm[2, 2]
             co = (Hm[0, 0], Hm[0, 1], Hm[0, 2], Hm[1, 0], Hm[1, 1], Hm[1, 2], Hm[2, 0], Hm[2, 1])
             piece = crop.transform((bx1 - bx0, by1 - by0), Image.Transform.PERSPECTIVE, co, Image.Resampling.BICUBIC)
-            layer.alpha_composite(piece, (bx0, by0))
+            layer.alpha_composite(piece.convert("RGBA"), (bx0, by0))
     return layer
+
+
+def warp_layer_hq(patch, size, grid, n, ss=3, max_px=36_000_000):
+    """warp_layer, but sharp: the picture is bent at 'ss' times the size and then shrunk with a proper filter
+    (the plain transform takes one sample per pixel, which breaks thin pen strokes into dots).
+    Only the box around the picture is worked on.  Returns an RGBA layer of the given size."""
+    W, H = size
+    xs = [p[0] for p in grid]; ys = [p[1] for p in grid]
+    bx0, by0 = max(0, int(math.floor(min(xs))) - 2), max(0, int(math.floor(min(ys))) - 2)
+    bx1, by1 = min(W, int(math.ceil(max(xs))) + 2), min(H, int(math.ceil(max(ys))) + 2)
+    bw, bh = bx1 - bx0, by1 - by0
+    out = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    if bw < 1 or bh < 1:
+        return out
+    # a bent picture (n = 3) may reach outside the box of its 4 outer points only a little; the box uses all points
+    ss = max(1, min(ss, int(math.sqrt(max_px / float(bw * bh)))))
+    if ss == 1:
+        return warp_layer(patch, size, grid, n)
+    g2 = [((x - bx0) * ss, (y - by0) * ss) for x, y in grid]
+    big = warp_layer(patch, (bw * ss, bh * ss), g2, n)
+    small = big.resize((bw, bh), Image.Resampling.LANCZOS)   # Pillow shrinks RGBA premultiplied
+    out.paste(small, (bx0, by0))
+    return out
 
 
 # ------------------------------------------------------------------ picture layers (signature, stamp ...)
@@ -1597,9 +1770,12 @@ def composite_layers(base, layers, hide=None):
         grid = [(x * W, y * H) for x, y in l["grid"]]
         patch = layer_rgba(l)
         tw = max(math.dist(grid[0], grid[n]), math.dist(grid[n * (n + 1)], grid[-1]))
-        if 8 <= tw < patch.width:                         # no need for more pixels than are shown
-            patch = patch.resize((int(tw), max(1, int(round(tw * patch.height / patch.width)))), Image.Resampling.BILINEAR)
-        out = Image.alpha_composite(out, warp_layer(patch, (W, H), grid, n))
+        # Never shrink the picture below the size it is shown at (the supersampled warp below does the final,
+        # filtered shrink): keep 3x the shown width, at most the picture's own size.
+        want = int(tw * 3)
+        if 8 <= want < patch.width:
+            patch = patch.resize((want, max(1, int(round(want * patch.height / patch.width)))), Image.Resampling.LANCZOS)
+        out = Image.alpha_composite(out, warp_layer_hq(patch, (W, H), grid, n))
     return out.convert("RGB")
 
 

@@ -15,9 +15,10 @@ def QApplication_shift():
 
 
 def np_to_qimage(arr):
+    """uint8 (h, w, 3) -> QImage in the format the painter draws fastest (RGB32).  Safe to call in a worker thread."""
     arr = np.ascontiguousarray(arr)
     h, w = arr.shape[:2]
-    return QImage(arr.data, w, h, w * 3, QImage.Format.Format_RGB888).copy()
+    return QImage(arr.data, w, h, w * 3, QImage.Format.Format_RGB888).convertToFormat(QImage.Format.Format_RGB32)
 
 
 class ImageCanvas(QWidget):
@@ -77,6 +78,12 @@ class ImageCanvas(QWidget):
         self._space = False
         self._tf = None                       # transform: dict(img, w, h, cx, cy, sx, sy, ang)
         self._tf_drag = None
+        self.crop_shape = "rect"              # 'rect' | 'circle' | 'oval' | 'round': the shape the crop box will keep
+        self._scaled = None                   # (key, QImage): the picture shrunk with a proper filter (crisp text when zoomed out)
+        self._scale_timer = QTimer(self)
+        self._scale_timer.setSingleShot(True)
+        self._scale_timer.setInterval(60)
+        self._scale_timer.timeout.connect(self._make_scaled)
         self._ants_timer = QTimer(self)
         self._ants_timer.setInterval(200)
         self._ants_timer.timeout.connect(self._tick)
@@ -571,6 +578,26 @@ class ImageCanvas(QWidget):
                     N[i] = QPointF(S[i].x() + k * nrm.x(), S[i].y() + k * nrm.y())
         t["pts"] = [N[0], N[1], N[3], N[2]]
 
+    def set_crop_shape(self, shape):
+        self.crop_shape = shape
+        self.update()
+
+    def _crop_shape_path(self, wr):
+        """Outline (widget coordinates) of what the crop keeps: the box, or a circle / oval / rounded box inside it."""
+        path = QPainterPath()
+        sh = self.crop_shape
+        if sh == "circle":
+            side = min(wr.width(), wr.height())
+            path.addEllipse(QRectF(wr.center().x() - side / 2, wr.center().y() - side / 2, side, side))
+        elif sh == "oval":
+            path.addEllipse(wr)
+        elif sh == "round":
+            r = 0.22 * min(wr.width(), wr.height())
+            path.addRoundedRect(wr, r, r)
+        else:
+            path.addRect(wr)
+        return path
+
     def crop_rect_img(self):
         r = self._crop
         return r.left(), r.top(), r.right(), r.bottom()
@@ -596,6 +623,36 @@ class ImageCanvas(QWidget):
         self.clone_delta = None if delta is None else QPointF(delta[0], delta[1])
         self.update()
 
+    # -------------------------------------------------------------- crisp zoom-out
+    def _dpr(self):
+        return max(1.0, float(self.devicePixelRatioF()))
+
+    def _scaled_key(self):
+        return (self._img.cacheKey(), round(self.zoom, 4), round(self._dpr(), 2))
+
+    def _scaled_ready(self):
+        """The shrunk copy for the current zoom, or None (then the normal drawing is used and a better copy is made
+        a moment later, when nothing moves any more)."""
+        if self._img is None or self.zoom >= 0.98:
+            return None
+        if self._scaled is not None and self._scaled[0] == self._scaled_key():
+            return self._scaled[1]
+        self._scale_timer.start()
+        return None
+
+    def _make_scaled(self):
+        if self._img is None or self.zoom >= 0.98:
+            self._scaled = None
+            return
+        dpr = self._dpr()
+        w = max(1, int(round(self._iw * self.zoom * dpr)))
+        h = max(1, int(round(self._ih * self.zoom * dpr)))
+        key = self._scaled_key()
+        s = self._img.scaled(w, h, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        s.setDevicePixelRatio(dpr)
+        self._scaled = (key, s)
+        self.update()
+
     # -------------------------------------------------------------- paint
     def paintEvent(self, e):
         p = QPainter(self)
@@ -605,11 +662,16 @@ class ImageCanvas(QWidget):
             p.drawText(QRectF(self.rect()), int(Qt.AlignmentFlag.AlignCenter), self._msg)
             return
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, self.zoom < 3.0)
-        p.save()
-        p.translate(self.off)
-        p.scale(self.zoom, self.zoom)
-        p.drawImage(0, 0, self._img)
-        p.restore()
+        sm = self._scaled_ready()
+        if sm is not None:                                  # zoomed out: the area-filtered copy, pixel-aligned = sharp text
+            dpr = self._dpr()
+            p.drawImage(QPointF(round(self.off.x() * dpr) / dpr, round(self.off.y() * dpr) / dpr), sm)
+        else:
+            p.save()
+            p.translate(self.off)
+            p.scale(self.zoom, self.zoom)
+            p.drawImage(0, 0, self._img)
+            p.restore()
         if self._float is not None:
             self._paint_float(p)
         if self.sel_visible and self.mode not in (self.CROP, self.PERSP, self.TRANSFORM):
@@ -747,19 +809,26 @@ class ImageCanvas(QWidget):
 
     def _paint_crop(self, p):
         wr = QRectF(self.to_wid(self._crop.topLeft()), self.to_wid(self._crop.bottomRight()))
+        shaped = self.crop_shape != "rect"
+        keep = self._crop_shape_path(wr)
         path = QPainterPath()
         path.addRect(self._full_rect_w())
-        path.addRect(wr)
+        path.addPath(keep)
         path.setFillRule(Qt.FillRule.OddEvenFill)
         p.fillPath(path, QBrush(QColor(0, 0, 0, 150)))
         p.setBrush(Qt.BrushStyle.NoBrush)
+        if shaped:                                               # the shape that is kept, drawn on top of the box
+            p.setPen(QPen(QColor(0, 0, 0, 170), 3.4))
+            p.drawPath(keep)
+            p.setPen(QPen(QColor(255, 255, 255), 1.8))
+            p.drawPath(keep)
         p.setPen(QPen(QColor(255, 255, 255, 80), 1))
         for i in (1, 2):
             x = wr.left() + wr.width() * i / 3
             y = wr.top() + wr.height() * i / 3
             p.drawLine(QPointF(x, wr.top()), QPointF(x, wr.bottom()))
             p.drawLine(QPointF(wr.left(), y), QPointF(wr.right(), y))
-        p.setPen(QPen(QColor(255, 255, 255), 1.6))
+        p.setPen(QPen(QColor(255, 255, 255, 150 if shaped else 255), 1.6, Qt.PenStyle.DashLine if shaped else Qt.PenStyle.SolidLine))
         p.drawRect(wr)
         p.setPen(QPen(QColor("#1b2030"), 1))
         p.setBrush(QBrush(QColor("white")))

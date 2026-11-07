@@ -49,9 +49,15 @@ class JobRunner(QObject):
         self._cur = None
         self._label = ""
         self.busy = False
+        self.light = False                          # the running job only opens a picture: removing pictures is still fine
 
-    def run(self, label, fn, done=None, fail=None):
-        self._q.append((label, fn, done, fail))
+    @property
+    def heavy_busy(self):
+        """Busy with work that changes pictures (not just opening one, and nothing waiting behind it)."""
+        return self.busy and (not self.light or bool(self._q))
+
+    def run(self, label, fn, done=None, fail=None, light=False):
+        self._q.append((label, fn, done, fail, light))
         if self._cur is None:
             self._next()
 
@@ -59,9 +65,11 @@ class JobRunner(QObject):
         if not self._q:
             self._cur = None
             self.busy = False
+            self.light = False
             self.changed.emit(False, 0.0, "")
             return
-        label, fn, done, fail = self._q.popleft()
+        label, fn, done, fail, light = self._q.popleft()
+        self.light = light
         sig = _Signals()
         self._cur = (sig, done, fail)               # keep alive until finished
         self._label = label

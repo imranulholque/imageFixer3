@@ -7,6 +7,7 @@ import traceback
 
 import numpy as np
 from PIL import Image, ImageDraw
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
 app = QApplication(sys.argv)
@@ -201,5 +202,136 @@ def t_window():
     assert w.phone is not None and w.phone.running()
     w.phone.stop()
 step("main window + phone dialog build", t_window)
+
+def _pump(cond, seconds=15):
+    import time
+    end = time.time() + seconds
+    while not cond() and time.time() < end:
+        app.processEvents(); time.sleep(0.005)
+    app.processEvents()
+
+def _window_with(n):
+    import ui
+    from PySide6.QtCore import QSettings
+    paths = []
+    for i in range(n):
+        q = d + "/m%d_%d.png" % (n, i)
+        Image.new("RGB", (240, 160), (200, 200 - i * 10, 190)).save(q); paths.append(q)
+    w = ui.MainWindow(QSettings("ImageFixerTest", "smoke_m%d" % n))
+    w.add_files(paths)
+    _pump(lambda: not w._adding and len(w.carousel.cards) == n)
+    assert len(w.carousel.cards) == n and w.strip.count() == n, "pictures were not added"
+    return w
+
+def t_multi_remove():
+    w = _window_with(5)
+    w.strip.clearSelection()
+    for r in (1, 2, 3):
+        w.strip.item(r).setSelected(True)
+    uids = w.strip.uids()
+    assert len(uids) == 3
+    w.remove_by_uids(uids)
+    assert len(w.carousel.cards) == 2 and w.strip.count() == 2 and len(w.items) == 2
+    assert [c.uid for c in w.carousel.cards] == [w.strip.item(i).data(Qt.ItemDataRole.UserRole) for i in range(2)]
+    w.remove_by_uids(w.strip.uids() or [w.carousel.cards[0].uid])
+    w.clear_all()
+    assert not w.carousel.cards and w.strip.count() == 0
+step("remove several thumbnails at once", t_multi_remove)
+
+def t_opening_async():
+    w = _window_with(3)
+    w.carousel.go_to(2, animate=False)
+    _pump(lambda: w.carousel.cards[2]._loaded)
+    assert w.carousel.cards[2]._loaded and w.carousel.cards[2].prev is not None
+    w.runner.wait_idle()
+    # settings copied to a picture that was never opened are applied when it opens
+    c0, c1 = w.carousel.cards[0], w.carousel.cards[1]
+    _pump(lambda: c0._loaded)
+    c0._set_look("sat", 60)
+    c1.apply_action(c0.last_action)                  # not opened yet: kept and applied on opening (or applied now)
+    assert c1.is_edited()
+    w.carousel.go_to(1, animate=False)
+    _pump(lambda: w.carousel.cards[1]._loaded and not w.runner.busy)
+    assert w.carousel.cards[1].look["sat"] == 60, w.carousel.cards[1].look
+    src = c1.render_source()
+    assert src().size == (240, 160)
+step("pictures open in the background, settings reach unopened pictures", t_opening_async)
+
+def t_delete_key_on_strip():
+    try:
+        from PySide6.QtTest import QTest
+        from PySide6.QtCore import Qt as _Qt
+        w = _window_with(3)
+        w.show(); w.strip.setFocus()
+        w.strip.clearSelection(); w.strip.item(0).setSelected(True); w.strip.item(1).setSelected(True)
+        QTest.keyClick(w.strip, _Qt.Key.Key_Delete)
+        app.processEvents()
+        assert len(w.carousel.cards) == 1, "Delete on the thumbnails removed %d" % (3 - len(w.carousel.cards))
+    except ImportError:
+        print("skipped (no QtTest)")
+step("Delete key on the thumbnails", t_delete_key_on_strip)
+
+def t_quality():
+    core.set_preview_max(core.quality_preview_max("sharp"))
+    big = Image.new("RGB", (6000, 4000), (220, 220, 220))
+    prev, sc = core.make_preview(big)
+    assert max(prev.shape[:2]) == 3200, prev.shape
+    core.set_preview_max(core.quality_preview_max("balanced"))
+step("preview quality levels", t_quality)
+
+
+def t_saturation_real():
+    rng = np.random.default_rng(3)
+    x = rng.integers(0, 256, (4000, 1, 3)).astype(np.float32)
+    Y = lambda a: a[..., 0] * 0.299 + a[..., 1] * 0.587 + a[..., 2] * 0.114
+    g = core._saturate(x, 0)
+    assert np.abs(g[..., 0] - g[..., 1]).max() < 0.01 and np.abs(Y(g) - Y(x)).max() < 0.01, "0 must be a gray picture"
+    for sat in (40, 150, 200):
+        o = core._saturate(x, sat)
+        assert np.abs(Y(o) - Y(x)).max() < 0.05, "brightness must not change"
+        assert o.min() > -0.1 and o.max() < 255.1, "no clipping"
+    gray = np.full((3, 1, 3), 90, np.float32)
+    assert np.abs(core._saturate(gray, 200) - gray).max() < 0.01, "gray must not change"
+    assert core.tone_active(core.new_look(vib=20))
+step("saturation: true saturation, brightness kept, no clipping", t_saturation_real)
+
+def t_manual_shadow():
+    W, H = 600, 400
+    yy, xx = np.mgrid[0:H, 0:W]
+    light = (0.95 - 0.4 * xx / W).astype(np.float32)
+    page = np.clip(np.full((H, W, 3), 235, np.float32) * light[..., None], 0, 255).astype(np.uint8)
+    before = page[..., 1].std()
+    out = core.render(page, [], core.new_look(flat=100), cache={})
+    assert out[..., 1].std() < before * 0.4, "even-light must flatten the page"
+    assert core.look_edited(core.new_look(shlift=10)) and not core.look_edited(core.new_look(flat_size=20))
+    lift = core.render(page, [], core.new_look(shlift=100, white=40), cache={})
+    assert lift[..., 1].mean() > page[..., 1].mean() + 20
+    sel = np.zeros((H, W), np.float32); sel[:, W // 2:] = 1
+    part = core.render(page, [], core.new_look(flat=100), cache={}, sel=sel)
+    assert (part[:, :W // 2 - 2] == page[:, :W // 2 - 2]).all(), "outside the selection stays"
+    r = core.remove_shadow(Image.fromarray(page), 1.0, None, {"even": 60, "depth": 80, "tint": 30, "clean": 50})
+    assert r.size == (W, H)
+step("manual shadow removal works without the one-click", t_manual_shadow)
+
+def t_crop_shapes():
+    for tool, shape_ok in (("crop_circle", True), ("crop_oval", True), ("crop_round", True)):
+        cc = cardmod.Card(p); cc.message.connect(lambda t: None); cc.ensure_loaded()
+        cc._set_tool(tool)
+        assert cc._tool == tool and cc.canvas.crop_shape in ("circle", "oval", "round")
+        w0, h0 = cc.base.size
+        cc.apply_pending()
+        assert cc.base.size[0] < w0 and cc.base.size[1] < h0, "the picture must be cropped"
+        if tool == "crop_circle":
+            assert abs(cc.base.size[0] - cc.base.size[1]) <= 1, "a circle needs a square box"
+        assert cc._tool == "view"
+    # a picture on the page: transparent outside the circle
+    rgb = Image.new("RGB", (300, 200), (10, 10, 200)); a = Image.new("L", (300, 200), 255)
+    r2, a2 = core.crop_to_shape(rgb, a, (50, 0, 250, 200), "oval")
+    assert a2.size == (200, 200) and a2.getpixel((1, 1)) == 0 and a2.getpixel((100, 100)) == 255
+    m = Image.new("L", (300, 200), 0); ImageDraw.Draw(m).ellipse((40, 40, 160, 160), fill=255)
+    r3, a3 = core.crop_to_shape(rgb, a, (40, 40, 161, 161), None, mask=m)
+    assert a3.getpixel((1, 1)) == 0 and a3.getpixel((60, 60)) == 255
+step("crop to circle / oval / rounded box / selection shape", t_crop_shapes)
+
 print("\nFAILED:" if steps else "\nALL OK", steps, flush=True)
 sys.exit(1 if steps else 0)
