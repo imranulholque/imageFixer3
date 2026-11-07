@@ -498,8 +498,8 @@ class MainWindow(QMainWindow):
         for keys, deg in (("[", -1), ("]", 1), ("Ctrl+[", -15), ("Ctrl+]", 15),
                           ("Ctrl+Alt+Left", -90), ("Ctrl+Alt+Right", 90)):
             sc(keys, lambda d=deg: self._with_current(lambda c: c.tf_rotate(d)))
-        sc("R", lambda: self._with_current(lambda c: c.rotate(-90.0)))          # turn the picture 90° right, every press
-        sc("Shift+R", lambda: self._with_current(lambda c: c.rotate(90.0)))     # 90° left
+        sc("R", lambda: self._with_current(lambda c: c.rotate_key(-90.0)))      # 90° right: the selected picture, else the page
+        sc("Shift+R", lambda: self._with_current(lambda c: c.rotate_key(90.0)))   # 90° left
         sc("Ctrl+V", self.paste)
         sc("Ctrl+C", cur(lambda c: c.copy_image()))
         sc("Ctrl+O", self.choose_files)
@@ -515,6 +515,7 @@ class MainWindow(QMainWindow):
         sc("Ctrl+Shift+I", cur(lambda c: c.invert_selection()))
         sc("Ctrl+T", cur(lambda c: c.start_transform()))
         sc("Delete", cur(lambda c: c.delete_selection()))
+        sc("Backspace", cur(lambda c: c.delete_selection()))
         sc("Return", cur(lambda c: c.apply_pending()))
         sc("Enter", cur(lambda c: c.apply_pending()))
         sc("Escape", cur(lambda c: c.cancel_pending()))
