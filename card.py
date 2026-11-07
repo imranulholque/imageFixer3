@@ -8,10 +8,10 @@ import tempfile
 import uuid
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageChops, ImageFilter, ImageOps
 from PySide6.QtCore import QMimeData, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QDrag, QImage, QPixmap
-from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QColorDialog, QFrame, QHBoxLayout, QLabel, QMenu,
+from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QColorDialog, QFileDialog, QFrame, QHBoxLayout, QLabel, QMenu,
                                QPushButton, QScrollArea, QSizePolicy, QSlider, QStackedWidget, QToolButton,
                                QVBoxLayout, QWidget)
 
@@ -548,6 +548,16 @@ class Card(QWidget):
         self._shadow_done = False
         self._shadow_busy = False
         self._shadow_again = False
+        self.layers = []                           # pictures placed on the page (signature, stamp ...), each its own layer
+        self.ctx = None                            # id of the picture layer that is being edited (None = the page)
+        self.alpha = None                          # transparency of that layer ('L'); self.base is then the layer's colours
+        self._stash = None                         # the page's own state while a layer is edited
+        self._hide_layer = None                    # a layer that is being moved is not drawn twice
+        self._place_id = None
+        self.sel_layer = None
+        self._layer_seq = 0
+        self._bg_busy = False
+        self._bg_again = False
         self.shadow_src = None                     # picture before shadow removal: lets the shadow options be changed later
         self.last_action = None                    # the last setting changed: what 'apply to all' copies
         self.keep_ink = True
@@ -583,6 +593,10 @@ class Card(QWidget):
         self._gest_timer.setSingleShot(True)
         self._gest_timer.setInterval(700)
         self._gest_timer.timeout.connect(self._end_gesture)
+        self._bg_timer = QTimer(self)              # background-removal sliders: re-cut a moment after the last move
+        self._bg_timer.setSingleShot(True)
+        self._bg_timer.setInterval(160)
+        self._bg_timer.timeout.connect(self._bg_apply)
         self._shadow_timer = QTimer(self)          # shadow sliders: re-apply live, a moment after the last move
         self._shadow_timer.setSingleShot(True)
         self._shadow_timer.setInterval(450)
@@ -761,6 +775,10 @@ class Card(QWidget):
             ("Rotate left", lambda: self.rotate(90.0)), ("Rotate right", lambda: self.rotate(-90.0))],
             "Crop, straighten a photographed page, rotate")
         self.menus = {"select": self.menuSelect, "move": self.menuMove, "erase": self.menuErase, "crop": self.menuCrop}
+        self.btnLayerDone = QPushButton("◀  Back to the page")
+        self.btnLayerDone.setProperty("accent", True)
+        self.btnLayerDone.setToolTip("You are editing one picture on its own. Click to go back to the whole page.")
+        self.btnLayerDone.hide()
         self.btnApply = QPushButton("Apply  (Enter)")
         self.btnApply.setProperty("accent", True)
         self.btnCancel = QPushButton("Cancel  (Esc)")
@@ -776,6 +794,7 @@ class Card(QWidget):
         for w in (self.menuSelect, self.menuMove, self.btnPick, self.menuErase, self.menuCrop):
             r2.addWidget(w)
         r2.addSpacing(10)
+        r2.addWidget(self.btnLayerDone)
         r2.addWidget(self.btnApply)
         r2.addWidget(self.btnCancel)
         r2.addStretch(1)
@@ -975,7 +994,7 @@ class Card(QWidget):
         self.tabGroup = QButtonGroup(self)
         self.tabGroup.setExclusive(True)
         self.stackPages = QStackedWidget()
-        names = ("Adjust", "Shadow", "Text", "Save")
+        names = ("Adjust", "Shadow", "Text", "Picture", "Save")
         for i, n in enumerate(names):
             b = QPushButton(n)
             b.setCheckable(True)
@@ -1101,6 +1120,67 @@ class Card(QWidget):
         lay.addStretch(1)
         self.stackPages.addWidget(pg)
 
+        # ---------------- Picture (signature, stamp ... placed on the page)
+        pg, lay = self._page()
+        g, gl = self._group_box("Pictures on this page")
+        self.btnAddPic = QPushButton("＋  Add picture  (signature, stamp ...)")
+        self.btnAddPic.setProperty("accent", True)
+        self.btnAddPic.setMinimumHeight(38)
+        self.btnAddPic.setToolTip("Put another picture on this page. Its background is removed.\n"
+                                  "Every picture is its own layer: select it, then use Adjust / Shadow / Text / Select / Erase / Crop on it alone.")
+        gl.addWidget(self.btnAddPic)
+        self.layerBox = QVBoxLayout()
+        self.layerBox.setSpacing(4)
+        gl.addLayout(self.layerBox)
+        self.lblLayerHint = QLabel("")
+        self.lblLayerHint.setObjectName("hint")
+        self.lblLayerHint.setWordWrap(True)
+        gl.addWidget(self.lblLayerHint)
+        lay.addWidget(g)
+        g, gl = self._group_box("Background of the selected picture")
+        self.chkBg = QCheckBox("Remove background")
+        self.chkBg.setChecked(True)
+        self.chkBg.toggled.connect(lambda _=False: self._bg_changed())
+        gl.addWidget(self.chkBg)
+        self.bgRows = {}
+        for key, title, caps, tip, val in (
+                ("strength", "Remove more", ("less", "", "more"),
+                 "Higher = paper that is a bit grey / dirty also disappears. Lower = keeps faint strokes.", 50),
+                ("soft", "Edge softness", ("sharp", "", "soft"), "How smooth the edge of the ink / stamp is.", 30),
+                ("opacity", "Opacity", ("faint", "", "solid"), "How strongly the picture shows on the page.", 100)):
+            row = SliderRow(title, 0, 100, val, caps, tip)
+            row.changed.connect(lambda v, k=key: self._bg_changed(k))
+            self.bgRows[key] = row
+            gl.addWidget(row)
+        self.chkUneven = QCheckBox("Uneven / grey print paper")
+        self.chkUneven.setToolTip("Turn on when the paper behind the signature / stamp is not one flat colour (shading, grey print).")
+        self.chkUneven.toggled.connect(lambda _=False: self._bg_changed())
+        gl.addWidget(self.chkUneven)
+        gl.addWidget(self._label("Ink color"))
+        trow = QHBoxLayout()
+        trow.setSpacing(4)
+        self.tintGroup = QButtonGroup(self)
+        self.tintGroup.setExclusive(True)
+        for i, (text, tip) in enumerate((("Original", "Keep the colors of the picture"), ("Black", "Make it black ink"),
+                                         ("Blue", "Make it blue ink (a blue stamp / pen)"))):
+            b = QPushButton(text)
+            b.setCheckable(True)
+            b.setToolTip(tip)
+            self.tintGroup.addButton(b, i)
+            trow.addWidget(b)
+        self.tintGroup.button(0).setChecked(True)
+        self.tintGroup.idClicked.connect(lambda _=0: self._bg_changed())
+        gl.addLayout(trow)
+        self.lblBgNote = QLabel("Changing the background starts the picture again from the original (edits made inside "
+                                "the picture are lost).")
+        self.lblBgNote.setObjectName("hint")
+        self.lblBgNote.setWordWrap(True)
+        gl.addWidget(self.lblBgNote)
+        self.bgGroup = g
+        lay.addWidget(g)
+        lay.addStretch(1)
+        self.stackPages.addWidget(pg)
+
         # ---------------- Save
         pg, lay = self._page()
         g, gl = self._group_box("Save")
@@ -1137,6 +1217,8 @@ class Card(QWidget):
         self.btnSaveAll.clicked.connect(self.saveAllRequested.emit)
         self.btnPdfAll.clicked.connect(self.pdfAllRequested.emit)
         self.btnApplyAll.clicked.connect(lambda: self.applyAllRequested.emit(self))
+        self.btnAddPic.clicked.connect(lambda: self.add_picture())
+        self.btnLayerDone.clicked.connect(lambda: self.leave_layer())
         self.btnCopy.clicked.connect(self.copy_image)
         return side
 
@@ -1236,14 +1318,28 @@ class Card(QWidget):
             QApplication.restoreOverrideCursor()
 
     @staticmethod
-    def _build_view(base, adjs, look, sel):
-        """Everything slow about showing a picture (preview, colour maths, first render). Runs in a worker thread."""
+    def _build_view(base, adjs, look, sel, deco=None):
+        """Everything slow about showing a picture (preview, colour maths, first render). Runs in a worker thread.
+        deco(out) puts the picture layers on the page (or the chess-board behind a layer)."""
         prev, scale = core.make_preview(base)
         cache = {}
         lab = core.rgb_to_lab(prev) if core.active_adjs(adjs) else None
         out = core.render(prev, adjs, look, lab=lab, cache=cache,
                           sel=sel if (sel is not None and sel.shape == prev.shape[:2]) else None)
+        if deco is not None:
+            out = deco(out)
         return {"prev": prev, "scale": scale, "lab": lab, "cache": cache, "out": out}
+
+    @staticmethod
+    def _deco_from(ctx, alpha, layers, hide=None):
+        if ctx is not None and alpha is not None:
+            return lambda out: core.show_alpha(out, alpha)
+        if layers:
+            return lambda out: np.asarray(core.composite_layers(Image.fromarray(out), layers, hide))
+        return None
+
+    def _deco(self):
+        return self._deco_from(self.ctx, self.alpha, self.layers, self._hide_layer)
 
     def _adopt_view(self, v, refit=True):
         self._view_gen += 1
@@ -1272,7 +1368,7 @@ class Card(QWidget):
         self._update_buttons()
 
     def _rebuild_preview(self, refit=True):
-        v = self._build_view(self.base, self.adjs, self.look, self.sel)
+        v = self._build_view(self.base, self.adjs, self.look, self.sel, self._deco())
         self._adopt_view(v, refit)
 
     def _get_lab(self):
@@ -1294,7 +1390,8 @@ class Card(QWidget):
         lab = self._get_lab() if (core.active_adjs(self.adjs) or focus is not None) else None
         out = core.render(self.prev, self.adjs, self.look, lab=lab, cache=self._cache, sel=self.sel)
         self._show_highlight(focus, None if focus is None else core.get_mask(self.prev, focus, lab, self._cache))
-        return out
+        deco = self._deco()
+        return deco(out) if deco is not None else out
 
     def _show_highlight(self, focus, mask):
         key = None if focus is None else (focus["id"], core.adj_key(focus), self._sel_ver)
@@ -1319,12 +1416,15 @@ class Card(QWidget):
         adjs = copy.deepcopy(self.adjs)
         look, sel = dict(self.look), self.sel
         focus = copy.deepcopy(self._focus_adj())
+        deco = self._deco()
 
         def work(progress):
             lab = lab0
             if lab is None and (core.active_adjs(adjs) or focus is not None):
                 lab = core.rgb_to_lab(prev)
             out = core.render(prev, adjs, look, lab=lab, cache=cache, sel=sel)
+            if deco is not None:
+                out = deco(out)
             hl = None if focus is None else core.get_mask(prev, focus, lab, cache)
             return out, hl, lab
 
@@ -1351,7 +1451,7 @@ class Card(QWidget):
 
     # --------------------------------------------------------------- state
     def is_edited(self):
-        return (self.ops > 0 or self._pending is not None or core.look_edited(self.look)
+        return (self.ops > 0 or bool(self.layers) or self._pending is not None or core.look_edited(self.look)
                 or bool(core.active_adjs(self.adjs)))
 
     def is_unsaved(self):
@@ -1373,7 +1473,20 @@ class Card(QWidget):
     def render_args(self):
         """A snapshot of everything needed to produce the final picture (safe to use in a worker thread)."""
         self.ensure_loaded()
-        return (self.base, copy.deepcopy(self.adjs), dict(self.look), self.sel)
+        layers = self._layers_now()
+        if self.ctx is not None and self._stash is not None:          # a layer is open: the result is still the whole page
+            st = self._stash
+            return (st["base"], copy.deepcopy(st["adjs"]), dict(st["look"]), st["sel"], layers)
+        return (self.base, copy.deepcopy(self.adjs), dict(self.look), self.sel, layers)
+
+    def _layers_now(self):
+        """The layers as they are right now (the one being edited with its unfinished settings)."""
+        if self.ctx is None:
+            return list(self.layers)
+        pend = None
+        if core.active_adjs(self.adjs) or core.look_edited(self.look):
+            pend = (copy.deepcopy(self.adjs), dict(self.look), self.sel)
+        return [dict(l, rgb=self.base, a=self.alpha, pend=pend) if l["id"] == self.ctx else l for l in self.layers]
 
     def result_image(self):
         return core.render_full(*self.render_args())
@@ -1385,12 +1498,14 @@ class Card(QWidget):
     # ------------------------------------------------- history (undo / redo)
     def _snap(self):
         return {"base": self.base, "adjs": copy.deepcopy(self.adjs), "look": dict(self.look),
-                "shadow": self._shadow_done, "sel": self.sel, "ops": self.ops, "shadow_src": self.shadow_src}
+                "shadow": self._shadow_done, "sel": self.sel, "ops": self.ops, "shadow_src": self.shadow_src,
+                "ctx": self.ctx, "alpha": self.alpha, "stash": self._stash, "layers": list(self.layers)}
 
     def _push_undo(self, st):
         self.undo.append(st)
         self.redo = []
-        while len(self.undo) > 80 or len({id(x) for e in self.undo for x in (e["base"], e.get("shadow_src")) if x is not None}) > 8:
+        while len(self.undo) > 80 or len({id(x) for e in self.undo for x in [e["base"], e.get("shadow_src")] + [l["rgb"] for l in e.get("layers", [])]
+                                      if x is not None}) > 12:
             self.undo.pop(0)
         self._update_buttons()
 
@@ -1431,16 +1546,21 @@ class Card(QWidget):
         self.sel = st.get("sel")
         self.ops = st["ops"]
         self.shadow_src = st.get("shadow_src")
+        self.ctx, self.alpha, self._stash = st.get("ctx"), st.get("alpha"), st.get("stash")
+        self.layers = list(st.get("layers", []))
+        if self.sel_layer is not None and not any(l["id"] == self.sel_layer for l in self.layers):
+            self.sel_layer = None
         self._sel_ver += 1
         self.colors.rebuild(self.adjs)
         self._sync_sliders()
+        self._refresh_layers_ui()
 
     def _goto(self, st):
         """Show a stored state (undo / redo)."""
         if self._tool in CROP_KEYS or self._tool == "transform":
             self._go_move()
         self._clear_clone()
-        if st["base"] is self.base:                      # same picture: only values / selection changed
+        if st["base"] is self.base and st.get("ctx") == self.ctx and st.get("alpha") is self.alpha:   # same picture: only values / selection changed
             self._set_fields(st)
             self.canvas.set_selection(self.sel)
             self._hl_key = None
@@ -1450,7 +1570,8 @@ class Card(QWidget):
             return
 
         def work(progress):
-            return self._build_view(st["base"], st["adjs"], core.new_look(**st["look"]), st.get("sel"))
+            return self._build_view(st["base"], st["adjs"], core.new_look(**st["look"]), st.get("sel"),
+                                    self._deco_from(st.get("ctx"), st.get("alpha"), st.get("layers", [])))
 
         def done(v):
             self._set_fields(st)
@@ -1481,11 +1602,12 @@ class Card(QWidget):
         self._goto(self.redo.pop())
 
     def _edit_base(self, label, make, keep_sel=True, refit=False, after=None, msg=None, shadow_src=None, merge=False,
-                   checkpoint=True, fail=None):
+                   checkpoint=True, fail=None, alpha_make=None):
         """Change the picture itself (erase, crop, rotate, move ...) in a worker thread, then show it.
         make(progress) -> new PIL image, or (new image, new selection)."""
         adjs = copy.deepcopy(self.adjs)
         look, sel_in = dict(self.look), self.sel
+        ctx_in, alpha_in, layers_in, hide_in = self.ctx, self.alpha, self.layers, self._hide_layer
 
         def work(progress):
             res = make(progress)
@@ -1493,11 +1615,14 @@ class Card(QWidget):
                 new, sel_out = res
             else:
                 new, sel_out = res, (sel_in if keep_sel else None)
+            na = alpha_make(progress) if (alpha_make is not None and ctx_in is not None) else alpha_in
             progress(0.9, "Showing")
-            return new, sel_out, self._build_view(new, adjs, look, sel_out)
+            return new, sel_out, self._build_view(new, adjs, look, sel_out, self._deco_from(ctx_in, na, layers_in, hide_in)), na
 
         def done(r):
-            new, sel_out, v = r
+            new, sel_out, v, na = r
+            if ctx_in is not None and self.ctx == ctx_in:
+                self.alpha = na
             if not checkpoint:
                 self.ops += 1
             elif merge and self._gest:               # a live shadow slider drag is ONE undo step
@@ -1519,6 +1644,362 @@ class Card(QWidget):
             if msg:
                 self.message.emit(msg)
         self._job(label, work, done, fail)
+
+    # ------------------------------------------------ picture layers (signature, stamp ...)
+    BG_DEFAULT = {"strength": 50, "soft": 30, "uneven": False, "tint": "orig", "opacity": 100, "remove": True}
+
+    def _layer(self, lid):
+        for l in self.layers:
+            if l["id"] == lid:
+                return l
+        return None
+
+    def _replace_layer(self, lid, **kw):
+        self.layers = [dict(l, **kw) if l["id"] == lid else l for l in self.layers]
+
+    def add_picture(self, path=None):
+        """A picture (signature, stamp ...) becomes a new layer: background removed, then placed on the page."""
+        self.ensure_loaded()
+        if not self._loaded:
+            return
+        if self.ctx is not None:
+            self.leave_layer(lambda: self.add_picture(path))
+            return
+        if path is None:
+            path, _ = QFileDialog.getOpenFileName(self, "Add picture (signature, stamp ...)", "",
+                                                  "Pictures (*.png *.jpg *.jpeg *.bmp *.webp *.tif *.tiff)")
+            if not path:
+                return
+        bg = dict(self.BG_DEFAULT)
+
+        def work(progress):
+            im = ImageOps.exif_transpose(Image.open(path))
+            rgba = im.convert("RGBA")
+            a = rgba.split()[3]
+            sa = a if a.getextrema()[0] < 250 else None          # a PNG that is already transparent keeps its holes
+            rgb = rgba.convert("RGB")
+            if max(rgb.size) > 2000:
+                f = 2000.0 / max(rgb.size)
+                size = (max(1, int(rgb.width * f)), max(1, int(rgb.height * f)))
+                rgb = rgb.resize(size, Image.Resampling.LANCZOS)
+                sa = sa.resize(size, Image.Resampling.LANCZOS) if sa is not None else None
+            cut = core.remove_background(rgb, sa, **bg)
+            box = core.content_box(cut.split()[3])
+            if box is not None:                                    # trim the empty margins
+                rgb = rgb.crop(box)
+                sa = sa.crop(box) if sa is not None else None
+                cut = cut.crop(box)
+            return rgb, sa, cut
+
+        def done(r):
+            rgb, sa, cut = r
+            self._layer_seq += 1
+            W, H = self.base.size
+            wn = 0.35
+            hn = wn * (rgb.height / rgb.width) * (W / H)
+            if hn > 0.6:
+                wn, hn = wn * 0.6 / hn, 0.6
+            x0, y0 = 0.5 - wn / 2, 0.5 - hn / 2
+            layer = {"id": self._layer_seq, "name": os.path.basename(path) or "Picture %d" % self._layer_seq,
+                     "rgb": cut.convert("RGB"), "a": cut.split()[3], "src": rgb, "sa": sa, "bg": bg,
+                     "grid": [(x0, y0), (x0 + wn, y0), (x0, y0 + hn), (x0 + wn, y0 + hn)], "n": 1,
+                     "opacity": 100, "visible": True}
+            self._checkpoint()
+            self.layers = self.layers + [layer]
+            self.ops += 1
+            self.sel_layer = layer["id"]
+            self._touch()
+            self.show_tab(3)
+            self._refresh_layers_ui()
+            self.place_layer_tool(layer["id"])
+            self.message.emit("Picture added. Drag it, use the corner handles to resize, the round handle to rotate, "
+                              "then press Enter.")
+        self._job("Adding picture", work, done)
+
+    def select_layer(self, lid):
+        self.sel_layer = lid
+        self._refresh_layers_ui()
+
+    def delete_layer(self, lid):
+        if self._layer(lid) is None:
+            return
+        if self.ctx == lid:
+            self.leave_layer(lambda: self.delete_layer(lid))
+            return
+        if self._tool == "transform" and self._place_id == lid:
+            self._place_id = None
+            self._hide_layer = None
+            self._go_move()
+        self._checkpoint()
+        self.layers = [l for l in self.layers if l["id"] != lid]
+        if self.sel_layer == lid:
+            self.sel_layer = None
+        self.ops += 1
+        self._touch()
+        self._timer.start()
+        self._refresh_layers_ui()
+
+    def move_layer_order(self, lid, d):
+        i = next((k for k, l in enumerate(self.layers) if l["id"] == lid), None)
+        j = None if i is None else i + d
+        if i is None or not (0 <= j < len(self.layers)):
+            return
+        self._checkpoint()
+        ls = list(self.layers)
+        ls[i], ls[j] = ls[j], ls[i]
+        self.layers = ls
+        self._touch()
+        self._timer.start()
+        self._refresh_layers_ui()
+
+    def toggle_layer(self, lid, visible):
+        self._checkpoint()
+        self._replace_layer(lid, visible=bool(visible))
+        self._touch()
+        self._timer.start()
+
+    def place_layer_tool(self, lid):
+        """Move / resize / rotate / bend one picture on the page."""
+        l = self._layer(lid)
+        if l is None or not self._loaded:
+            return
+        if self.ctx is not None:
+            self.leave_layer(lambda: self.place_layer_tool(lid))
+            return
+        if self._tool == "transform":
+            self._go_move()
+        PH, PW = self.prev.shape[:2]
+        n = l["n"]
+        pts = [(x * PW, y * PH) for x, y in l["grid"]]
+        rgba = core.layer_rgba(l, pend=False)
+        f = min(1.0, 700.0 / max(rgba.size))
+        if f < 1.0:
+            rgba = rgba.resize((max(1, int(rgba.width * f)), max(1, int(rgba.height * f))), Image.Resampling.LANCZOS)
+        arr = np.asarray(rgba)
+        qimg = QImage(arr.data, arr.shape[1], arr.shape[0], arr.shape[1] * 4, QImage.Format.Format_RGBA8888).copy()
+        self.sel_layer = lid
+        self._hide_layer = lid
+        self._timer.start()
+        self._set_tool("transform")
+        self._place_id = lid                           # (_set_tool clears it, so it is set after)
+        self.canvas.start_layer_transform(qimg, pts, n)
+        self.tfBtns["warp" if n == 3 else "free"].setChecked(True)
+        self._refresh_layers_ui()
+
+    def _apply_layer_place(self):
+        lid, p = self._place_id, self.canvas.transform_params()
+        if lid is None or p is None or self._layer(lid) is None:
+            return
+        pts, n = p
+        PH, PW = self.prev.shape[:2]
+        self._checkpoint()
+        self._replace_layer(lid, grid=[(x / PW, y / PH) for x, y in pts], n=n)
+        self.ops += 1
+        self._place_id = None
+        self._hide_layer = None
+        self._go_move()
+        self._touch()
+        self._timer.start()
+
+    def edit_layer(self, lid):
+        """Work on ONE picture alone: Adjust / Shadow / Text / Select / Erase / Crop then change only this picture."""
+        l = self._layer(lid)
+        if l is None or not self._loaded:
+            return
+        if self.ctx == lid:
+            return
+        if self.ctx is not None:
+            self.leave_layer(lambda: self.edit_layer(lid))
+            return
+        if self._tool in CROP_KEYS or self._tool == "transform":
+            self._place_id = None
+            self._hide_layer = None
+            self._go_move()
+        self._clear_clone()
+        self._checkpoint()
+        self._stash = {"base": self.base, "adjs": self.adjs, "look": dict(self.look), "sel": self.sel,
+                       "shadow_src": self.shadow_src, "shadow": self._shadow_done}
+        self.ctx, self.alpha, self.sel_layer = lid, l["a"], lid
+        self.base, self.adjs, self.look, self.sel = l["rgb"], [], core.new_look(), None
+        self.shadow_src, self._shadow_done = None, False
+        self._view_gen += 1
+        self._timer.stop()
+        self.colors.rebuild(self.adjs)
+        self._sync_sliders()
+        self._sel_ver += 1
+        deco = self._deco()
+        base = self.base
+
+        def work(progress):
+            return self._build_view(base, [], core.new_look(), None, deco)
+
+        def done(v):
+            self._adopt_view(v, True)
+            self._touch()
+            self._refresh_layers_ui()
+            self.message.emit("Editing this picture alone. All tools work on it only. Click 'Back to the page' when done.")
+        self._job("Opening picture", work, done)
+
+    def leave_layer(self, then=None):
+        if self.ctx is None:
+            if then:
+                then()
+            return
+        lid, st = self.ctx, self._stash
+        adjs, look, sel, base, alpha = copy.deepcopy(self.adjs), dict(self.look), self.sel, self.base, self.alpha
+        layers0 = list(self.layers)
+        self._checkpoint()
+        pending = core.active_adjs(adjs) or core.look_edited(look)
+
+        def work(progress):
+            rgb = core.render_full(base, adjs, look, sel) if pending else base
+            layers = [dict(l, rgb=rgb, a=alpha, pend=None) if l["id"] == lid else l for l in layers0]
+            v = self._build_view(st["base"], st["adjs"], core.new_look(**st["look"]), st["sel"],
+                                 self._deco_from(None, None, layers, None))
+            return layers, v
+
+        def done(r):
+            layers, v = r
+            self.layers = layers
+            self.base, self.adjs, self.look, self.sel = st["base"], copy.deepcopy(st["adjs"]), core.new_look(**st["look"]), st["sel"]
+            self.shadow_src, self._shadow_done = st["shadow_src"], st["shadow"]
+            self.ctx = self.alpha = self._stash = None
+            self._go_move()
+            self._clear_clone()
+            self.colors.rebuild(self.adjs)
+            self._sync_sliders()
+            self._sel_ver += 1
+            self._adopt_view(v, True)
+            self._touch()
+            self._refresh_layers_ui()
+            if then:
+                then()
+        self._job("Back to the page", work, done)
+
+    # --- background of the selected picture
+    def _bg_changed(self, key=None):
+        lid = self.sel_layer
+        l = None if lid is None else self._layer(lid)
+        if l is None or self.ctx is not None:
+            return
+        self._begin_change()
+        if key == "opacity":                       # no new cut needed
+            self._replace_layer(lid, opacity=int(self.bgRows["opacity"].sl.value()))
+            self._timer.start()
+            self._touch()
+            return
+        self._bg_timer.start()
+
+    def _bg_params(self):
+        tint = ("orig", "black", "blue")[max(0, self.tintGroup.checkedId())]
+        return {"strength": int(self.bgRows["strength"].sl.value()), "soft": int(self.bgRows["soft"].sl.value()),
+                "uneven": self.chkUneven.isChecked(), "tint": tint, "opacity": 100, "remove": self.chkBg.isChecked()}
+
+    def _bg_apply(self):
+        lid = self.sel_layer
+        l = None if lid is None else self._layer(lid)
+        if l is None or self.ctx is not None:
+            return
+        if self._bg_busy:
+            self._bg_again = True
+            return
+        self._bg_busy = True
+        bg = self._bg_params()
+        src, sa = l["src"], l["sa"]
+
+        def work(progress):
+            return core.remove_background(src, sa, **bg)
+
+        def done(cut):
+            self._bg_busy = False
+            if self._layer(lid) is not None and self.ctx is None:
+                self._replace_layer(lid, rgb=cut.convert("RGB"), a=cut.split()[3], bg=bg)
+                self._touch()
+                self._timer.start()
+            if self._bg_again:
+                self._bg_again = False
+                self._bg_timer.start()
+
+        def fail(msg):
+            self._bg_busy = False
+            self.message.emit("Background problem: " + msg.splitlines()[0])
+        run_background(work, done, fail)
+
+    def _refresh_layers_ui(self):
+        if not hasattr(self, "layerBox"):
+            return
+        while self.layerBox.count():
+            it = self.layerBox.takeAt(0)
+            if it.widget() is not None:
+                it.widget().deleteLater()
+        for l in reversed(self.layers):                  # top layer first
+            row = QWidget()
+            h = QHBoxLayout(row)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(4)
+            eye = QCheckBox()
+            eye.setChecked(l.get("visible", True))
+            eye.setToolTip("Show / hide this picture")
+            eye.toggled.connect(lambda on, i=l["id"]: self.toggle_layer(i, on))
+            name = QPushButton(l["name"])
+            name.setCheckable(True)
+            name.setChecked(self.sel_layer == l["id"])
+            name.setToolTip("Select this picture")
+            name.clicked.connect(lambda _=False, i=l["id"]: self.select_layer(i))
+            mv = QPushButton("Move")
+            mv.setToolTip("Move / resize / rotate / bend this picture on the page (Ctrl+T)")
+            mv.clicked.connect(lambda _=False, i=l["id"]: self.place_layer_tool(i))
+            ed = QPushButton("Edit")
+            ed.setToolTip("Work on this picture alone: Adjust, Shadow, Text, Select, Erase, Crop")
+            ed.setProperty("accent", self.ctx == l["id"])
+            ed.clicked.connect(lambda _=False, i=l["id"]: self.edit_layer(i))
+            up = QPushButton("↑")
+            up.setFixedWidth(26)
+            up.setToolTip("Bring forward")
+            up.clicked.connect(lambda _=False, i=l["id"]: self.move_layer_order(i, 1))
+            dn = QPushButton("↓")
+            dn.setFixedWidth(26)
+            dn.setToolTip("Send backward")
+            dn.clicked.connect(lambda _=False, i=l["id"]: self.move_layer_order(i, -1))
+            rm = QPushButton("✕")
+            rm.setFixedWidth(26)
+            rm.setToolTip("Remove this picture")
+            rm.clicked.connect(lambda _=False, i=l["id"]: self.delete_layer(i))
+            h.addWidget(eye)
+            h.addWidget(name, 1)
+            for w in (mv, ed, up, dn, rm):
+                h.addWidget(w)
+            self.layerBox.addWidget(row)
+        if not self.layers:
+            self.lblLayerHint.setText("No pictures yet. Add a signature or a stamp: its background is removed and you can "
+                                      "place it anywhere on the page.")
+        elif self.ctx is not None:
+            self.lblLayerHint.setText("Editing one picture alone. Everything you do now changes only this picture.")
+        else:
+            self.lblLayerHint.setText("Move = place it.  Edit = work on this picture alone (Adjust, Shadow, Text, "
+                                      "Select, Erase, Crop).  Select a picture to change its background below.")
+        self.btnLayerDone.setVisible(self.ctx is not None)
+        self.bgGroup.setEnabled(self.ctx is None and self.sel_layer is not None and self._layer(self.sel_layer) is not None)
+        l = None if self.sel_layer is None else self._layer(self.sel_layer)
+        if l is not None and self.ctx is None:
+            bg = l.get("bg", self.BG_DEFAULT)
+            for k in ("strength", "soft"):
+                self.bgRows[k].sl.blockSignals(True)
+                self.bgRows[k].sl.setValue(int(bg.get(k, 50)))
+                self.bgRows[k].val.setText("%d%%" % int(bg.get(k, 50)))
+                self.bgRows[k].sl.blockSignals(False)
+            self.bgRows["opacity"].sl.blockSignals(True)
+            self.bgRows["opacity"].sl.setValue(int(l.get("opacity", 100)))
+            self.bgRows["opacity"].val.setText("%d%%" % int(l.get("opacity", 100)))
+            self.bgRows["opacity"].sl.blockSignals(False)
+            for w, v in ((self.chkUneven, bg.get("uneven", False)), (self.chkBg, bg.get("remove", True))):
+                w.blockSignals(True)
+                w.setChecked(bool(v))
+                w.blockSignals(False)
+            i = ("orig", "black", "blue").index(bg.get("tint", "orig"))
+            self.tintGroup.blockSignals(True)
+            self.tintGroup.button(i).setChecked(True)
+            self.tintGroup.blockSignals(False)
 
     # ------------------------------------------- settings shared by all pictures
     def apply_action(self, act):
@@ -1840,6 +2321,9 @@ class Card(QWidget):
         self._job("Selecting", work, done)
 
     def _on_move(self, dx, dy, copy_flag):
+        if self.ctx is not None:
+            self._warn("Not inside a picture. Use 'Move / resize' on the picture in the Picture tab to place it.")
+            return
         if not self._loaded or self.sel is None:
             self.message.emit("Make a selection first.")
             return
@@ -1857,16 +2341,28 @@ class Card(QWidget):
         """Delete key: what is selected disappears, the place is filled from its surroundings."""
         if not self._loaded:
             return
+        if self._tool == "transform" and self._place_id is not None:   # a picture is being placed: Delete removes it
+            self.delete_layer(self._place_id)
+            return
         if self._tool == "transform":                # Delete while transforming: the object goes away
             self._go_move()
         if self.sel is None:
             self._warn("Nothing is selected. Select something first (Select menu), or pick a color and press 'Select this color'.")
             return
         sel, base, ink = self.sel, self.base, self.keep_ink
+        if self.ctx is not None:                     # inside a picture layer: deleted = transparent
+            alpha = self.alpha
+            self._edit_base("Deleting", lambda progress: base, msg="Deleted. Ctrl+Z brings it back.",
+                            alpha_make=lambda progress: self._alpha_minus(alpha, self._mask_img(sel, alpha.size)))
+            return
 
         def make(progress):
             return core.erase_region(base, self._mask_img(sel, base.size), None, 2.0, ink)
         self._edit_base("Deleting", make, msg="Deleted. Ctrl+Z brings it back.")
+
+    @staticmethod
+    def _alpha_minus(alpha, mask):
+        return ImageChops.multiply(alpha, ImageChops.invert(mask))
 
     def fill_selection(self):
         if not self._loaded:
@@ -1878,7 +2374,9 @@ class Card(QWidget):
 
         def make(progress):
             return core.fill_region(base, self._mask_img(sel, base.size), rgb)
-        self._edit_base("Filling", make)
+        alpha = self.alpha
+        self._edit_base("Filling", make,
+                        alpha_make=lambda progress: ImageChops.lighter(alpha, self._mask_img(sel, alpha.size)) if alpha is not None else None)
 
     # ---------------------------------------------------------------- tools
     def choose_tool(self, key):
@@ -1894,6 +2392,13 @@ class Card(QWidget):
     def _set_tool(self, key):
         if not self._loaded and key != "view":
             return
+        if self.ctx is not None and key in ("persp", "transform", "copy"):
+            self._warn("Not inside a picture. Use 'Move / resize' on the picture in the Picture tab to place it.")
+            return
+        if key != "transform" and self._place_id is not None:      # a picture was not placed: it stays where it was
+            self._place_id = None
+            self._hide_layer = None
+            self._timer.start()
         mode, shape = TOOL_MODE[key]
         self._tool = key
         self.canvas.copy_mode = key == "copy"
@@ -1935,8 +2440,11 @@ class Card(QWidget):
             self.canvas.tf_nudge(dx, dy)
 
     def start_transform(self):
-        """Ctrl+T: resize / rotate / move the selected part."""
+        """Ctrl+T: resize / rotate / move the selected part (or the selected picture layer)."""
         if not self._loaded:
+            return
+        if self.ctx is None and self.sel is None and self.sel_layer is not None:
+            self.place_layer_tool(self.sel_layer)
             return
         px = self.canvas.selection_pixels() if self.sel is not None else None
         if px is None:
@@ -1949,6 +2457,8 @@ class Card(QWidget):
     def apply_pending(self):
         if self._tool in CROP_KEYS:
             self._apply_crop()
+        elif self._tool == "transform" and self._place_id is not None:
+            self._apply_layer_place()
         elif self._tool == "transform":
             self._apply_transform()
 
@@ -1997,13 +2507,21 @@ class Card(QWidget):
         size = self.sizeSlider.value()
         base, sel, ink = self.base, self.sel, self.keep_ink
 
-        def make(progress):
+        def get_mask():
             mask = core.make_mask(base.size, kind, payload, brush=size)
             if sel is not None:                      # with a selection, erasing only works inside it
                 m = np.asarray(mask, dtype=np.float32) * core.resize_mask(sel, base.size)
                 mask = Image.fromarray(np.clip(m, 0, 255).astype(np.uint8))
+            return mask
+
+        def make(progress):
             feather = max(1.5, 0.08 * size) if kind == "brush" else 2.0
-            return core.erase_region(base, mask, offset, feather, ink)
+            return core.erase_region(base, get_mask(), offset, feather, ink)
+        if self.ctx is not None:                     # inside a picture layer: erased = transparent
+            alpha = self.alpha
+            self._edit_base("Erasing", lambda progress: base,
+                            alpha_make=lambda progress: self._alpha_minus(alpha, get_mask().filter(ImageFilter.GaussianBlur(0.8))))
+            return
         self._edit_base("Erasing", make)
 
     def _apply_crop(self):
@@ -2018,6 +2536,7 @@ class Card(QWidget):
 
             def make(progress):
                 return core.crop_box(base, box)
+            alpha_make = (lambda progress: core.crop_box(self.alpha.convert("RGB"), box).convert("L")) if self.ctx is not None else None
         elif self._tool == "persp":
             quad = [(x / s, y / s) for x, y in c.quad_img()]
 
@@ -2029,7 +2548,8 @@ class Card(QWidget):
         def after():
             self._clear_clone()
             self._go_move()
-        self._edit_base("Cropping", make, keep_sel=False, refit=True, after=after)
+        self._edit_base("Cropping", make, keep_sel=False, refit=True, after=after,
+                        alpha_make=locals().get("alpha_make"))
 
     def _apply_transform(self):
         p = self.canvas.transform_params()
@@ -2049,10 +2569,34 @@ class Card(QWidget):
         self._edit_base("Transforming", make, after=self._go_move)
 
     def rotate(self, deg_ccw):
+        """Turn the whole picture (the page, or the picture layer being edited) by deg_ccw; pictures placed on the
+        page turn with it."""
         if not self._loaded:
             return
-        base = self.base
-        self._edit_base("Rotating", lambda progress: core.rotate_image(base, deg_ccw), keep_sel=False, refit=True)
+        if self._tool in CROP_KEYS or self._tool == "transform":
+            self._place_id = None
+            self._hide_layer = None
+            self._go_move()
+        base, alpha = self.base, self.alpha
+        am = (lambda progress: core.rotate_image(alpha.convert("RGB"), deg_ccw).convert("L")) if self.ctx is not None else None
+        quarter = int(round(deg_ccw / 90.0)) % 4 if abs(deg_ccw / 90.0 - round(deg_ccw / 90.0)) < 1e-6 else None
+        layers_in = self.layers if (self.ctx is None and quarter) else None
+
+        def turn(p):                                   # one quarter turn counter-clockwise in normalised page coordinates
+            return (p[1], 1.0 - p[0])
+
+        def after():
+            if layers_in:
+                ls = []
+                for l in layers_in:
+                    g = l["grid"]
+                    for _ in range(quarter):
+                        g = [turn(p) for p in g]
+                    ls.append(dict(l, grid=g))
+                self.layers = ls
+                self._timer.start()
+        self._edit_base("Rotating", lambda progress: core.rotate_image(base, deg_ccw), keep_sel=False, refit=True,
+                        alpha_make=am, after=after)
 
     def _auto_shadow(self, live=False):
         """Shadow removal. It always starts from the picture BEFORE the first shadow removal, so the options
