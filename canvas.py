@@ -29,6 +29,10 @@ class ImageCanvas(QWidget):
     sourcePicked = Signal(float, float)   # Alt + click: spot to copy from (clone)
     selectFinished = Signal(str, object, str)   # ('quick'|'rect'|'lasso'|'color', data, ''|'add'|'sub') preview pixels
     moveFinished = Signal(int, int, bool)       # dx, dy (preview pixels), True = copy (original stays)
+    viewClicked = Signal(float, float)          # a plain click with the hand tool (select a picture layer there)
+    tfCommitted = Signal()                      # a picture layer was moved / resized / rotated (mouse released)
+    layerOutside = Signal(float, float)         # click outside the box of the selected picture layer
+    layerEditRequested = Signal()               # double click on the selected picture layer
 
     VIEW, PICK, CROP, PERSP, ERASE, SELECT, MOVESEL, TRANSFORM = 0, 1, 2, 3, 4, 5, 6, 7
     HIT = 11
@@ -51,6 +55,7 @@ class ImageCanvas(QWidget):
         self._quad = []
         self._drag = None
         self._pan_last = None
+        self._view_press = None
         self._hover = None
         self._erase = None                    # stroke / shape being drawn
         self.erase_shape = "brush"
@@ -288,12 +293,27 @@ class ImageCanvas(QWidget):
     def start_layer_transform(self, img, pts, n):
         """Move / resize / rotate / bend a picture layer: img = QImage (RGBA), pts = its net in preview pixels."""
         self._tf = {"img": img, "w": float(img.width()), "h": float(img.height()), "n": n,
-                    "mode": "warp" if n == 3 else "free", "pts": [QPointF(x, y) for x, y in pts]}
+                    "mode": "warp" if n == 3 else "free", "layer": True, "pts": [QPointF(x, y) for x, y in pts]}
         self._tf_drag = None
         self.mode = self.TRANSFORM
         self._update_cursor()
         self.setFocus()
         self.update()
+
+    def set_tf_image(self, img):
+        """A new picture for the box that is open (the background of a layer was changed)."""
+        if self._tf is not None:
+            self._tf["img"] = img
+            self._tf["w"], self._tf["h"] = float(img.width()), float(img.height())
+            self.update()
+
+    def mouseDoubleClickEvent(self, e):
+        if self.mode == self.TRANSFORM and self._tf is not None and self._tf.get("layer") \
+                and e.button() == Qt.MouseButton.LeftButton and self._tf_hit(e.position()) == "move":
+            self._tf_drag = None
+            self.layerEditRequested.emit()
+            return
+        super().mouseDoubleClickEvent(e)
 
     def selection_pixels(self):
         """(QImage RGBA of the selected pixels, x0, y0) in preview pixels, or None."""
@@ -463,7 +483,7 @@ class ImageCanvas(QWidget):
         poly = QPolygonF(self._corners())
         if poly.containsPoint(self.to_img(pos), Qt.FillRule.OddEvenFill):
             return "move"
-        return "rotate"
+        return "outside" if t.get("layer") else "rotate"
 
     def _tf_start(self, hit, ip):
         t = self._tf
@@ -848,13 +868,19 @@ class ImageCanvas(QWidget):
         if btn in (Qt.MouseButton.MiddleButton, Qt.MouseButton.RightButton) or \
                 (btn == Qt.MouseButton.LeftButton and (self.mode == self.VIEW or self._space)):
             self._pan_last = pos
+            if btn == Qt.MouseButton.LeftButton and self.mode == self.VIEW and not self._space:
+                self._view_press = pos
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
             return
         if btn != Qt.MouseButton.LeftButton:
             return
         ip = self.to_img(pos)
         if self.mode == self.TRANSFORM and self._tf is not None:
-            self._tf_drag = self._tf_start(self._tf_hit(pos), ip)
+            hit = self._tf_hit(pos)
+            if hit == "outside":
+                self.layerOutside.emit(ip.x(), ip.y())
+                return
+            self._tf_drag = self._tf_start(hit, ip)
             return
         if self.mode == self.PICK:
             if 0 <= ip.x() < self._iw and 0 <= ip.y() < self._ih:
@@ -989,10 +1015,18 @@ class ImageCanvas(QWidget):
             self._update_cursor(pos)
 
     def mouseReleaseEvent(self, e):
+        if self._view_press is not None and e.button() == Qt.MouseButton.LeftButton:
+            moved = (e.position() - self._view_press).manhattanLength()
+            ip = self.to_img(e.position())
+            self._view_press = None
+            if moved < 5:                                    # a click, not a drag of the picture
+                self.viewClicked.emit(ip.x(), ip.y())
         if self._tf_drag is not None:
             self._tf_drag = None
             self._pan_last = None
             self._update_cursor(e.position())
+            if self._tf is not None and self._tf.get("layer"):
+                self.tfCommitted.emit()
             return
         if self._float_start is not None and e.button() == Qt.MouseButton.LeftButton:
             copy = self._float_start[1]
