@@ -957,6 +957,10 @@ class Card(QWidget):
         self.canvas.sourcePicked.connect(self._on_source)
         self.canvas.selectFinished.connect(self._on_select)
         self.canvas.moveFinished.connect(self._on_move)
+        self.canvas.viewClicked.connect(self._on_view_click)
+        self.canvas.tfCommitted.connect(self._commit_layer_pts)
+        self.canvas.layerOutside.connect(self._on_layer_outside)
+        self.canvas.layerEditRequested.connect(lambda: self.edit_layer(self._place_id) if self._place_id is not None else None)
         self.btnApply.clicked.connect(self.apply_pending)
         self.btnCancel.clicked.connect(self.cancel_pending)
         self.btnUndo.clicked.connect(self.undo_step)
@@ -1123,7 +1127,7 @@ class Card(QWidget):
         # ---------------- Picture (signature, stamp ... placed on the page)
         pg, lay = self._page()
         g, gl = self._group_box("Pictures on this page")
-        self.btnAddPic = QPushButton("＋  Add picture  (signature, stamp ...)")
+        self.btnAddPic = QPushButton("＋  Add picture")
         self.btnAddPic.setProperty("accent", True)
         self.btnAddPic.setMinimumHeight(38)
         self.btnAddPic.setToolTip("Put another picture on this page. Its background is removed.\n"
@@ -1712,8 +1716,8 @@ class Card(QWidget):
             self.show_tab(3)
             self._refresh_layers_ui()
             self.place_layer_tool(layer["id"])
-            self.message.emit("Picture added. Drag it, use the corner handles to resize, the round handle to rotate, "
-                              "then press Enter.")
+            self.message.emit("Picture added. Drag it, corner handles resize, the round handle rotates. "
+                              "Click outside it when done; click it again any time to change it.")
         self._job("Adding picture", work, done)
 
     def select_layer(self, lid):
@@ -1767,16 +1771,15 @@ class Card(QWidget):
             self.leave_layer(lambda: self.place_layer_tool(lid))
             return
         if self._tool == "transform":
+            if self._place_id is not None:
+                self._commit_layer_pts()
+            self._place_id = None
+            self._hide_layer = None
             self._go_move()
         PH, PW = self.prev.shape[:2]
         n = l["n"]
         pts = [(x * PW, y * PH) for x, y in l["grid"]]
-        rgba = core.layer_rgba(l, pend=False)
-        f = min(1.0, 700.0 / max(rgba.size))
-        if f < 1.0:
-            rgba = rgba.resize((max(1, int(rgba.width * f)), max(1, int(rgba.height * f))), Image.Resampling.LANCZOS)
-        arr = np.asarray(rgba)
-        qimg = QImage(arr.data, arr.shape[1], arr.shape[0], arr.shape[1] * 4, QImage.Format.Format_RGBA8888).copy()
+        qimg = self._layer_qimage(l)
         self.sel_layer = lid
         self._hide_layer = lid
         self._timer.start()
@@ -1786,20 +1789,78 @@ class Card(QWidget):
         self.tfBtns["warp" if n == 3 else "free"].setChecked(True)
         self._refresh_layers_ui()
 
-    def _apply_layer_place(self):
+    def _commit_layer_pts(self):
+        """The picture was moved / resized / rotated with the mouse: it is kept at once (one undo step)."""
         lid, p = self._place_id, self.canvas.transform_params()
         if lid is None or p is None or self._layer(lid) is None:
             return
         pts, n = p
         PH, PW = self.prev.shape[:2]
+        grid = [(x / PW, y / PH) for x, y in pts]
+        l = self._layer(lid)
+        if l["n"] == n and all(abs(a[0] - b[0]) + abs(a[1] - b[1]) < 1e-6 for a, b in zip(grid, l["grid"])):
+            return
         self._checkpoint()
-        self._replace_layer(lid, grid=[(x / PW, y / PH) for x, y in pts], n=n)
+        self._replace_layer(lid, grid=grid, n=n)
         self.ops += 1
+        self._touch()
+
+    def _end_layer_session(self):
+        self._commit_layer_pts()
         self._place_id = None
         self._hide_layer = None
         self._go_move()
-        self._touch()
         self._timer.start()
+
+    def _layer_at(self, x, y, skip=None):
+        """The picture layer on top at this preview position (or None)."""
+        PH, PW = self.prev.shape[:2]
+        for l in reversed(self.layers):
+            if not l.get("visible", True) or l["id"] == skip:
+                continue
+            g, n = l["grid"], l["n"]
+            quad = [g[0], g[n], g[-1], g[n * (n + 1)]]
+            inside = False
+            j = len(quad) - 1
+            for i in range(len(quad)):
+                xi, yi = quad[i][0] * PW, quad[i][1] * PH
+                xj, yj = quad[j][0] * PW, quad[j][1] * PH
+                if (yi > y) != (yj > y) and x < (xj - xi) * (y - yi) / ((yj - yi) or 1e-9) + xi:
+                    inside = not inside
+                j = i
+            if inside:
+                return l["id"]
+        return None
+
+    def _on_view_click(self, x, y):
+        if self.ctx is not None or not self.layers or self._tool != "view":
+            return
+        lid = self._layer_at(x, y)
+        if lid is not None:
+            self.place_layer_tool(lid)
+
+    def _on_layer_outside(self, x, y):
+        lid = self._layer_at(x, y, skip=self._place_id)
+        if lid is not None:
+            self.place_layer_tool(lid)                 # another picture: select that one
+        else:
+            self._end_layer_session()                  # empty place: the picture is deselected
+
+    def _layer_qimage(self, l):
+        rgba = core.layer_rgba(l, pend=False)
+        f = min(1.0, 900.0 / max(rgba.size))
+        if f < 1.0:
+            rgba = rgba.resize((max(1, int(rgba.width * f)), max(1, int(rgba.height * f))), Image.Resampling.LANCZOS)
+        arr = np.ascontiguousarray(np.asarray(rgba))
+        return QImage(arr.data, arr.shape[1], arr.shape[0], arr.shape[1] * 4, QImage.Format.Format_RGBA8888).copy()
+
+    def rotate_key(self, deg_ccw):
+        """R: the selected picture turns 90° (right), with nothing selected the whole page does."""
+        if self._tool == "transform" and self._place_id is not None:
+            self.canvas.tf_rotate(-deg_ccw)
+            self._commit_layer_pts()
+        else:
+            self.rotate(deg_ccw)
 
     def edit_layer(self, lid):
         """Work on ONE picture alone: Adjust / Shadow / Text / Select / Erase / Crop then change only this picture."""
@@ -1887,6 +1948,8 @@ class Card(QWidget):
             self._replace_layer(lid, opacity=int(self.bgRows["opacity"].sl.value()))
             self._timer.start()
             self._touch()
+            if self._place_id == lid:
+                self.canvas.set_tf_image(self._layer_qimage(self._layer(lid)))
             return
         self._bg_timer.start()
 
@@ -1916,6 +1979,8 @@ class Card(QWidget):
                 self._replace_layer(lid, rgb=cut.convert("RGB"), a=cut.split()[3], bg=bg)
                 self._touch()
                 self._timer.start()
+                if self._place_id == lid:
+                    self.canvas.set_tf_image(self._layer_qimage(self._layer(lid)))
             if self._bg_again:
                 self._bg_again = False
                 self._bg_timer.start()
@@ -1933,42 +1998,43 @@ class Card(QWidget):
             if it.widget() is not None:
                 it.widget().deleteLater()
         for l in reversed(self.layers):                  # top layer first
-            row = QWidget()
-            h = QHBoxLayout(row)
-            h.setContentsMargins(0, 0, 0, 0)
-            h.setSpacing(4)
+            row = QFrame()
+            row.setObjectName("layerRow")
+            v = QVBoxLayout(row)
+            v.setContentsMargins(0, 0, 0, 2)
+            v.setSpacing(3)
+            h1 = QHBoxLayout()
+            h1.setSpacing(6)
             eye = QCheckBox()
             eye.setChecked(l.get("visible", True))
             eye.setToolTip("Show / hide this picture")
             eye.toggled.connect(lambda on, i=l["id"]: self.toggle_layer(i, on))
-            name = QPushButton(l["name"])
+            nm = l["name"] if len(l["name"]) <= 24 else l["name"][:21] + "..."
+            name = QPushButton(nm)
             name.setCheckable(True)
             name.setChecked(self.sel_layer == l["id"])
-            name.setToolTip("Select this picture")
-            name.clicked.connect(lambda _=False, i=l["id"]: self.select_layer(i))
-            mv = QPushButton("Move")
-            mv.setToolTip("Move / resize / rotate / bend this picture on the page (Ctrl+T)")
-            mv.clicked.connect(lambda _=False, i=l["id"]: self.place_layer_tool(i))
+            name.setToolTip(l["name"] + "\nClick = select this picture (a click on it on the page works too)")
+            name.setMinimumWidth(0)
+            name.clicked.connect(lambda _=False, i=l["id"]: self.place_layer_tool(i))
+            h1.addWidget(eye)
+            h1.addWidget(name, 1)
+            h2 = QHBoxLayout()
+            h2.setSpacing(4)
             ed = QPushButton("Edit")
-            ed.setToolTip("Work on this picture alone: Adjust, Shadow, Text, Select, Erase, Crop")
+            ed.setToolTip("Work on this picture alone: Adjust, Shadow, Text, Select, Erase, Crop  (double click on it works too)")
             ed.setProperty("accent", self.ctx == l["id"])
             ed.clicked.connect(lambda _=False, i=l["id"]: self.edit_layer(i))
-            up = QPushButton("↑")
-            up.setFixedWidth(26)
-            up.setToolTip("Bring forward")
-            up.clicked.connect(lambda _=False, i=l["id"]: self.move_layer_order(i, 1))
-            dn = QPushButton("↓")
-            dn.setFixedWidth(26)
-            dn.setToolTip("Send backward")
-            dn.clicked.connect(lambda _=False, i=l["id"]: self.move_layer_order(i, -1))
-            rm = QPushButton("✕")
-            rm.setFixedWidth(26)
-            rm.setToolTip("Remove this picture")
-            rm.clicked.connect(lambda _=False, i=l["id"]: self.delete_layer(i))
-            h.addWidget(eye)
-            h.addWidget(name, 1)
-            for w in (mv, ed, up, dn, rm):
-                h.addWidget(w)
+            h2.addWidget(ed, 1)
+            for text, tip, fn in (("↑", "Bring forward", lambda i=l["id"]: self.move_layer_order(i, 1)),
+                                  ("↓", "Send backward", lambda i=l["id"]: self.move_layer_order(i, -1)),
+                                  ("✕", "Remove this picture  (Delete key)", lambda i=l["id"]: self.delete_layer(i))):
+                b_ = QPushButton(text)
+                b_.setFixedWidth(30)
+                b_.setToolTip(tip)
+                b_.clicked.connect(lambda _=False, f=fn: f())
+                h2.addWidget(b_)
+            v.addLayout(h1)
+            v.addLayout(h2)
             self.layerBox.addWidget(row)
         if not self.layers:
             self.lblLayerHint.setText("No pictures yet. Add a signature or a stamp: its background is removed and you can "
@@ -1976,8 +2042,9 @@ class Card(QWidget):
         elif self.ctx is not None:
             self.lblLayerHint.setText("Editing one picture alone. Everything you do now changes only this picture.")
         else:
-            self.lblLayerHint.setText("Move = place it.  Edit = work on this picture alone (Adjust, Shadow, Text, "
-                                      "Select, Erase, Crop).  Select a picture to change its background below.")
+            self.lblLayerHint.setText("Click a picture on the page to select it: drag = move, handles = resize / rotate / bend, "
+                                      "R = turn 90°, Delete = remove, click outside = done.  Edit = work on it alone "
+                                      "(Adjust, Shadow, Text, Select, Erase, Crop).")
         self.btnLayerDone.setVisible(self.ctx is not None)
         self.bgGroup.setEnabled(self.ctx is None and self.sel_layer is not None and self._layer(self.sel_layer) is not None)
         l = None if self.sel_layer is None else self._layer(self.sel_layer)
@@ -2458,7 +2525,7 @@ class Card(QWidget):
         if self._tool in CROP_KEYS:
             self._apply_crop()
         elif self._tool == "transform" and self._place_id is not None:
-            self._apply_layer_place()
+            self._end_layer_session()
         elif self._tool == "transform":
             self._apply_transform()
 
