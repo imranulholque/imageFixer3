@@ -285,6 +285,16 @@ class ImageCanvas(QWidget):
         self.setFocus()
         self.update()
 
+    def start_layer_transform(self, img, pts, n):
+        """Move / resize / rotate / bend a picture layer: img = QImage (RGBA), pts = its net in preview pixels."""
+        self._tf = {"img": img, "w": float(img.width()), "h": float(img.height()), "n": n,
+                    "mode": "warp" if n == 3 else "free", "pts": [QPointF(x, y) for x, y in pts]}
+        self._tf_drag = None
+        self.mode = self.TRANSFORM
+        self._update_cursor()
+        self.setFocus()
+        self.update()
+
     def selection_pixels(self):
         """(QImage RGBA of the selected pixels, x0, y0) in preview pixels, or None."""
         m = self._masks["sel"]
