@@ -84,3 +84,4 @@ NEW (round 4)
   gray / black / white never change, strong colors do not burn out. New Vibrance slider (weak colors change more than strong ones).
 - Shadow: manual sliders work without the one-click button; the one-click got 4 more options. Existing settings are unchanged.
 - Placed pictures (signature, stamp ...) can be cropped to a circle, oval, rounded box, a box or any selected shape.
+- Compare button (top right of a picture, only shown after you changed it): original and edited together, with a slider or side by side. Wheel = zoom, drag = move.

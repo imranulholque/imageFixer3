@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QColorDial
 
 import core
 from canvas import ImageCanvas, np_to_qimage
+from compare import CompareDialog
 from flow import ElidedLabel, FlowLayout
 from jobs import _log, run_background
 
@@ -585,6 +586,7 @@ class Card(QWidget):
         self._loaded = False
         self._failed = False
         self._loading = False
+        self._orig_q = None                        # the original picture (QImage) for the comparison, made once
         self._dead = False                         # removed from the window: late results of background work are dropped
         self._tool = "view"
         self._ver = 0
@@ -747,13 +749,16 @@ class Card(QWidget):
         self.btnRedo.setToolTip("Redo one step (Ctrl+Y or Ctrl+Shift+Z)")
         self.btnReset = QPushButton("Reset")
         self.btnReset.setToolTip("Back to the original picture")
+        self.btnCompare = QPushButton("Compare")
+        self.btnCompare.setToolTip("See the original and the edited picture together (slider or side by side)")
+        self.btnCompare.hide()                      # only a picture that was changed has something to compare
         self.btnRemove = QPushButton("Remove")
         self.btnRemove.setProperty("danger", True)
         r1.addWidget(self.lblName)
         r1.addWidget(self.lblInfo)
         r1.addWidget(self.lblState)
         r1.addStretch(1)
-        for b in (self.btnUndo, self.btnRedo, self.btnReset, self.btnRemove):
+        for b in (self.btnCompare, self.btnUndo, self.btnRedo, self.btnReset, self.btnRemove):
             r1.addWidget(b)
         root.addLayout(r1)
 
@@ -974,6 +979,7 @@ class Card(QWidget):
         self.btnUndo.clicked.connect(self.undo_step)
         self.btnRedo.clicked.connect(self.redo_step)
         self.btnReset.clicked.connect(self.reset_image)
+        self.btnCompare.clicked.connect(self.compare)
         self.btnRemove.clicked.connect(lambda: self.removeRequested.emit(self))
         self.btnSelVis.toggled.connect(self._toggle_sel_vis)
         self.colors.changed.connect(self._on_adj_changed)
@@ -1312,6 +1318,7 @@ class Card(QWidget):
         self.btnUndo.setEnabled(bool(self.undo))
         self.btnRedo.setEnabled(bool(self.redo))
         self.btnReset.setEnabled(self._loaded and self.is_edited())
+        self.btnCompare.setVisible(self._loaded and self.is_edited())
         if self.is_edited():
             self.lblState.setText("edited" if self.is_unsaved() else "saved")
         else:
@@ -1354,6 +1361,30 @@ class Card(QWidget):
             return
         self.runner.run(label, work, done, failed)
 
+    def compare(self):
+        """Original vs edited in one window.  The original is read in the background (once)."""
+        if not self._loaded or not self.is_edited() or self.canvas._img is None:
+            return
+        edited = self.canvas._img.copy()
+
+        def show(orig):
+            if not self._dead:
+                CompareDialog(orig, edited, self.name, self.window()).exec()
+        if self._orig_q is not None:
+            show(self._orig_q)
+            return
+        path = self.path
+
+        def work(progress):
+            progress(0.2, "reading the original")
+            prev, _sc = core.make_preview(core.load_image(path))
+            return np_to_qimage(prev)
+
+        def done(q):
+            self._orig_q = q
+            QTimer.singleShot(0, lambda: show(q))          # open the window after the job is finished
+        self._job("Preparing the comparison", work, done)
+
     def dispose(self):
         """The picture is being removed: stop timers, ignore everything that is still being computed for it."""
         self._dead = True
@@ -1361,7 +1392,7 @@ class Card(QWidget):
             tm = getattr(self, t, None)
             if tm is not None:
                 tm.stop()
-        self.base = self.prev = self._lab = None
+        self.base = self.prev = self._lab = self._orig_q = None
         self.undo = []
         self.redo = []
         self._cache = {}
