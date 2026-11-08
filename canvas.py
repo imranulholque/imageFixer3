@@ -72,6 +72,8 @@ class ImageCanvas(QWidget):
         self._mver = {"sel": 0, "hl": 0}
         self._edge_cache = {}
         self.sel_visible = True
+        self.sel_preview = False              # Color range preview: the selection shown as a white (selected) / black picture
+        self._pv = None                       # (mask version, QImage) cache of that preview
         self.select_shape = "quick"
         self.copy_mode = False
         self.quick_prev = 20.0                # quick-select brush size in preview pixels
@@ -136,6 +138,23 @@ class ImageCanvas(QWidget):
         self._mver["hl"] += 1
         self._sync_ants()
         self.update()
+
+    def set_sel_preview(self, on):
+        self.sel_preview = bool(on)
+        self.update()
+
+    def _preview_image(self):
+        """The selection as a grey picture: white = selected, black = not, grey = partly.  None if there is no selection."""
+        m = self._masks["sel"]
+        if m is None or m.shape[0] != self._ih or m.shape[1] != self._iw:
+            return None
+        key = (self._mver["sel"], self._iw, self._ih)
+        if self._pv is None or self._pv[0] != key:
+            g = np.ascontiguousarray(np.clip(m * 255.0 + 0.5, 0, 255).astype(np.uint8))
+            q = QImage(g.data, g.shape[1], g.shape[0], g.shape[1], QImage.Format.Format_Grayscale8).convertToFormat(
+                QImage.Format.Format_RGB32)
+            self._pv = (key, q)
+        return self._pv[1]
 
     def selection_mask(self):
         return self._masks["sel"]
@@ -719,9 +738,16 @@ class ImageCanvas(QWidget):
             p.scale(self.zoom, self.zoom)
             p.drawImage(0, 0, self._img)
             p.restore()
+        pv = self._preview_image() if (self.sel_preview and self.mode == self.SELECT) else None
+        if pv is not None:                                  # Color range preview: white = selected, black = not
+            p.save()
+            p.translate(self.off)
+            p.scale(self.zoom, self.zoom)
+            p.drawImage(0, 0, pv)
+            p.restore()
         if self._float is not None:
             self._paint_float(p)
-        if self.sel_visible and self.mode not in (self.CROP, self.PERSP, self.TRANSFORM):
+        if pv is None and self.sel_visible and self.mode not in (self.CROP, self.PERSP, self.TRANSFORM):
             self._paint_ants(p, "sel", (0, 0, 0, 255), (255, 255, 255, 255))
             self._paint_ants(p, "hl", (20, 30, 120, 255), (160, 190, 255, 255))
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)

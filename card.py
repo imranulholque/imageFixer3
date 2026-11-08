@@ -962,6 +962,9 @@ class Card(QWidget):
         self.localSlider.setFixedWidth(90)
         self.localSlider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.localSlider.setToolTip("How far around the click (percent of the picture)")
+        self.chkPrev = QCheckBox("Preview")
+        self.chkPrev.setToolTip("Show the selection as black and white (white = selected, grey = partly, black = not selected),\n"
+                                "like the preview in Photoshop's Color Range. Move Fuzziness to see what changes.")
         self.chkSnap = QCheckBox("Snap to edges")
         self.chkSnap.setChecked(True)
         self.chkSnap.setToolTip("Deselect brush: take out only what looks like what you paint over (exact edges).\nOff = a plain eraser for the selection.")
@@ -971,6 +974,8 @@ class Card(QWidget):
         tb.addWidget(self.chkLocal)
         tb.addWidget(self.localSlider)
         tb.addWidget(self.chkSnap)
+        tb.addWidget(self.chkPrev)
+        self.chkPrev.toggled.connect(lambda _on: self._sync_preview())
         self.tolSlider.valueChanged.connect(self._tol_changed)
         self.chkLocal.toggled.connect(lambda _on: self._recompute_color_range())
         self.localSlider.valueChanged.connect(lambda _v: self._recompute_color_range())
@@ -1485,6 +1490,12 @@ class Card(QWidget):
         self.chkLocal.setVisible(color)
         self.localSlider.setVisible(color and self.chkLocal.isChecked())
         self.chkSnap.setVisible(key == "deselect")
+        self.chkPrev.setVisible(color)
+        self._sync_preview()
+
+    def _sync_preview(self):
+        """The black / white preview only exists for the Color range tool."""
+        self.canvas.set_sel_preview(self._tool == "color" and self.chkPrev.isChecked())
 
     def _tol_changed(self, v):
         self.lblTolV.setText(str(v))

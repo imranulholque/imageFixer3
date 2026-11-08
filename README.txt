@@ -6,6 +6,7 @@ Clean many text pictures (WhatsApp photos, scans) and print them. One big card p
                 Intersect, All / None / Inverse, Grow / Shrink. Shift = add, Alt = subtract.
  - EVERYTHING acts only inside the selection (brightness, contrast, saturation, hue, warmth, color change, shadow removal,
    sharpness, erase). No selection = whole picture. Example: Color range on the red part, Hue +120 -> red becomes green.
+ - Color range 'Preview' tick: shows the selection as black and white (white = selected, grey = partly, black = not), like Photoshop; move Fuzziness to see what changes.
  - Delete key:  deletes the selection (filled from the paper around it).   Fill color (Adjust tab) fills it with a color.
  - Move v:      drag = move, Alt + drag = copy, Ctrl+T = Transform (resize / rotate, Enter = apply).
  - Color Brush (P): paints with the fill color (swatch in the options bar / Adjust tab). Select something first = the color goes ONLY
