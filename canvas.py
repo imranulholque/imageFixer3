@@ -15,6 +15,16 @@ def QApplication_shift():
     return bool(QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier)
 
 
+def snap_straight(dx, dy):
+    """Shift while dragging: the movement goes dead straight - sideways, up / down or exactly diagonal (whichever is closest)."""
+    if not dx and not dy:
+        return dx, dy
+    a = round(math.atan2(dy, dx) / (math.pi / 4)) * (math.pi / 4)
+    ux, uy = math.cos(a), math.sin(a)
+    t = dx * ux + dy * uy
+    return t * ux, t * uy
+
+
 def np_to_qimage(arr):
     """uint8 (h, w, 3) -> QImage in the format the painter draws fastest (RGB32).  Safe to call in a worker thread."""
     arr = np.ascontiguousarray(arr)
@@ -573,6 +583,8 @@ class ImageCanvas(QWidget):
         dx, dy = ip.x() - d[2].x(), ip.y() - d[2].y()
         n = t["n"]
         if d[0] == "move":
+            if QApplication_shift():                         # Shift: the object moves dead straight
+                dx, dy = snap_straight(dx, dy)
             t["pts"] = [QPointF(q.x() + dx, q.y() + dy) for q in st]
         elif d[0] == "rotate":
             a = math.radians(math.degrees(math.atan2(ip.y() - c0.y(), ip.x() - c0.x())) - d[3])
@@ -1191,7 +1203,10 @@ class ImageCanvas(QWidget):
         if self._float_start is not None:
             ip = self.to_img(pos)
             a = self._float_start[0]
-            self._float_d = (int(round(ip.x() - a.x())), int(round(ip.y() - a.y())))
+            dx, dy = ip.x() - a.x(), ip.y() - a.y()
+            if QApplication_shift():                       # Shift: dead straight (moving and copying)
+                dx, dy = snap_straight(dx, dy)
+            self._float_d = (int(round(dx)), int(round(dy)))
             self.update()
             return
         if self._erase is not None:
