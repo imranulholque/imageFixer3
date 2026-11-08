@@ -452,9 +452,51 @@ class MainWindow(QMainWindow):
         self.btnClear.clicked.connect(self.clear_all)
         self.btnSettings = QPushButton("Settings")
         self.btnSettings.setMenu(self._build_menu())
-        for b in (self.btnFolder, self.btnOpenDir, self.btnClear, self.btnSettings):
+        for b in (self.btnFolder, self.btnOpenDir, self.btnClear):
             l.addWidget(b)
+        l.addWidget(self._build_save_group())
+        l.addWidget(self.btnSettings)
         return h
+
+    def _build_save_group(self):
+        """Save (this picture) + a small arrow with the other ways to save / share. Sits left of Settings."""
+        box = QWidget()
+        bl = QHBoxLayout(box)
+        bl.setContentsMargins(0, 0, 0, 0)
+        bl.setSpacing(2)
+        self.btnSave = QPushButton("Save")
+        self.btnSave.setProperty("accent", True)
+        self.btnSave.setToolTip("Replaces the original file with the edited picture (Ctrl+S).\n"
+                                "A picture from the phone / clipboard goes to the save folder.")
+        self.btnSave.clicked.connect(lambda: self._with_loaded(self.save_card))
+        self.btnSaveMore = QPushButton("\u25be")
+        self.btnSaveMore.setFixedWidth(30)
+        self.btnSaveMore.setToolTip("Save as..., save all, PDF, print, copy")
+        m = QMenu(self)
+
+        def act(text, fn, key=None):
+            a = QAction(text, self)
+            if key:
+                a.setShortcutVisibleInContextMenu(True)
+            a.triggered.connect(lambda _=False: fn())
+            m.addAction(a)
+            return a
+        self.actSaveAs = act("Save as...  (JPG, PNG, PDF)", lambda: self._with_loaded(self.save_card_as))
+        self.actSaveAll = act("Save all edited...", self.save_all)
+        self.actPdfAll = act("All pages as one PDF", self.save_all_pdf)
+        self.actPrint = act("Print...   Ctrl+P", lambda: self._with_loaded(lambda c: self.print_cards([c])))
+        m.addSeparator()
+        self.actApplyAll = act("Apply last setting to all pictures", lambda: self._with_loaded(self.apply_to_all))
+        self.actCopy = act("Copy picture   Ctrl+C", lambda: self._with_loaded(lambda c: c.copy_image()))
+        self.btnSaveMore.setMenu(m)
+        bl.addWidget(self.btnSave)
+        bl.addWidget(self.btnSaveMore)
+        return box
+
+    def _with_loaded(self, fn):
+        c = self.carousel.current()
+        if c is not None and getattr(c, "_loaded", True) and not self.runner.busy:
+            fn(c)
 
     def _build_menu(self):
         m = QMenu(self)
@@ -1071,6 +1113,12 @@ class MainWindow(QMainWindow):
         label = "Save all edited (%d)" % unsaved if unsaved else "Save all edited"
         self.btnSaveAll.setText(label)
         self.btnSaveAll.setEnabled(unsaved > 0)
+        if hasattr(self, "actSaveAll"):                       # the Save v menu in the top bar
+            self.actSaveAll.setText("Save all edited (%d)..." % unsaved if unsaved else "Save all edited...")
+            self.actSaveAll.setEnabled(unsaved > 0)
+            self.actPdfAll.setEnabled(n > 0)
+            for w in (self.btnSave, self.btnSaveMore):
+                w.setEnabled(n > 0)
         for c in (self.carousel.cards if n else []):
             c.btnSaveAll.setText(label)
             c.btnSaveAll.setEnabled(unsaved > 0)

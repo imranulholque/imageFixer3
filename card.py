@@ -1,6 +1,6 @@
 """One picture = one card.
 Top: dropdown tool menus (Select / Move / Erase / Crop) + eyedropper.   Middle: the picture.
-Right: tabs  Adjust | Color | Shadow | Text | Picture | Save.   Every change acts ONLY inside the selection (if there is one)."""
+Right: tabs  Adjust | Color | Shadow | Text | Picture  (Save is in the top bar).   Every change acts ONLY inside the selection (if there is one)."""
 import copy
 import math
 import os
@@ -544,7 +544,7 @@ def side_sync():
 
 
 class Card(QWidget):
-    TAB_ADJUST, TAB_COLOR, TAB_SHADOW, TAB_TEXT, TAB_PICTURE, TAB_SAVE = range(6)   # order of the side tabs
+    TAB_ADJUST, TAB_COLOR, TAB_SHADOW, TAB_TEXT, TAB_PICTURE = range(5)   # order of the side tabs
     SIDE_W = 350                                                                     # width of the side panel (shared, drag to change)
     editedChanged = Signal(object)
     removeRequested = Signal(object)
@@ -1171,7 +1171,7 @@ class Card(QWidget):
         self.tabGroup = QButtonGroup(self)
         self.tabGroup.setExclusive(True)
         self.stackPages = QStackedWidget()
-        names = ("Adjust", "Color", "Shadow", "Text", "Picture", "Save")
+        names = ("Adjust", "Color", "Shadow", "Text", "Picture")
         for i, n in enumerate(names):
             b = QPushButton(n)
             b.setCheckable(True)
@@ -1485,9 +1485,8 @@ class Card(QWidget):
         lay.addStretch(1)
         self.stackPages.addWidget(pg)
 
-        # ---------------- Save
-        pg, lay = self._page()
-        g, gl = self._group_box("Save")
+        # ---------------- Save / share: no tab any more - the window's top bar (Save v) calls the same actions.
+        # These buttons are kept (not shown) so the existing enable / disable and signals keep working.
         self.btnSave = QPushButton("Save")
         self.btnSave.setProperty("accent", True)
         self.btnSave.setMinimumHeight(38)
@@ -1500,22 +1499,12 @@ class Card(QWidget):
         self.btnPrint.clicked.connect(lambda: self.printRequested.emit(self))
         self.btnPdfAll = QPushButton("All pages as one PDF")
         self.btnPdfAll.setToolTip("One PDF with every open picture, one page each, in the order of the thumbnails")
-        for w in (self.btnSave, self.btnSaveAs, self.btnSaveAll, self.btnPdfAll, self.btnPrint):
-            gl.addWidget(w)
-        lay.addWidget(g)
-        g, gl = self._group_box("Share", collapsed=True)
         self.btnApplyAll = QPushButton("Apply last setting to all pictures")
         self.btnApplyAll.setToolTip("Copies ONLY the setting you changed last (one slider, the shadow removal, or the picked colors) "
                                    "to the other pictures. Crop, erase, move ... are never copied.")
         self.btnCopy = QPushButton("Copy picture  (Ctrl+C)")
         self.btnCopy.setToolTip("Copy this picture (with your edits) - then paste it anywhere")
         self.btnDrag = DragHandle(self)
-        for w in (self.btnApplyAll, self.btnCopy, self.btnDrag):
-            gl.addWidget(w)
-        lay.addWidget(g)
-        lay.addStretch(1)
-        self.stackPages.addWidget(pg)
-
         v.addWidget(self.stackPages, 1)
         self.tabGroup.idClicked.connect(self.stackPages.setCurrentIndex)
         self.btnShadow.clicked.connect(self._auto_shadow)
