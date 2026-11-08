@@ -54,9 +54,9 @@ HINTS = {
     "brush": "Paint the area to select.  Shift = add,  Alt = subtract.",
     "deselect": "Paint over a part that was selected by mistake: it is taken out of the selection, but only what looks like "
                 "what you paint over - the edge stays exact.  (Tolerance = how alike.  'Snap' off = plain eraser.)",
-    "rect": "Drag a box.  Shift = add,  Alt = subtract.",
-    "ellipse": "Drag an ellipse.  Shift = add,  Alt = subtract.",
-    "lasso": "Draw freely around an area like with a pen. When you let go it closes by itself.  Shift = add,  Alt = subtract.",
+    "rect": "Drag a box.  Shift = add,  Alt = subtract.  Drag INSIDE the selection = move only the outline.",
+    "ellipse": "Drag an ellipse.  Shift = add,  Alt = subtract.  Drag INSIDE the selection = move only the outline.",
+    "lasso": "Draw freely around an area like with a pen. When you let go it closes by itself.  Shift = add,  Alt = subtract.  Drag INSIDE the selection = move only the outline.",
     "color": "Click a color: every place with that color is selected.  Fuzziness = how wide (move it after the click, it updates).  "
              "Shift+click = add a color,  Alt+click = take a color out.  The clicked color also becomes the fill color.",
     "move": "Drag inside the selection to move it (old place is filled from around).  Alt + drag = copy.",
@@ -1089,7 +1089,7 @@ class Card(QWidget):
         self.opSlider.valueChanged.connect(self._sync_paint)
         self.softSlider.valueChanged.connect(self._sync_paint)
         self.brushSwatch.clicked.connect(self._pick_fill)
-        self.modeGroup.idClicked.connect(lambda i: setattr(self, "sel_mode", ("new", "add", "sub", "int")[i]))
+        self.modeGroup.idClicked.connect(lambda i: self._set_sel_mode(("new", "add", "sub", "int")[i]))
         self.btnSelAll.clicked.connect(self.select_all)
         self.btnDeselect.clicked.connect(self.deselect)
         self.btnInvert.clicked.connect(self.invert_selection)
@@ -1106,6 +1106,8 @@ class Card(QWidget):
         self.canvas.paintFinished.connect(self._on_paint)
         self.canvas.sourcePicked.connect(self._on_source)
         self.canvas.selectFinished.connect(self._on_select)
+        self.canvas.selectionMoved.connect(self._move_selection)
+        self.canvas.sel_mode_name = self.sel_mode
         self.canvas.moveFinished.connect(self._on_move)
         self.canvas.viewClicked.connect(self._on_view_click)
         self.canvas.tfCommitted.connect(self._commit_layer_pts)
@@ -2858,6 +2860,23 @@ class Card(QWidget):
         self._touch()
 
     # ------------------------------------------------------------ selection
+    def _set_sel_mode(self, mode):
+        self.sel_mode = mode
+        self.canvas.sel_mode_name = mode
+
+    def _move_selection(self, dx, dy):
+        """The selection outline was dragged with Box / Ellipse / Freehand: only the outline moves, not the picture."""
+        if not self._loaded or self.sel is None:
+            return
+        if self._bake(lambda: self._move_selection(dx, dy)):          # settings made in the old place stay there
+            return
+        moved = core.shift_mask(self.sel, int(dx), int(dy))
+        if float(moved.max()) <= 0.01:                    # pushed completely out of the picture: nothing is selected
+            moved = None
+        self._checkpoint()
+        self.sel = moved
+        self._sel_changed()
+
     def _sel_changed(self):
         self._sel_ver += 1
         self.canvas.set_selection(self.sel)

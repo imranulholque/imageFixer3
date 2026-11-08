@@ -63,6 +63,29 @@ def dropper_cursor():
     return QCursor(pm, 4, 28)
 
 
+def move_selection_cursor():
+    """Photoshop's 'move the selection outline': an arrow with a small dotted box (hot spot = the arrow tip)."""
+    pm = QPixmap(32, 32)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    arrow = QPolygonF([QPointF(2, 2), QPointF(2, 20), QPointF(7, 15.5), QPointF(11, 24), QPointF(14.5, 22.5),
+                       QPointF(10.5, 14.5), QPointF(17, 14)])
+    p.setPen(QPen(QColor("#000000"), 1.6))
+    p.setBrush(QBrush(QColor("#ffffff")))
+    p.drawPolygon(arrow)
+    box = QRectF(17.5, 19.5, 11, 8)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.setPen(QPen(QColor("#ffffff"), 3.2))
+    p.drawRect(box)
+    pen = QPen(QColor("#000000"), 1.4)
+    pen.setStyle(Qt.PenStyle.DashLine)
+    p.setPen(pen)
+    p.drawRect(box)
+    p.end()
+    return QCursor(pm, 2, 2)
+
+
 QSS = """
 * { font-family: "Segoe UI"; font-size: 13px; color: #e8eaed; }
 QMainWindow, QDialog, QMessageBox { background: #0e1116; }

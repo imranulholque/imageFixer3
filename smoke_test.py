@@ -474,5 +474,28 @@ def t_bake_global_before_select():
     assert out[:, -20:].mean() >= out[:, :20].mean() - 3, "the area outside the selection must keep the change"
 step("settings made before a selection stay on the whole picture", t_bake_global_before_select)
 
+
+def t_move_selection_outline():
+    from PySide6.QtCore import QPointF, Qt as _Qt
+    cc = cardmod.Card(p); cc.message.connect(lambda t: None); cc.ensure_loaded()
+    H, W = cc.prev.shape[:2]
+    m = np.zeros((H, W), np.float32); m[10:40, 20:60] = 1
+    cc._set_selection(m, "new")
+    before = np.asarray(cc.base).copy()
+    cc.canvas.set_mode(cc.canvas.SELECT, "rect")
+    cc.canvas.sel_mode_name = "new"
+    NM = _Qt.KeyboardModifier.NoModifier
+    assert cc.canvas._can_move_selection(NM, QPointF(30, 20)), "inside the selection the outline can be dragged"
+    assert not cc.canvas._can_move_selection(NM, QPointF(W - 5, H - 5)), "outside it a new shape is drawn"
+    assert not cc.canvas._can_move_selection(_Qt.KeyboardModifier.ShiftModifier, QPointF(30, 20)), "Shift = a new shape is added"
+    cc._move_selection(15, 7)
+    ys, xs = np.nonzero(cc.sel)
+    assert ys.min() == 17 and xs.min() == 35, (ys.min(), xs.min())
+    assert (np.asarray(cc.base) == before).all(), "only the outline moves, never the picture"
+    cc.undo_step()
+    ys, xs = np.nonzero(cc.sel)
+    assert ys.min() == 10 and xs.min() == 20, "Undo puts the outline back"
+step("dragging inside a selection moves only the outline", t_move_selection_outline)
+
 print("\nFAILED:" if steps else "\nALL OK", steps, flush=True)
 sys.exit(1 if steps else 0)

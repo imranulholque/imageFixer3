@@ -8,7 +8,7 @@ from PySide6.QtGui import QBrush, QColor, QImage, QPainter, QPainterPath, QPen, 
 from PySide6.QtWidgets import QApplication, QWidget
 
 import core
-from theme import dropper_cursor
+from theme import dropper_cursor, move_selection_cursor
 
 
 def QApplication_shift():
@@ -41,6 +41,7 @@ class ImageCanvas(QWidget):
     sourcePicked = Signal(float, float)   # Alt + click: spot to copy from (clone)
     selectFinished = Signal(str, object, str)   # ('quick'|'rect'|'lasso'|'color', data, ''|'add'|'sub') preview pixels
     tfCopyChanged = Signal(bool)                 # Alt + drag inside Transform: True = a copy will be placed
+    selectionMoved = Signal(int, int)           # the selection outline was dragged (dx, dy in preview pixels); the picture stays
     moveFinished = Signal(int, int, bool)       # dx, dy (preview pixels), True = copy (original stays)
     viewClicked = Signal(float, float)          # a plain click with the hand tool (select a picture layer there)
     tfCommitted = Signal()                      # a picture layer was moved / resized / rotated (mouse released)
@@ -102,6 +103,9 @@ class ImageCanvas(QWidget):
         self._scale_timer.setSingleShot(True)
         self._scale_timer.setInterval(60)
         self._scale_timer.timeout.connect(self._make_scaled)
+        self._selmove = None                  # dragging the selection outline: {'start': QPointF, 'd': (dx, dy)}
+        self.sel_mode_name = "add"            # set by the card: the outline can be dragged in the modes 'new' and 'add'
+        self._move_sel_cursor = move_selection_cursor()
         self._ants_timer = QTimer(self)
         self._ants_timer.setInterval(200)
         self._ants_timer.timeout.connect(self._tick)
@@ -229,6 +233,21 @@ class ImageCanvas(QWidget):
         self._edge_cache[name] = (key, ys, xs)
         return ys, xs
 
+    def _inside_selection(self, ip):
+        m = self._masks.get("sel")
+        if m is None:
+            return False
+        x, y = int(ip.x()), int(ip.y())
+        return 0 <= y < m.shape[0] and 0 <= x < m.shape[1] and float(m[y, x]) > 0.5
+
+    def _can_move_selection(self, mods, ip):
+        """Photoshop: with a marquee / lasso tool, a press INSIDE the selection drags the outline (not the picture).
+        Shift / Alt still start a new shape that is added / subtracted."""
+        return (self.mode == self.SELECT and self.select_shape in ("rect", "ellipse", "lasso")
+                and self.sel_mode_name in ("new", "add")
+                and not (mods & (Qt.KeyboardModifier.ShiftModifier | Qt.KeyboardModifier.AltModifier))
+                and self._inside_selection(ip))
+
     def _paint_ants(self, p, name, dark, light):
         if self._masks[name] is None:
             return
@@ -240,6 +259,9 @@ class ImageCanvas(QWidget):
         on = ((xs + ys + self._phase) // 4) % 2 == 0
         buf[ys - y0, xs - x0] = np.where(on[:, None], np.array(dark, np.uint8), np.array(light, np.uint8))
         img = QImage(buf.data, buf.shape[1], buf.shape[0], buf.shape[1] * 4, QImage.Format.Format_RGBA8888)
+        if name == "sel" and self._selmove is not None:                  # the outline follows the mouse while it is dragged
+            x0 += int(round(self._selmove["d"][0] * self.zoom))
+            y0 += int(round(self._selmove["d"][1] * self.zoom))
         p.drawImage(x0, y0, img.copy())
 
     def has_image(self):
@@ -1118,6 +1140,11 @@ class ImageCanvas(QWidget):
                 self._drag = ("pt", i)
         elif self.mode == self.SELECT:
             mods = e.modifiers()
+            if self._can_move_selection(mods, ip):
+                self._selmove = {"start": ip, "d": (0, 0)}
+                self.setCursor(self._move_sel_cursor)
+                self.update()
+                return
             self._sel_mod = "add" if mods & Qt.KeyboardModifier.ShiftModifier else \
                 ("sub" if mods & Qt.KeyboardModifier.AltModifier else "")
             if self.select_shape == "color":
@@ -1208,6 +1235,12 @@ class ImageCanvas(QWidget):
             self._clamp()
             self.update()
             return
+        if self._selmove is not None:
+            ip = self.to_img(pos)
+            a = self._selmove["start"]
+            self._selmove["d"] = (int(round(ip.x() - a.x())), int(round(ip.y() - a.y())))
+            self.update()
+            return
         if self._tf_drag is not None:
             self._tf_do(pos)
             return
@@ -1234,12 +1267,22 @@ class ImageCanvas(QWidget):
                 self._erase["pts"] = [pts[0], ip]
             self.update()
             return
+        if self.mode == self.SELECT:
+            self._update_cursor(pos)
         if self.mode in (self.PICK, self.ERASE, self.SELECT, self.PAINT):
             self.update()
         elif self.mode in (self.CROP, self.PERSP):
             self._update_cursor(pos)
 
     def mouseReleaseEvent(self, e):
+        if self._selmove is not None and e.button() == Qt.MouseButton.LeftButton:
+            dx, dy = self._selmove["d"]
+            self._selmove = None
+            self.update()
+            self._update_cursor(e.position())
+            if dx or dy:
+                self.selectionMoved.emit(int(dx), int(dy))
+            return
         if self._view_press is not None and e.button() == Qt.MouseButton.LeftButton:
             moved = (e.position() - self._view_press).manhattanLength()
             ip = self.to_img(e.position())
@@ -1305,6 +1348,9 @@ class ImageCanvas(QWidget):
             self.setCursor(C.OpenHandCursor)
         elif self.mode == self.PICK:
             self.setCursor(self._pick_cursor)
+        elif self.mode == self.SELECT and pos is not None and self._img is not None and (
+                self._selmove is not None or self._can_move_selection(QApplication.keyboardModifiers(), self.to_img(pos))):
+            self.setCursor(self._move_sel_cursor)                  # inside the selection: 'move the outline'
         elif self.mode in (self.ERASE, self.SELECT, self.PAINT):
             self.setCursor(C.CrossCursor)
         elif self.mode in (self.MOVESEL, self.TRANSFORM):
