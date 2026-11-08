@@ -9,9 +9,9 @@ import uuid
 
 import numpy as np
 from PIL import Image, ImageChops, ImageFilter, ImageOps
-from PySide6.QtCore import QMimeData, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QMimeData, QObject, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QDrag, QImage, QPixmap
-from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QColorDialog, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QMenu,
+from PySide6.QtWidgets import (QSplitter, QApplication, QButtonGroup, QCheckBox, QColorDialog, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QMenu,
                                QPushButton, QScrollArea, QSizePolicy, QSlider, QStackedWidget, QToolButton,
                                QVBoxLayout, QWidget)
 
@@ -527,8 +527,25 @@ class DragHandle(QPushButton):
 
 
 
+
+class _SideSync(QObject):
+    moved = Signal(int)
+
+
+_SIDE_SYNC = None
+
+
+def side_sync():
+    """One object all pictures listen to: drag the panel bar on one picture and the others follow."""
+    global _SIDE_SYNC
+    if _SIDE_SYNC is None:
+        _SIDE_SYNC = _SideSync()
+    return _SIDE_SYNC
+
+
 class Card(QWidget):
     TAB_ADJUST, TAB_COLOR, TAB_SHADOW, TAB_TEXT, TAB_PICTURE, TAB_SAVE = range(6)   # order of the side tabs
+    SIDE_W = 350                                                                     # width of the side panel (shared, drag to change)
     editedChanged = Signal(object)
     removeRequested = Signal(object)
     copyRequested = Signal(object)
@@ -675,21 +692,41 @@ class Card(QWidget):
         sc.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         host = QWidget()
         lay = QVBoxLayout(host)
-        lay.setContentsMargins(0, 4, 6, 4)
-        lay.setSpacing(10)
+        lay.setContentsMargins(0, 2, 4, 2)
+        lay.setSpacing(6)
         sc.setWidget(host)
         return sc, lay
 
-    def _group_box(self, title=None):
+    def _group_box(self, title=None, collapsed=False, collapsible=True):
+        """A framed group.  With a title it is a drop-down: click the title to fold / unfold it.  Returns (frame, layout)."""
         f = QFrame()
         f.setObjectName("group")
-        l = QVBoxLayout(f)
-        l.setContentsMargins(12, 12, 12, 12)
-        l.setSpacing(12)
-        if title:
+        outer = QVBoxLayout(f)
+        outer.setContentsMargins(8, 6, 8, 8)
+        outer.setSpacing(4)
+        body = QWidget()
+        l = QVBoxLayout(body)
+        l.setContentsMargins(0, 0, 0, 0)
+        l.setSpacing(6)
+        if title and collapsible:
+            hdr = QPushButton(("\u25b8  " if collapsed else "\u25be  ") + title)
+            hdr.setProperty("gh", True)
+            hdr.setCursor(Qt.CursorShape.PointingHandCursor)
+            hdr.setToolTip("Click to fold / unfold")
+
+            def toggle(_=False, hdr=hdr, body=body, title=title):
+                show = not body.isVisible()
+                body.setVisible(show)
+                hdr.setText(("\u25be  " if show else "\u25b8  ") + title)
+            hdr.clicked.connect(toggle)
+            outer.addWidget(hdr)
+            body.setVisible(not collapsed)
+            f.expand = lambda body=body, hdr=hdr, title=title: (body.setVisible(True), hdr.setText("\u25be  " + title))
+        elif title:
             t = QLabel(title)
             t.setObjectName("sub")
-            l.addWidget(t)
+            outer.addWidget(t)
+        outer.addWidget(body)
         return f, l
 
     def _scope_label(self):
@@ -753,8 +790,8 @@ class Card(QWidget):
         self._scope_labels = []
         self._bake_btns = []
         root = QVBoxLayout(self)
-        root.setContentsMargins(14, 10, 14, 8)
-        root.setSpacing(7)
+        root.setContentsMargins(10, 6, 8, 4)
+        root.setSpacing(4)
 
         # --- row 1: name + history
         r1 = QHBoxLayout()
@@ -1025,14 +1062,22 @@ class Card(QWidget):
         root.addWidget(self.lblHint)
 
         # --- body: picture + tabs
-        body = QHBoxLayout()
-        body.setSpacing(0)
         self.canvas = ImageCanvas()
         self.canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.canvas.setMinimumSize(200, 200)
-        body.addWidget(self.canvas, 1)
-        body.addWidget(self._build_side())
-        root.addLayout(body, 1)
+        self.split = QSplitter(Qt.Orientation.Horizontal)          # drag the bar between picture and panel to resize
+        self.split.setChildrenCollapsible(False)
+        self.split.setHandleWidth(8)
+        self.split.addWidget(self.canvas)
+        self.split.addWidget(self._build_side())
+        self.split.setStretchFactor(0, 1)
+        self.split.setStretchFactor(1, 0)
+        self.split.handle(1).setCursor(Qt.CursorShape.SplitHCursor)
+        self.split.handle(1).setToolTip("Drag to make the panel wider or narrower")
+        self._split_init = False
+        self.split.splitterMoved.connect(self._side_moved)
+        side_sync().moved.connect(self._side_set)
+        root.addWidget(self.split, 1)
 
         # --- wiring
         self.btnHand.clicked.connect(lambda: self.choose_tool("view"))
@@ -1091,17 +1136,32 @@ class Card(QWidget):
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
-        side = getattr(self, "_side", None)
-        if side is not None:                      # the tab panel is a share of the window: never too wide on a small screen
-            w = int(max(300, min(460, self.width() * 0.27)))
-            if side.width() != w:
-                side.setFixedWidth(w)
+        if not self._split_init and self.width() > 500:        # first time: the panel gets the remembered width
+            self._split_init = True
+            w = min(Card.SIDE_W, int(self.width() * 0.6))
+            self.split.setSizes([self.width() - w, w])
+
+    def _side_moved(self, _pos=0, _idx=0):
+        w = self.split.sizes()[1]
+        if w >= 200:
+            Card.SIDE_W = w                                    # every picture's panel follows
+            side_sync().moved.emit(w)
+
+    def _side_set(self, w):
+        sz = self.split.sizes()
+        total = sum(sz)
+        if total <= 0 or abs(sz[1] - w) < 3:
+            return
+        self.split.blockSignals(True)
+        self.split.setSizes([total - w, w])
+        self.split.blockSignals(False)
 
     def _build_side(self):
         side = QWidget()
         side.setObjectName("panel")
         side.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        side.setFixedWidth(376)               # six tabs now (Color has its own)
+        side.setMinimumWidth(290)
+        side.setMaximumWidth(900)
         self._side = side
         v = QVBoxLayout(side)
         v.setContentsMargins(12, 8, 6, 8)
@@ -1205,7 +1265,8 @@ class Card(QWidget):
         lay.addWidget(g2)
         self.colors = ColorList()
         self.colors.scroll = pg
-        g3, gl3 = self._group_box()
+        g3, gl3 = self._group_box("Picked colors")
+        self.grpPicked = g3
         gl3.addWidget(self.colors)
         lay.addWidget(g3)
         lay.addStretch(1)
@@ -1223,7 +1284,8 @@ class Card(QWidget):
         # ---------------- Shadow
         pg, lay = self._page()
         lay.addWidget(self._scope_label())
-        gn, gln = self._group_box("Newspaper / book photo  \u2192  white page")
+        shparts = {}
+        gn, gln = self._group_box("Newspaper / book photo  \u2192  white page", collapsible=False)
         hn = QLabel("For a photo of a newspaper or a book page: the text and the shapes stay as they are, the page turns white. "
                     "One click - then slide the strength down or up. The slider works before and after the click.")
         hn.setObjectName("hint")
@@ -1239,9 +1301,9 @@ class Card(QWidget):
         gln.addWidget(self._look_row("news_keep", "Protect light writing", 0, 100, ("less", "", "more"),
                                      "Up = pale writing, thin lines and light shapes are kept (a little grey may stay).\n"
                                      "Down = a cleaner page, but pale details can fade.", ""))
-        lay.addWidget(gn)
+        shparts["white"] = gn
         self.btnNews.clicked.connect(self._news_click)
-        g, gl = self._group_box("One-click shadow removal")
+        g, gl = self._group_box("One-click shadow removal", collapsible=False)
         self.btnShadow = QPushButton("Remove shadow  (one click)")
         self.btnShadow.setProperty("accent", True)
         self.btnShadow.setMinimumHeight(40)
@@ -1283,8 +1345,8 @@ class Card(QWidget):
         self.modeOut.idClicked.connect(lambda i: self._shadow_opt("mode", ("color", "gray", "bw")[i]))
         gl.addWidget(self._label("Result"))
         gl.addLayout(mrow)
-        lay.addWidget(g)
-        g2, gl2 = self._group_box("Manual shadow removal")
+        shparts["one"] = g
+        g2, gl2 = self._group_box("Manual shadow removal", collapsible=False)
         info = QLabel("Works at once - no click needed.  Select a part of the picture first (Select menu) to fix only "
                       "that part, for example a shadow in one corner.  After the one-click button it fine-tunes the result.")
         info.setObjectName("hint")
@@ -1307,9 +1369,38 @@ class Card(QWidget):
         self.btnShadowReset.setToolTip("Sets the five sliders above back to 'off'")
         self.btnShadowReset.clicked.connect(self._reset_manual_shadow)
         gl2.addWidget(self.btnShadowReset)
-        lay.addWidget(g2)
+        shparts["manual"] = g2
+        # the three ways side by side: pick one, only that one is shown (faster than scrolling past all of them)
+        self.shStack = QStackedWidget()
+        seg = QHBoxLayout()
+        seg.setSpacing(4)
+        self.shSeg = QButtonGroup(self)
+        self.shSeg.setExclusive(True)
+        for k, (key, text, tip) in enumerate((("one", "One click", "Remove shadow with one click"),
+                                              ("manual", "Manual", "Manual shadow removal (sliders, works at once)"),
+                                              ("white", "White page", "Newspaper / book photo: make the page white"))):
+            b = QPushButton(text)
+            b.setCheckable(True)
+            b.setToolTip(tip)
+            self.shSeg.addButton(b, k)
+            seg.addWidget(b, 1)
+            self.shStack.addWidget(shparts[key])
+        self.shSeg.button(0).setChecked(True)
+
+        def sh_page(k):
+            for n in range(self.shStack.count()):                  # a hidden page must not keep the panel tall
+                w_ = self.shStack.widget(n)
+                pol = QSizePolicy.Policy.Preferred if n == k else QSizePolicy.Policy.Ignored
+                w_.setSizePolicy(pol, pol)
+            self.shStack.setCurrentIndex(k)
+            self.shStack.updateGeometry()
+        self.shSeg.idClicked.connect(sh_page)
+        sh_page(0)
+        lay.addLayout(seg)
+        lay.addWidget(self.shStack)
         lay.addStretch(1)
         self.stackPages.addWidget(pg)
+
 
         # ---------------- Text clarity
         pg, lay = self._page()
@@ -1349,7 +1440,7 @@ class Card(QWidget):
         self.lblLayerHint.setWordWrap(True)
         gl.addWidget(self.lblLayerHint)
         lay.addWidget(g)
-        g, gl = self._group_box("Background of the selected picture")
+        g, gl = self._group_box("Background of the selected picture", collapsed=True)
         self.chkBg = QCheckBox("Remove background")
         self.chkBg.setChecked(True)
         self.chkBg.toggled.connect(lambda _=False: self._bg_changed())
@@ -1415,7 +1506,7 @@ class Card(QWidget):
         for w in (self.btnSave, self.btnSaveAs, self.btnSaveAll, self.btnPdfAll, self.btnPrint):
             gl.addWidget(w)
         lay.addWidget(g)
-        g, gl = self._group_box("Share")
+        g, gl = self._group_box("Share", collapsed=True)
         self.btnApplyAll = QPushButton("Apply last setting to all pictures")
         self.btnApplyAll.setToolTip("Copies ONLY the setting you changed last (one slider, the shadow removal, or the picked colors) "
                                    "to the other pictures. Crop, erase, move ... are never copied.")
@@ -1518,8 +1609,8 @@ class Card(QWidget):
         """Fuzziness / 'near the click' changed after a click: the same selection, redone (no new undo step)."""
         self.localSlider.setVisible(self._tool == "color" and self.chkLocal.isChecked())
         cr = self._cr
-        if cr is None or not self._loaded or self._sel_ver != cr["ver"]:
-            return                                          # something else changed the selection since the click
+        if cr is None or not self._loaded or self.sel is not cr["sel"]:
+            return                                          # the selection was changed by something else since the click
         lab = cr["lab"]
         if self.prev is None or lab.shape[:2] != self.prev.shape[:2]:
             return
@@ -1531,11 +1622,11 @@ class Card(QWidget):
             return core.color_range_fuzzy(lab, rgb, fuzz, center, local)
 
         def done(mask):
-            if self._dead or cr.get("token") != token or self._cr is not cr or self._sel_ver != cr["ver"]:
+            if self._dead or cr.get("token") != token or self._cr is not cr or self.sel is not cr["sel"]:
                 return
             self.sel = core.sel_combine(base, mask, mode)
             self._sel_changed()
-            cr["ver"] = self._sel_ver
+            cr["sel"] = self.sel
         run_background(work, done, lambda msg: None)
 
     def _pick_fill(self):
@@ -2698,6 +2789,8 @@ class Card(QWidget):
 
     def _after_pick(self, kind, items, L):
         self.show_tab(self.TAB_COLOR)
+        if getattr(self, "grpPicked", None) is not None:
+            self.grpPicked.expand()
         if kind == "color":
             new = items[0]
             for a in self.adjs:
@@ -2902,7 +2995,7 @@ class Card(QWidget):
                     # 'Near the click' can redo it live (before, it was remembered too early and the sliders did nothing)
                     if info is not None:
                         self._cr = {"lab": lab, "rgb": info[0], "center": info[1], "base": base, "mode": mode,
-                                    "ver": self._sel_ver}
+                                    "sel": self.sel}
                 self._set_selection(mask, mode, after=remember)
                 if info is not None and getattr(self, "chkUseClick", None) is not None \
                         and self.chkUseClick.isChecked() and mode != "sub":

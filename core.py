@@ -1671,7 +1671,7 @@ def color_range_mask(lab, rgb, tol=30.0):
 
 def fuzz_to_tol(fuzz):
     """Photoshop-like 'Fuzziness' 0..200 -> the colour distance used by color_range_mask."""
-    return max(1.0, float(fuzz) * 0.55)
+    return 6.0 + float(fuzz) * 0.5          # never 0: a click always selects at least the colours that look the same
 
 
 def color_range_fuzzy(lab, rgb, fuzz=50, center=None, local=0.0):

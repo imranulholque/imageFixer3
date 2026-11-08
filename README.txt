@@ -63,7 +63,7 @@ KEYS
  Ctrl + wheel zoom, Ctrl +/- zoom, Ctrl+0 fit, Ctrl+1 100%     Left / Right previous / next picture
  Ctrl+S save, Ctrl+Shift+S save all edited, Ctrl+C copy picture
 
-SETTINGS (top right): start with Windows, Send to entry, save folder.
+SETTINGS (top right): start with Windows, Send to entry, save folder, Auto update.
 Closing the window keeps the program in the tray; use the tray icon -> Exit to quit.
 Problems are written to  %APPDATA%\ImageFixer\error.log
 
@@ -115,3 +115,15 @@ NEW (round 5)
   full resolution (up to 4800 px) and are upscaled with a good filter when shown larger.
 - Warp (Transform) has a 5 x 5 net: corners, middle of every side and the middle of the picture.
 - Undo during a Transform steps back inside it and finally cancels it (untransform).
+
+AUTO UPDATE  (Settings > Auto update)
+ - ON (default): a few seconds after start, and every 6 hours while the program is open, it looks on GitHub for a newer build.
+   When there is one you get a notification (tray), then a question "Update now / Later". Only after "Update now" it downloads the
+   new version, closes, copies it over the program folder and starts again. Your settings are kept. Unsaved pictures are asked about first.
+ - OFF: it never looks and never shows anything about updates. ("Check for updates now..." still works when you click it yourself.)
+ - How it works: every build that finishes on the main branch is published as a GitHub Release  build-<number>  (file ImageFixer-windows.zip).
+   The build writes its own number and your repository name into the program (buildinfo.py), so nothing needs to be set up.
+ - Needs: a PUBLIC repository (a private one cannot be read by the program without a login), and the program folder must be writable
+   (C:\Tools\ImageFixer is fine, C:\Program Files is not). Details of a failed update: %APPDATA%\ImageFixer\update.log
+ - Repository Settings > Actions > General > Workflow permissions must allow "Read and write permissions" (the build publishes the Release).
+ - Test the update logic: python test_updater.py

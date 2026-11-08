@@ -14,10 +14,12 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QDial
                                QPushButton, QSizePolicy, QStackedLayout, QSystemTrayIcon, QVBoxLayout, QWidget)
 
 import core
+import updater
 import winutil
 from card import EXPORT_DIR, Card
 from savedlg import SaveAllDialog
 from jobs import JobRunner
+from updatedlg import UpdateManager
 from theme import logo_pixmap, make_icon, scaled_qss
 
 FILTER = "Pictures and PDF (%s);;All files (*)" % " ".join("*" + e for e in sorted(core.IMG_EXT | {core.PDF_EXT}))
@@ -401,6 +403,7 @@ class MainWindow(QMainWindow):
         self.thumbs.done.connect(self._thumb_done)
         self._build_tray()
         self._build_shortcuts()
+        self.updater.start()                      # auto update: looks for a new build a few seconds after start (if switched on)
         self._apply_ui_size(self.settings.value("ui_size", "auto", type=str), say=False)
         self._fit_layout()
         self._refresh_dir()
@@ -462,6 +465,27 @@ class MainWindow(QMainWindow):
         self.actSend.toggled.connect(self._toggle_sendto)
         m.addAction(self.actAuto)
         m.addAction(self.actSend)
+        m.addSeparator()
+        # ---- auto update (all of it lives here)
+        self.updater = UpdateManager(self)
+        self.actUpd = QAction("Auto update (tell me, ask, then install)", self)
+        self.actUpd.setCheckable(True)
+        self.actUpd.setChecked(self.updater.enabled())
+        self.actUpd.setToolTip("ON: the program looks for a new version on GitHub, tells you, asks, then updates itself.\n"
+                               "OFF: it never looks and never shows anything about updates.")
+        self.actUpd.toggled.connect(self._toggle_update)
+        self.actUpdReady = QAction("", self)
+        self.actUpdReady.setVisible(False)
+        self.actUpdReady.triggered.connect(lambda: self.updater.info and self.updater.ask(self.updater.info))
+        self.actUpdNow = QAction("Check for updates now...", self)
+        self.actUpdNow.triggered.connect(lambda: self.updater.check(True))
+        self.actUpdVer = QAction("Version: " + updater.version_text(), self)
+        self.actUpdVer.setEnabled(False)
+        self.updater.available_changed.connect(self._update_available)
+        m.addAction(self.actUpd)
+        m.addAction(self.actUpdReady)
+        m.addAction(self.actUpdNow)
+        m.addAction(self.actUpdVer)
         m.addSeparator()
         a = QAction("Choose save folder...", self)
         a.triggered.connect(self.choose_dir)
@@ -1539,6 +1563,16 @@ class MainWindow(QMainWindow):
     def _toggle_autostart(self, on):
         winutil.set_autostart(on)
         self.say("Image Fixer will start with Windows." if on else "Image Fixer will not start with Windows.")
+
+    def _toggle_update(self, on):
+        self.updater.set_enabled(on)
+        self.say("Auto update is on: you will be told when a new version is ready." if on
+                 else "Auto update is off: new versions will not be shown.")
+
+    def _update_available(self, info):
+        self.actUpdReady.setVisible(info is not None)
+        if info is not None:
+            self.actUpdReady.setText("Update ready: build %d - install..." % info["build"])
 
     def _toggle_sendto(self, on):
         self.settings.setValue("sendto", on)
