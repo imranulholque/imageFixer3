@@ -1,7 +1,15 @@
 name: Build
 on:
   push:
+    branches: ["**"]
   workflow_dispatch:
+# Needed to publish the Release that the program's auto update reads.
+permissions:
+  contents: write
+# Two quick pushes: only the newest one is built, so "latest release" is always the newest code.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   build:
     runs-on: windows-latest
@@ -11,6 +19,14 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -r requirements.txt
+      # Tell the program which build it is and where to look for newer ones (used by Settings > Auto update).
+      - name: Stamp build info
+        shell: python
+        run: |
+          open("buildinfo.py", "w").write('BUILD = ${{ github.run_number }}\nREPO = "${{ github.repository }}"\nCOMMIT = "${{ github.sha }}"\n')
+      - name: Updater test
+        continue-on-error: true
+        run: python test_updater.py
       # Opens the real window invisibly and clicks through the main features.
       # If something is wrong the log shows exactly where; the exe is still built.
       - name: Self test
@@ -32,8 +48,28 @@ jobs:
               d.polygon([(70, 176), (110, 130), (136, 158), (158, 138), (190, 176)], fill=(255, 255, 255, 255))
               d.ellipse((84, 86, 108, 110), fill=(255, 255, 255, 255))
               im.save("icon.ico", sizes=[(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
-      - run: pyinstaller --noconsole --onedir --name ImageFixer --icon icon.ico --collect-all pillow_heif --collect-all pypdfium2 --exclude-module tkinter app.py
+      - run: pyinstaller --noconsole --onedir --name ImageFixer --icon icon.ico --collect-all pillow_heif --collect-all pypdfium2 --hidden-import buildinfo --exclude-module tkinter app.py
       - uses: actions/upload-artifact@v4
         with:
           name: ImageFixer
           path: dist/ImageFixer
+      # Publish this build as a Release: the installed programs see it, tell the user, and update after the user agrees.
+      # Only for the main branch. Built as a draft first so nobody sees a release before the zip is attached.
+      - name: Zip for the updater
+        if: github.ref_name == github.event.repository.default_branch
+        shell: python
+        run: |
+          import shutil
+          shutil.make_archive("ImageFixer-windows", "zip", "dist/ImageFixer")
+      - name: Publish release
+        if: github.ref_name == github.event.repository.default_branch
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: build-${{ github.run_number }}
+          NOTES: ${{ github.event.head_commit.message }}
+        run: |
+          gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG" ImageFixer-windows.zip --draft --target "$GITHUB_SHA" \
+            --title "Build ${{ github.run_number }}" --notes "${NOTES:-Manual build}"
+          gh release edit "$TAG" --draft=false --latest
