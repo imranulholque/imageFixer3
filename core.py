@@ -454,6 +454,18 @@ def _mask_filter(m, k, use_max=True):
     return min_filter(np.asarray(m), k, use_max)
 
 
+def _local_paper(Y, long):
+    """Brightness of the paper around every pixel (block maximum, smoothed): writing is what is darker than this."""
+    b = max(4, int(0.012 * long))
+    H, W = Y.shape
+    ph, pw = (-H) % b, (-W) % b
+    pad = np.pad(Y, ((0, ph), (0, pw)), mode="edge")
+    mx = pad.reshape(pad.shape[0] // b, b, pad.shape[1] // b, b).max(axis=(1, 3)).astype(np.float32)
+    mx = max_filter(mx, 3)
+    im = Image.fromarray(mx, "F").resize((pad.shape[1], pad.shape[0]), Image.Resampling.BILINEAR)
+    return np.asarray(im, dtype=np.float32)[:H, :W]
+
+
 def clarity(rgb, look):
     """Text / line / shape sharpness, faint strokes, darker text, cleaner specks.  Only the lightness is changed,
     with a limit against halos, so shapes are never bent or moved."""
@@ -481,9 +493,12 @@ def clarity(rgb, look):
         k = max(3, int(2 * math.ceil(r) + 1))
         mn = min_filter(u, k).astype(np.float32)
         mx = max_filter(u, k).astype(np.float32)
-        margin = 0.3 * (mx - mn) + 2.0
-        return np.clip(Ys, mn - margin, mx + margin)
+        span = mx - mn
+        return np.clip(Ys, mn - 0.5 * span - 3.0, mx + 0.35 * span + 2.0)
 
+    # noise level of the picture (paper grain, camera noise): detail below this is not writing and is never sharpened
+    sm1 = np.asarray(u8(Y).filter(ImageFilter.GaussianBlur(1.0)), dtype=np.float32)
+    nf = float(np.clip(2.6 * 1.4826 * np.median(np.abs(Y - sm1)), 3.0, 14.0))
     if clear > 0:                                   # remove specks / noise
         med = median3(np.asarray(u8(Yf))).astype(np.float32)
         a = clear / 100.0
@@ -491,14 +506,25 @@ def clarity(rgb, look):
     if detail > 0:                                  # local contrast with a wide radius = faint strokes
         r2 = max(6.0, 0.02 * long)
         blur = np.asarray(u8(Yf).filter(ImageFilter.GaussianBlur(r2)), dtype=np.float32)
-        Yf = Yf + (detail / 100.0 * 1.6) * (Yf - blur)
+        dd = Yf - blur
+        dd = np.sign(dd) * np.maximum(np.abs(dd) - max(4.0, nf), 0.0)                    # paper grain / noise is not "faint writing"
+        Yf = np.clip(Yf + (detail / 100.0 * 3.2) * np.minimum(dd, 0.0) + (detail / 100.0 * 0.6) * np.maximum(dd, 0.0), 0.0, 255.0)
     if objs > 0:                                    # shapes / thick lines: medium radius
-        Yf = unsharp(Yf, max(1.5, 0.004 * long), objs / 100.0 * 1.4, 0.0)
+        Yf = np.clip(unsharp(Yf, max(1.5, 0.004 * long), objs / 100.0 * 2.8, nf), 0.0, 255.0)
     if sharp > 0:                                   # text edges: small radius
-        Yf = unsharp(Yf, float(np.clip(0.0008 * long, 0.6, 3.0)), sharp / 100.0 * 2.5, 2.0)
-    if dark > 0:                                    # text darker, paper untouched
-        t = 1.0 - _smooth(Yf / 200.0)
-        Yf = Yf * (1.0 - 0.7 * (dark / 100.0) * t)
+        r0 = float(np.clip(0.0008 * long, 0.6, 3.0))
+        Yf = np.clip(unsharp(Yf, r0, sharp / 100.0 * 3.2, nf), 0.0, 255.0)
+        Yf = np.clip(unsharp(Yf, r0 * 2.2, sharp / 100.0 * 1.6, nf), 0.0, 255.0)   # a second, wider pass: blurred text gets steep edges
+    if dark > 0:                                    # text darker, paper untouched - relative to the paper AROUND it
+        Yf = np.clip(Yf, 0.0, 255.0)                # the steps above may overshoot; the paper level must not
+        bg = _local_paper(Y, long)                  # paper level of the ORIGINAL (the steps above never move the paper)
+        diff = np.maximum(bg - Yf, 0.0)
+        a = dark / 100.0
+        r_t = max(1.6, 0.004 * long)                # thin and dark compared with what is around it = writing / lines
+        hp = np.asarray(u8(Yf).filter(ImageFilter.GaussianBlur(r_t)), dtype=np.float32) - Yf
+        t = _smooth((diff - 0.07 * bg) / (0.06 * bg + 4.0)) * _smooth((hp - 3.0) / 14.0)    # (paper grain, smooth photos, big dark areas stay)
+        gain = 1.0 + 4.0 * a * (1.0 - _smooth((diff - 90.0) / 110.0))           # faint writing gets the most, black stays black
+        Yf = Yf * (1.0 - t) + np.clip(bg - diff * gain, 0.0, 255.0) * t
     out = x + (Yf - Y)[..., None]
     return np.clip(out + 0.5, 0, 255).astype(np.uint8)
 
@@ -537,7 +563,9 @@ def active_adjs(adjs):
 DEFAULT_LOOK = {"sat": 100, "bright": 0, "contrast": 0, "hue": 0, "warm": 0, "vib": 0,
                 "sharp": 0, "objs": 0, "detail": 0, "dark": 0, "clear": 0,
                 # manual shadow removal (works without the one-click button)
-                "flat": 0, "flat_size": 50, "shlift": 0, "white": 0, "black": 0}
+                "flat": 0, "flat_size": 50, "shlift": 0, "white": 0, "black": 0,
+                # newsprint / book photo: text and shapes stay, the page becomes white (one click + this slider)
+                "news": 0, "news_keep": 50}
 
 
 def new_look(**kw):
@@ -553,7 +581,7 @@ def tone_active(l):
 
 def shadow_active(l):
     """Manual shadow removal in use ('flat_size' alone does nothing)."""
-    return bool(l.get("flat", 0) or l.get("shlift", 0) or l.get("white", 0) or l.get("black", 0))
+    return bool(l.get("flat", 0) or l.get("shlift", 0) or l.get("white", 0) or l.get("black", 0) or l.get("news", 0))
 
 
 def clarity_active(l):
@@ -613,6 +641,61 @@ def gain_rows(gain, y0, y1, H, W):
         (W, y1 - y0), Image.Resampling.BILINEAR, box=box), dtype=np.float32) for c in range(3)], -1)
 
 
+def _apply_gain(x, g, strength=1.0):
+    """Brighten the shaded paper (gain map g) but not the writing: pixels much darker than the paper around them (ink,
+    dark shapes) are left as they are, so black stays black and a dark box does not turn white."""
+    gl = g.mean(2)
+    L = x[..., 0] * 0.299 + x[..., 1] * 0.587 + x[..., 2] * 0.114
+    r = L * gl / 255.0                                       # 1 = as light as the paper around it, small = ink
+    w = _smooth((r - 0.40) / 0.32) * strength
+    return np.minimum(x * (1.0 + (g - 1.0) * w[..., None]), 255.0)
+
+
+def _newsprint(x, g, s, keep):
+    """Newsprint / book page: the light is evened out, then everything that is clearly lighter than the writing becomes
+    white (grain, yellow paper, writing showing through from the back).  Dark writing and dark / coloured shapes keep
+    their colour and edges.  s 0..1 = how strongly (how dark a grey may still be turned white), keep 0..1 = how much
+    light writing / thin lines are protected."""
+    if g is not None:
+        x = _apply_gain(x, np.minimum(g, 2.6))               # a limited lift: a big dark picture is not mistaken for a shadow
+    L = x[..., 0] * 0.299 + x[..., 1] * 0.587 + x[..., 2] * 0.114
+    t1 = 238.0 - 92.0 * s                                   # at / above this the pixel is white
+    t0 = t1 - (38.0 + 34.0 * (1.0 - keep))                   # at / below this nothing changes
+    m = _smooth((L - t0) / max(1.0, t1 - t0))
+    mx, mn = x.max(2), x.min(2)
+    S = (mx - mn) / np.maximum(mx, 1.0)
+    prot = 1.0 - 0.92 * _smooth((S - 0.22) / 0.30) * (1.0 - _smooth((L - 215.0) / 30.0))   # strong colours (a red box) stay
+    return x + (255.0 - x) * (m * prot)[..., None]
+
+
+def _otsu8(a):
+    """Otsu threshold of a uint8 picture."""
+    h = np.bincount(a.reshape(-1), minlength=256).astype(np.float64)
+    tot = h.sum()
+    if tot == 0:
+        return 128
+    w0 = np.cumsum(h)
+    m0 = np.cumsum(h * np.arange(256))
+    mt = m0[-1]
+    w1 = tot - w0
+    with np.errstate(divide="ignore", invalid="ignore"):
+        var = (mt * w0 - m0 * tot) ** 2 / (w0 * w1)
+    var[~np.isfinite(var)] = 0
+    return int(np.argmax(var))
+
+
+def auto_news_strength(rgb):
+    """The strength (0..100) for the one click: found from the picture itself (where the writing ends and the page begins)."""
+    H, W = rgb.shape[:2]
+    s = 1000.0 / max(H, W)
+    small = np.asarray(Image.fromarray(rgb).resize((max(8, round(W * s)), max(8, round(H * s))), Image.Resampling.BOX)) if s < 1 else rgb
+    sg = np.minimum(shadow_gain(small, 50, None), 2.6)
+    g = _apply_gain(small.astype(np.float32), sg)
+    L = g[..., 0] * 0.299 + g[..., 1] * 0.587 + g[..., 2] * 0.114
+    t = _otsu8(np.clip(L, 0, 255).astype(np.uint8))
+    return int(np.clip(round((238.0 - (t + 12.0)) / 92.0 * 100.0), 35, 92))
+
+
 def apply_shadow_manual(x, g, l):
     """Hand-made shadow removal on float32 (...,3) 0..255.
     flat   = even out the light (uses the measured paper light 'g'), flat_size = how wide the shadows are
@@ -620,7 +703,10 @@ def apply_shadow_manual(x, g, l):
     white  = paper whiteness (the paper's grey becomes white)    black = text darkness"""
     f = l.get("flat", 0)
     if f and g is not None:
-        x = np.minimum(x * (1.0 + (g - 1.0) * (f / 100.0)), 255.0)
+        x = _apply_gain(x, g, f / 100.0)
+    n = l.get("news", 0)
+    if n:
+        x = _newsprint(x, g, n / 100.0, l.get("news_keep", 50) / 100.0)
     k = l.get("shlift", 0) / 100.0
     if k > 0:
         v = x.max(2) / 255.0
@@ -658,7 +744,7 @@ def render(rgb, adjs, look=None, lab=None, cache=None, chunk_rows=0, sel=None):
         keep = {("m",) + adj_key(a) for a in adjs}
         keep.add(("f",) + tuple(adj_key(a) for a in dec))
         keep |= {("g",) + adj_key(a) for a in dec}
-        if look.get("flat", 0):
+        if look.get("flat", 0) or look.get("news", 0):
             keep.add(("sg", int(look.get("flat_size", 50))))
         for k in [k for k in cache if k not in keep]:
             del cache[k]
@@ -666,7 +752,8 @@ def render(rgb, adjs, look=None, lab=None, cache=None, chunk_rows=0, sel=None):
     if not act and not tone_on and not clar_on and not shad_on:
         return rgb
     H, W = rgb.shape[:2]
-    gainmap = shadow_gain(rgb, look.get("flat_size", 50), cache) if (shad_on and look.get("flat", 0)) else None
+    gainmap = (shadow_gain(rgb, look.get("flat_size", 50), cache)
+               if (shad_on and (look.get("flat", 0) or look.get("news", 0))) else None)
     masks = {a["id"]: get_mask(rgb, a, lab, cache) for a in act}
     # the fill must avoid ALL matching pixels, also the ones outside the selection
     F = get_fill(rgb, [masks[a["id"]] for a in dec], [adj_key(a) for a in dec], cache) if dec else None
@@ -1026,7 +1113,7 @@ def photo_mask(img):
     return np.asarray(big, dtype=np.float32) / 255.0
 
 
-SHADOW_DEFAULTS = {"strength": 100, "white": 50, "ink": 50, "scale": 50, "mode": "color", "protect": 1,
+SHADOW_DEFAULTS = {"strength": 100, "white": 50, "ink": 50, "scale": 50, "mode": "color", "protect": 0,
                    "even": 100, "depth": 60, "tint": 0, "clean": 0}
 
 
@@ -1062,7 +1149,7 @@ def remove_shadow(img, strength=1.0, progress=None, opts=None):
     wp = float(max(bp + 20.0, min(254.0, wp)))
     gam = (1.0 + 0.35 * s) * (1.0 + (o["ink"] - 50) / 100.0 * 0.9)
     out = np.empty_like(arr)
-    pm = photo_mask(img) if o.get("protect", 1) else None      # photos (faces ...): only the light is evened out
+    pm = photo_mask(img) if o.get("protect", 0) else None      # photos (faces ...): only the light is evened out
     if pm is not None and float(pm.max()) < 0.05:
         pm = None
     step = 600
@@ -1326,6 +1413,49 @@ def out_ext(src_name):
     return e if e in SAVE_EXT else ".png"
 
 
+ORIG_DIR = os.path.join(os.environ.get("TEMP") or os.environ.get("TMPDIR") or "/tmp", "imagefixer_originals")
+
+
+def backup_original(path, uid):
+    """Before 'Save' replaces a file: a copy of the original is kept (temporarily) so Reset and Compare still show it."""
+    import shutil
+    os.makedirs(ORIG_DIR, exist_ok=True)
+    dst = os.path.join(ORIG_DIR, "%s_%s" % (uid, os.path.basename(path)))
+    if not os.path.exists(dst):
+        shutil.copy2(path, dst)
+    return dst
+
+
+def write_replacing(img, path):
+    """Writes the picture to path through a temporary file, so a failure never leaves a broken original."""
+    d, n = os.path.split(path)
+    tmp = os.path.join(d, ".~if_" + n)
+    try:
+        save_image(img, tmp)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def purge_dir(folder, older_than=None):
+    """Removes the temporary files (all of them, or only those older than that many seconds)."""
+    import time
+    if not os.path.isdir(folder):
+        return
+    now = time.time()
+    for n in os.listdir(folder):
+        p = os.path.join(folder, n)
+        try:
+            if os.path.isfile(p) and (older_than is None or now - os.path.getmtime(p) > older_than):
+                os.remove(p)
+        except OSError:
+            pass
+
+
 def unique_path(folder, base, ext):
     p = os.path.join(folder, base + ext)
     n = 2
@@ -1391,6 +1521,77 @@ def color_range_mask(lab, rgb, tol=30.0):
     strength (so a dark pixel with a faint tint is not taken); white / grey / black match by lightness."""
     pt = rgb_to_lab(np.array([[list(rgb)]], dtype=np.uint8))[0, 0]
     return adj_mask(lab, {"type": "color", "target": [float(pt[0]), float(pt[1]), float(pt[2])], "tol": float(tol)})
+
+
+def fuzz_to_tol(fuzz):
+    """Photoshop-like 'Fuzziness' 0..200 -> the colour distance used by color_range_mask."""
+    return max(1.0, float(fuzz) * 0.55)
+
+
+def color_range_fuzzy(lab, rgb, fuzz=50, center=None, local=0.0):
+    """Color range with a fuzziness slider (0..200).  local > 0 (fraction of the picture's long side): only around 'center'
+    (x, y) - 'localized color clusters', so the same colour far away is not taken."""
+    m = color_range_mask(lab, rgb, fuzz_to_tol(fuzz))
+    if center is not None and local > 0:
+        H, W = m.shape
+        R = max(8.0, local * max(H, W))
+        yy, xx = np.ogrid[0:H, 0:W]
+        d = np.sqrt((xx - center[0]) ** 2 + (yy - center[1]) ** 2)
+        m = m * (1.0 - _smooth((d - R * 0.85) / (R * 0.3 + 1e-3))).astype(np.float32)
+    return m
+
+
+def smart_deselect(sel, lab, stroke, tol=28.0, size=30.0):
+    """The deselect brush: paint over the part that was selected by mistake.  Only what looks like what was brushed
+    (and touches the brush) is taken out, so the edge between two colours stays exactly where it is - like the subtract
+    mode of Photoshop's quick selection.  Returns the mask of what to remove (0..1)."""
+    H, W = stroke.shape
+    core_m = stroke > 0.5
+    if not core_m.any():
+        return np.zeros((H, W), np.float32)
+    inside = core_m & (sel > 0.3)
+    if int(inside.sum()) < 6:
+        return np.asarray(stroke, np.float32)
+    vals = lab[inside]
+    ref1 = np.median(vals, axis=0)
+    dv = np.sqrt(((vals[:, 0] - ref1[0]) * 0.8) ** 2 + (vals[:, 1] - ref1[1]) ** 2 + (vals[:, 2] - ref1[2]) ** 2)
+    refs = [ref1]
+    far = dv > tol * 1.4
+    if int(far.sum()) > 0.15 * len(vals):                 # the brush crossed two colours: use both
+        refs.append(np.median(vals[far], axis=0))
+    spread = float(np.mean(1.4826 * np.median(np.abs(vals - ref1), axis=0)))
+    thr = tol + min(18.0, 2.0 * spread)
+    ys, xs = np.nonzero(stroke > 0.05)
+    reach = int(max(6, 0.9 * size))
+    y0, y1 = max(0, int(ys.min()) - reach), min(H, int(ys.max()) + 1 + reach)
+    x0, x1 = max(0, int(xs.min()) - reach), min(W, int(xs.max()) + 1 + reach)
+    sub = lab[y0:y1, x0:x1]
+    d = None
+    for r in refs:
+        dr = np.sqrt(((sub[..., 0] - r[0]) * 0.8) ** 2 + (sub[..., 1] - r[1]) ** 2 + (sub[..., 2] - r[2]) ** 2)
+        d = dr if d is None else np.minimum(d, dr)
+    soft = (1.0 - _smooth((d - thr * 0.75) / (thr * 0.5))).astype(np.float32)
+    st = core_m[y0:y1, x0:x1]
+    near = np.asarray(Image.fromarray((st * 255).astype(np.uint8)).filter(ImageFilter.MaxFilter(2 * reach + 1))) > 0
+    allow = ((soft > 0.5) & near & (sel[y0:y1, x0:x1] > 0.05))
+    seed = st & allow
+    if not seed.any():
+        seed = st
+    cur = Image.fromarray((seed * 255).astype(np.uint8))
+    allow_im = Image.fromarray((allow * 255).astype(np.uint8))
+    prev_n = int(seed.sum())
+    for _ in range(max(4, reach)):                        # grows only through matching pixels that touch the brush
+        nxt = ImageChops.multiply(cur.filter(ImageFilter.MaxFilter(3)), allow_im)
+        n = int(np.count_nonzero(np.asarray(nxt)))
+        cur = nxt
+        if n == prev_n:
+            break
+        prev_n = n
+    grown = np.asarray(cur, np.float32) / 255.0
+    m = np.zeros((H, W), np.float32)
+    keep_core = (core_m[y0:y1, x0:x1] & (d < thr * 1.8)).astype(np.float32)
+    m[y0:y1, x0:x1] = np.maximum(grown * soft, keep_core)
+    return np.asarray(Image.fromarray((np.clip(m, 0, 1) * 255).astype(np.uint8)).filter(ImageFilter.GaussianBlur(0.7)), np.float32) / 255.0
 
 
 def quick_select(lab, stroke, tol=28.0):
@@ -1686,7 +1887,30 @@ def warp_layer_hq(patch, size, grid, n, ss=3, max_px=36_000_000):
 
 
 # ------------------------------------------------------------------ picture layers (signature, stamp ...)
-def remove_background(img, alpha=None, strength=50, soft=30, uneven=False, tint="orig", opacity=100, remove=True):
+def _box_sum(a, r):
+    """Sum of a (float32 h,w) in the (2r+1) x (2r+1) window around every pixel (integral image, exact)."""
+    H, W = a.shape
+    p = np.pad(a, ((r + 1, r), (r + 1, r)), mode="constant").astype(np.float64)
+    s = p.cumsum(0).cumsum(1)
+    k = 2 * r + 1
+    return (s[k:k + H, k:k + W] - s[:H, k:k + W] - s[k:k + H, :W] + s[:H, :W]).astype(np.float32)
+
+
+def despeckle_alpha(a, level):
+    """Takes dust and paper grain out of a cut-out: a spot is kept only when enough 'ink' is around it, so strokes (long,
+    even faint ones) stay and isolated specks go.  level 0..100."""
+    if level <= 0:
+        return a
+    H, W = a.shape
+    r = int(np.clip(round(0.007 * max(H, W)), 3, 12))
+    mass = _box_sum(np.clip(a * 2.5, 0.0, 1.0), r)
+    T = (2 * r + 1) ** 2 * (0.02 + 0.16 * level / 100.0)
+    keep = _smooth((mass - 0.6 * T) / (0.6 * T))
+    return a * keep
+
+
+def remove_background(img, alpha=None, strength=50, soft=30, uneven=False, tint="orig", opacity=100, remove=True,
+                      specks=50, fine=70):
     """PIL RGB (+ optional 'L' alpha of its own) -> PIL RGBA with the background taken away.
     The background colour is read from the border; with 'uneven' (grey print paper, shading) it is followed across the
     picture.  Edge pixels are un-mixed from the paper colour, so a signature / stamp has no light halo."""
@@ -1702,6 +1926,17 @@ def remove_background(img, alpha=None, strength=50, soft=30, uneven=False, tint=
                                  rgb[:, :k].reshape(-1, 3), rgb[:, -k:].reshape(-1, 3)])
         bgc = np.median(border, axis=0).astype(np.uint8)
         bl = rgb_to_lab(bgc[None, None, :])[0, 0]
+        # the border is not always paper (ink touching it, a table around the picture): then the paper colour is the
+        # middle colour of the lightest half of the picture
+        Lall = lab[..., 0]
+        step = max(1, int(Lall.size // 200000))
+        lf, rf = Lall.reshape(-1)[::step], rgb.reshape(-1, 3)[::step]
+        light = rf[lf >= np.percentile(lf, 50)]
+        if len(light) > 16:
+            bgc2 = np.median(light, axis=0).astype(np.uint8)
+            bl2 = rgb_to_lab(bgc2[None, None, :])[0, 0]
+            if float(np.sqrt(((bl - bl2) ** 2).sum())) > 12.0:
+                bgc, bl = bgc2, bl2
         B = np.broadcast_to(bgc.astype(np.float32), x.shape)
         Bl = bl
         if uneven:
@@ -1715,9 +1950,12 @@ def remove_background(img, alpha=None, strength=50, soft=30, uneven=False, tint=
                 B = F.astype(np.float32)
                 Bl = rgb_to_lab(F)
         dist = np.sqrt(((lab - Bl) ** 2).sum(2))
-        t0 = 3.0 + 0.3 * strength
+        pap = dist[dist < 25.0]
+        P = float(np.percentile(pap[::max(1, pap.size // 100000)], 90)) if pap.size > 64 else 6.0     # how noisy the paper is
+        t0 = (max(3.0, 1.15 * P) + 0.18 * strength) * (1.35 - 0.7 * fine / 100.0)
         t1 = t0 + 6.0 + 0.5 * soft
         a = _smooth((dist - t0) / (t1 - t0))
+        a = despeckle_alpha(a, specks)
         a3 = a[..., None]
         C = np.where(a3 > 0.97, x, np.clip((x - B * (1.0 - a3)) / np.maximum(a3, 0.08), 0, 255))
     if alpha is not None:
@@ -1775,6 +2013,9 @@ def composite_layers(base, layers, hide=None):
         want = int(tw * 3)
         if 8 <= want < patch.width:
             patch = patch.resize((want, max(1, int(round(want * patch.height / patch.width)))), Image.Resampling.LANCZOS)
+        elif patch.width < tw * 1.05 and tw < 9000:           # shown LARGER than its pixels: upscale it with a good filter first
+            up = int(tw * 1.5)
+            patch = patch.resize((up, max(1, int(round(up * patch.height / patch.width)))), Image.Resampling.LANCZOS)
         out = Image.alpha_composite(out, warp_layer_hq(patch, (W, H), grid, n))
     return out.convert("RGB")
 

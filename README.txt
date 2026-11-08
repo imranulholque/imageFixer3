@@ -85,3 +85,23 @@ NEW (round 4)
 - Shadow: manual sliders work without the one-click button; the one-click got 4 more options. Existing settings are unchanged.
 - Placed pictures (signature, stamp ...) can be cropped to a circle, oval, rounded box, a box or any selected shape.
 - Compare button (top right of a picture, only shown after you changed it): original and edited together, with a slider or side by side. Wheel = zoom, drag = move.
+
+NEW (round 5)
+- Save works like Photoshop: Save (Ctrl+S) replaces the original file (asked once; a copy of the original is kept for Reset / Compare
+  while the picture is open). A picture from the phone / clipboard has no original: it goes to the save folder, which is asked once and
+  then remembered (change it with Save as... or the folder button). Save as... = folder, name, format JPG / PNG / PDF.
+  Save all edited... = replace the originals OR a folder (Browse...), remembered. Print... (Ctrl+P).
+  Edited copies made for copy / drag / print are temporary: they are removed with the picture and when the program exits.
+- Incoming pictures (drag, Ctrl+V, phone / QR): in the PICTURE tab they become an overlay on the current page, in any other tab a new main picture.
+- Phone: new page (Scan / Send / Scan a saved photo, drag corners AND sides, Original / Clean / Gray / B&W, turn, auto next page),
+  a much better paper finder for busy backgrounds. The phone window is now a dropdown under the button.
+- Compare is shown IN the picture (slider or side by side); click it again to switch it off.
+- Select: Color range has Fuzziness (updates live after the click, optional 'Near the click'); new Deselect brush (Select menu) takes
+  parts out of a selection accurately; the clicked color becomes the fill color; Fill / Delete / eyedropper / hex in one group;
+  'Remove a stamp or mark' (keep dark writing) is its own group at the top of the Adjust tab.
+- Shadow tab: Newspaper / book photo -> white page (one click + slider, both directions); 'keep photos and faces' removed.
+- Text options are stronger at 100% (faint writing gets dark, the paper stays white).
+- Overlay background cut: paper noise is measured, specks removed (new sliders Keep faint strokes / Remove specks); pictures keep their
+  full resolution (up to 4800 px) and are upscaled with a good filter when shown larger.
+- Warp (Transform) has a 5 x 5 net: corners, middle of every side and the middle of the picture.
+- Undo during a Transform steps back inside it and finally cancels it (untransform).

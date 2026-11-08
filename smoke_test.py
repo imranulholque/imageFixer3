@@ -333,5 +333,106 @@ def t_crop_shapes():
     assert a3.getpixel((1, 1)) == 0 and a3.getpixel((60, 60)) == 255
 step("crop to circle / oval / rounded box / selection shape", t_crop_shapes)
 
+
+def t_scanner_v2():
+    import scanner, math
+    W, H = 1200, 900
+    bgim = Image.new("RGB", (W, H), (60, 52, 44)); dr = ImageDraw.Draw(bgim)
+    for i in range(0, W, 24): dr.line([(i, 0), (i + 90, H)], fill=(80, 66, 50), width=6)       # a stripy table
+    paper = Image.new("RGB", (500, 700), (238, 236, 228)); pd = ImageDraw.Draw(paper)
+    for i in range(20): pd.text((30, 30 + i * 30), "text line %d lorem ipsum" % i, fill=(20, 20, 30))
+    quad = [(300, 120), (900, 170), (860, 800), (260, 740)]
+    co = core._coeffs(quad, [(0, 0), (500, 0), (500, 700), (0, 700)])
+    wp = paper.transform((W, H), Image.Transform.PERSPECTIVE, co, Image.Resampling.BICUBIC)
+    wm = Image.new("L", (500, 700), 255).transform((W, H), Image.Transform.PERSPECTIVE, co, Image.Resampling.BILINEAR)
+    scene = Image.composite(wp, bgim, wm)
+    q, found = scanner.detect_document(scene)
+    assert found, "the paper must be found"
+    err = max(math.hypot(a[0] - b[0], a[1] - b[1]) for a, b in zip(core.order_quad(q), core.order_quad(quad)))
+    assert err < 0.03 * math.hypot(W, H), "corners off by %.0f px" % err
+    noise = Image.fromarray((np.random.default_rng(1).random((600, 800, 3)) * 100 + 60).astype(np.uint8))
+    assert scanner.detect_document(noise)[1] is False, "noise is not a paper"
+    out = scanner.enhance(scanner.straighten(scene, q), "clean"); assert out.size[0] > 100
+step("phone scanner finds the paper on a busy background", t_scanner_v2)
+
+def t_warp_middle():
+    n = 4
+    patch = Image.new("RGBA", (400, 400), (255, 255, 255, 255)); ImageDraw.Draw(patch).line([(0, 200), (400, 200)], fill=(0, 0, 0, 255), width=6)
+    grid = [((j / n) * 400, (i / n) * 400) for i in range(n + 1) for j in range(n + 1)]
+    grid[(n // 2) * (n + 1) + n // 2] = (200, 120)
+    a = np.asarray(core.warp_layer(patch, (400, 400), grid, n))
+    ys = [int(np.argmin(a[:, x, 0].astype(int) + (a[:, x, 3] == 0) * 999)) for x in (10, 200, 390)]
+    assert ys[1] < 140 and abs(ys[0] - 200) < 5 and abs(ys[2] - 200) < 5, ys
+step("warp net has a middle node", t_warp_middle)
+
+def t_select_tools():
+    W, H = 400, 300
+    im = Image.new("RGB", (W, H), (236, 232, 224)); dd = ImageDraw.Draw(im)
+    dd.ellipse((60, 60, 220, 220), fill=(200, 40, 50)); dd.rectangle((260, 80, 380, 180), fill=(214, 120, 125))
+    rgb = np.asarray(im); lab = core.rgb_to_lab(rgb)
+    narrow = core.color_range_fuzzy(lab, (200, 40, 50), 20); wide = core.color_range_fuzzy(lab, (200, 40, 50), 140)
+    assert narrow[100:180, 300:360].mean() < 0.05 and wide[100:180, 300:360].mean() > 0.9, "fuzziness must widen the selection"
+    assert core.color_range_fuzzy(lab, (200, 40, 50), 140, (140, 140), 0.2)[100:180, 300:360].mean() < 0.05, "near the click only"
+    sel = (wide > 0.5).astype(np.float32)
+    stroke = np.zeros((H, W), np.float32); stroke[110:150, 280:360] = 1
+    after = core.sel_combine(sel, core.smart_deselect(sel, lab, stroke, 28.0, 40.0), "sub")
+    assert after[110:150, 280:360].mean() < 0.05 and after[120:160, 100:180].mean() > 0.95, "deselect brush: only the painted part goes"
+step("color range fuzziness and the deselect brush", t_select_tools)
+
+def t_news_and_text():
+    rng = np.random.default_rng(3); W, H = 700, 900
+    pg = Image.new("RGB", (W, H), (214, 205, 170)); dd = ImageDraw.Draw(pg)
+    for i in range(24): dd.text((40, 40 + i * 30), "newspaper text line number %d here" % i, fill=(40, 40, 40))
+    dd.rectangle((400, 700, 640, 860), outline=(160, 20, 30), width=8)
+    a = np.asarray(pg).astype(np.float32) * (0.95 - 0.3 * np.mgrid[0:H, 0:W][1] / W)[..., None] + rng.normal(0, 7, (H, W, 3))
+    img = np.clip(a, 0, 255).astype(np.uint8)
+    s = core.auto_news_strength(img); assert 30 <= s <= 95
+    out = core.render(img, [], core.new_look(news=s), cache={}).astype(np.float32)
+    assert out[:20].mean() > 245, "the page must be white"
+    assert out[700:860, 400:410].reshape(-1, 3).mean(0)[0] > out[700:860, 400:410].reshape(-1, 3).mean(0)[1] + 40, "a red shape stays red"
+    weak = core.render(img, [], core.new_look(news=20), cache={}).astype(np.float32)
+    assert weak[:20].mean() <= out[:20].mean() + 1, "the slider works in both directions"
+    # text options: faint writing gets clearly stronger, the paper stays
+    ink = Image.new("L", (800, 500), 0); di = ImageDraw.Draw(ink)
+    for i in range(14): di.text((30, 20 + i * 30), "faint writing sample %d" % i, fill=255)
+    m = np.asarray(ink.filter(ImageFilter.GaussianBlur(1.5))).astype(np.float32) / 255 * 0.5
+    faint = np.clip(np.stack([230 - 150 * m] * 3, -1), 0, 255).astype(np.uint8)
+    o = core.render(faint, [], core.new_look(sharp=100, objs=100, detail=100, dark=100), cache={}).astype(np.float32).mean(2)
+    assert o[:15].mean() > 215 and o[(m > 0.15)].mean() < o[(m < 0.01)].mean() - 90, "text contrast must rise, paper must stay white"
+step("newspaper page to white + stronger text options", t_news_and_text)
+
+def t_background_cut():
+    rng = np.random.default_rng(0); W, H = 500, 250
+    ink = Image.new("L", (W, H), 0); ImageDraw.Draw(ink).line([(20, 200), (120, 40), (220, 190), (330, 60), (470, 150)], fill=255, width=5)
+    a = np.asarray(ink).astype(np.float32) / 255
+    x = np.full((H, W, 3), (226, 224, 214), np.float32) * (1 - a[..., None] * 0.9) + rng.normal(0, 14, (H, W, 3))
+    cut = core.remove_background(Image.fromarray(np.clip(x, 0, 255).astype(np.uint8)), None, 50, 30, False)
+    al = np.asarray(cut)[..., 3].astype(np.float32) / 255
+    assert (al[a < 0.01] > 0.1).mean() < 0.01, "paper noise must not stay"
+    assert al[a > 0.9].mean() > 0.9, "the writing must stay"
+step("background cut: noisy paper gives no specks", t_background_cut)
+
+def t_save_helpers():
+    import tempfile
+    dd = tempfile.mkdtemp(); fp = os.path.join(dd, "x.jpg"); Image.new("RGB", (40, 30), (10, 200, 30)).save(fp)
+    bk = core.backup_original(fp, "t1"); core.write_replacing(Image.new("RGB", (40, 30), (200, 10, 30)), fp)
+    assert Image.open(fp).getpixel((3, 3))[0] > 150 and Image.open(bk).getpixel((3, 3))[1] > 150
+    assert not [n for n in os.listdir(dd) if n.startswith(".~")]
+    core.purge_dir(core.ORIG_DIR)
+step("save replaces the original through a temporary file, a backup is kept", t_save_helpers)
+
+def t_incoming_routing():
+    w = _window_with(2)
+    c = w.carousel.cards[0]
+    w.carousel.go_to(0, animate=False); _pump(lambda: c._loaded)
+    q = d + "/ov.png"; Image.new("RGB", (60, 40), (20, 20, 120)).save(q)
+    c.tabGroup.button(0).click()                                   # Adjust tab: a new picture arrives -> a new main picture
+    n0 = len(w.carousel.cards); w._incoming([q], "phone"); _pump(lambda: not w._adding and len(w.carousel.cards) == n0 + 1)
+    assert len(w.carousel.cards) == n0 + 1 and w.carousel.cards[-1].origin == "phone" and not w.carousel.cards[-1].can_replace()
+    c.tabGroup.button(3).click()                                   # Picture tab: it becomes an overlay on this page
+    w._incoming([q], "file"); _pump(lambda: len(c.layers) == 1 and not w.runner.busy)
+    assert len(c.layers) == 1 and len(w.carousel.cards) == n0 + 1, "overlay, not a new picture"
+step("incoming pictures: overlay in the Picture tab, main picture elsewhere", t_incoming_routing)
+
 print("\nFAILED:" if steps else "\nALL OK", steps, flush=True)
 sys.exit(1 if steps else 0)

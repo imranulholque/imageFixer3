@@ -1,11 +1,12 @@
-"""'Add from phone' window: Same Wi-Fi / Internet tabs, QR code, link + Copy, status, folder for received files."""
+"""'Add from phone' DROPDOWN under the button (not a separate window): Same Wi-Fi / Internet tabs, QR code, link + Copy,
+status, folder for received files."""
 import os
 
 import segno
-from PySide6.QtCore import Qt, QTimer, QUrl
+from PySide6.QtCore import QEvent, QPoint, Qt, QTimer, QUrl
 from PySide6.QtGui import QColor, QIntValidator, QDesktopServices, QGuiApplication, QPainter, QPixmap
-from PySide6.QtWidgets import (QButtonGroup, QDialog, QFileDialog, QFrame, QHBoxLayout, QLabel, QPushButton,
-                               QLineEdit, QStackedWidget, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QButtonGroup, QFileDialog, QFrame, QGraphicsDropShadowEffect, QHBoxLayout, QLabel,
+                               QPushButton, QLineEdit, QStackedWidget, QVBoxLayout, QWidget)
 
 import phone
 from theme import logo_pixmap
@@ -90,14 +91,22 @@ class _Pane(QWidget):
         self.btnCopy.setEnabled(bool(url))
 
 
-class PhoneDialog(QDialog):
+class PhoneDialog(QFrame):
+    """A panel that drops down under the 'Add from phone' button, inside the main window."""
+
     def __init__(self, win):
         super().__init__(win)
         self.win = win
-        self.setWindowTitle("Add from phone")
-        self.setModal(False)
-        self.setMinimumSize(800, 620)
-        self.resize(820, 640)
+        self.setObjectName("phonePanel")
+        self.setStyleSheet("QFrame#phonePanel { background: #12161d; border: 1px solid #343c52; border-radius: 16px; }")
+        self.setAutoFillBackground(False)
+        sh = QGraphicsDropShadowEffect(self)
+        sh.setBlurRadius(38)
+        sh.setOffset(0, 10)
+        sh.setColor(QColor(0, 0, 0, 170))
+        self.setGraphicsEffect(sh)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.hide()
         self._url = None
         self._net_url = None
         root = QVBoxLayout(self)
@@ -124,6 +133,12 @@ class PhoneDialog(QDialog):
         self.lblRun = QLabel("Starting")
         head.addWidget(self.dot)
         head.addWidget(self.lblRun)
+        self.btnClose = QPushButton("\u2715")
+        self.btnClose.setFixedSize(34, 30)
+        self.btnClose.setToolTip("Close (the phone stays connected)")
+        self.btnClose.clicked.connect(self.close_panel)
+        head.addSpacing(8)
+        head.addWidget(self.btnClose)
         root.addLayout(head)
 
         # ---- card with tabs
@@ -265,11 +280,56 @@ class PhoneDialog(QDialog):
         self.btnStop.style().polish(self.btnStop)
 
     def show_front(self):
+        """The button: opens the panel, or closes it when it is open already."""
+        if self.isVisible():
+            self.close_panel()
+            return
         self._start()
+        self.reposition()
         self.show()
         self.raise_()
-        self.activateWindow()
+        self.setFocus()
         self.timer.start()
+        QApplication.instance().installEventFilter(self)
+
+    def reposition(self):
+        w = self.win
+        btn = w.btnPhone
+        pw = int(max(560, min(800, w.width() - 24)))
+        ph = int(max(420, min(self.sizeHint().height(), w.height() - 70)))
+        self.resize(pw, ph)
+        p = btn.mapTo(w, QPoint(0, btn.height() + 8))
+        x = int(min(max(10, p.x()), max(10, w.width() - pw - 10)))
+        self.move(x, int(p.y()))
+
+    def close_panel(self):
+        QApplication.instance().removeEventFilter(self)
+        self._stop_net()           # the internet link only lives while the panel is open
+        self.tabGroup.button(0).setChecked(True)
+        self.stack.setCurrentIndex(0)
+        self.timer.stop()          # the local connection stays open: pictures can still arrive
+        self.hide()
+
+    def eventFilter(self, obj, e):
+        """Click anywhere else in the window (not on the panel, not on the button) = the dropdown closes."""
+        if self.isVisible() and e.type() == QEvent.Type.MouseButtonPress:
+            try:
+                if obj.window() is self.win:
+                    gp = e.globalPosition().toPoint()
+                    on_panel = self.rect().contains(self.mapFromGlobal(gp))
+                    btn = self.win.btnPhone
+                    on_btn = btn.rect().contains(btn.mapFromGlobal(gp))
+                    if not on_panel and not on_btn:
+                        self.close_panel()
+            except Exception:
+                pass
+        return False
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key.Key_Escape:
+            self.close_panel()
+            return
+        super().keyPressEvent(e)
 
     def _start(self, new_token=False):
         import phone as _p
@@ -408,14 +468,3 @@ class PhoneDialog(QDialog):
         self._stop_net()
         self.lblNet.setText(msg)
         self.btnNet.show()
-
-    def closeEvent(self, e):
-        self._stop_net()           # the internet link only lives while this window is open
-        self.tabGroup.button(0).setChecked(True)
-        self.stack.setCurrentIndex(0)
-        self.timer.stop()          # the local connection stays open: pictures can still arrive
-        super().closeEvent(e)
-
-    def hideEvent(self, e):
-        self.timer.stop()
-        super().hideEvent(e)

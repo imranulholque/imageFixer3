@@ -8,14 +8,15 @@ from PySide6.QtCore import (QEasingCurve, QEvent, QItemSelectionModel, QObject, 
                             QUrl, QVariantAnimation, Signal)
 from PySide6.QtCore import QMimeData
 from PySide6.QtGui import (QAction, QActionGroup, QColor, QDesktopServices, QDrag, QFontMetrics, QIcon, QImage,
-                           QKeySequence, QPainter, QPixmap, QShortcut)
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel,
+                           QKeySequence, QPainter, QPixmap, QShortcut, QTransform)
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QDialog, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel,
                                QListView, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QProgressBar,
                                QPushButton, QSizePolicy, QStackedLayout, QSystemTrayIcon, QVBoxLayout, QWidget)
 
 import core
 import winutil
 from card import EXPORT_DIR, Card
+from savedlg import SaveAllDialog
 from jobs import JobRunner
 from theme import logo_pixmap, make_icon, scaled_qss
 
@@ -369,6 +370,10 @@ class MainWindow(QMainWindow):
         geo = scr.availableGeometry() if scr is not None else QRect(0, 0, 1366, 768)
         self._screen_long = max(geo.width(), geo.height()) * (scr.devicePixelRatio() if scr is not None else 1.0)
         self._ui_scale = 1.0
+        core.purge_dir(EXPORT_DIR, older_than=6 * 3600)         # leftovers of an earlier run
+        core.purge_dir(core.ORIG_DIR, older_than=6 * 3600)
+        self._replace_ok = False                   # 'Save replaces the original' was confirmed in this session
+        self._origin = {}                          # path -> 'phone' / 'paste' for pictures that have no file of their own
         self._add_queue = []                       # pictures waiting to get their card (added in small slices)
         self._add_total = 0
         self._add_done = 0
@@ -648,6 +653,7 @@ class MainWindow(QMainWindow):
         sc("Shift+R", lambda: self._with_current(lambda c: c.rotate_key(90.0)))   # 90° left
         sc("Ctrl+V", self.paste)
         sc("Ctrl+C", cur(lambda c: self.copy_cards([c])))
+        sc("Ctrl+P", cur(lambda c: self.print_cards([c])))
         sc("Ctrl+O", self.choose_files)
         sc("Ctrl+S", cur(self.save_card))
         sc("Ctrl+Shift+S", self.save_all)
@@ -717,6 +723,8 @@ class MainWindow(QMainWindow):
         self.btnPhone.setText("Add from phone" if w >= 1000 else "Phone")
         self.btnChoose.setText("+  Choose files" if w >= 900 else "+  Files")
         self._refresh_dir()
+        if self._phone_dlg is not None and self._phone_dlg.isVisible():
+            self._phone_dlg.reposition()
         px = int(round((56 if h < 720 else 64 if h < 1000 else 80) * self._ui_scale))
         if px != self._thumb_px:
             self._thumb_px = px
@@ -792,6 +800,10 @@ class MainWindow(QMainWindow):
             if ans != QMessageBox.StandardButton.Yes:
                 return
         self.quitting = True
+        for c in list(self.carousel.cards):                    # the temporary copies (edited files for drag / copy / print) go away
+            c.dispose()
+        core.purge_dir(EXPORT_DIR)
+        core.purge_dir(core.ORIG_DIR)
         if self.phone_tunnel is not None:
             self.phone_tunnel.stop()
         if self.phone is not None:
@@ -811,7 +823,7 @@ class MainWindow(QMainWindow):
         md = e.mimeData()
         paths = [u.toLocalFile() for u in md.urls() if u.isLocalFile()] if md.hasUrls() else []
         if paths:
-            self.add_files(paths)
+            self._incoming(paths, "file")
         elif md.hasImage():
             self._add_qimage(md.imageData())
         e.acceptProposedAction()
@@ -824,7 +836,7 @@ class MainWindow(QMainWindow):
         if md.hasUrls():
             paths = [u.toLocalFile() for u in md.urls() if u.isLocalFile()]
             if paths:
-                self.add_files(paths)
+                self._incoming(paths, "file")
                 return
         if md.hasImage():
             self._add_qimage(cb.image())
@@ -837,7 +849,7 @@ class MainWindow(QMainWindow):
         self._paste_n += 1
         p = os.path.join(self.tmp, "pasted_%s_%d.png" % (time.strftime("%H%M%S"), self._paste_n))
         if img.save(p, "PNG"):
-            self.add_files([p])
+            self._incoming([p], "paste")
 
     def choose_files(self):
         start = self.settings.value("last_dir", "", type=str)
@@ -912,10 +924,12 @@ class MainWindow(QMainWindow):
 
     def _add_one(self, path):
         c = Card(path)
+        c.origin = self._origin.pop(path, "paste" if path.startswith(self.tmp) else "file")
         c.runner = self.runner
         c.editedChanged.connect(self._card_edited)
         c.removeRequested.connect(self.remove_card)
         c.copyRequested.connect(lambda card: self.copy_cards([card]))
+        c.printRequested.connect(lambda card: self.print_cards([card]))
         c.saveRequested.connect(self.save_card)
         c.saveAsRequested.connect(self.save_card_as)
         c.saveAllRequested.connect(self.save_all)
@@ -1045,6 +1059,47 @@ class MainWindow(QMainWindow):
         md.setUrls(urls)
         return md
 
+    # ------------------------------------------------------------ print (with all edits; nothing is saved)
+    def print_cards(self, cards):
+        cards = [c for c in cards if c is not None]
+        if not cards or self._busy():
+            return
+        try:
+            from PySide6.QtPrintSupport import QPrintDialog, QPrinter
+        except ImportError:
+            self.say("Printing is not available on this computer.")
+            return
+        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+        dlg = QPrintDialog(printer, self)
+        dlg.setWindowTitle("Print " + (cards[0].name if len(cards) == 1 else "%d pictures" % len(cards)))
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        sources = [c.render_source() for c in cards]
+
+        def work(progress):
+            out = []
+            for i, src in enumerate(sources):
+                progress(i / len(sources), "%d / %d" % (i + 1, len(sources)))
+                im = src().convert("RGB")
+                out.append((im.width, im.height, im.tobytes()))
+            return out
+
+        def done(pages):
+            p = QPainter(printer)
+            for i, (w, h, data) in enumerate(pages):
+                if i:
+                    printer.newPage()
+                img = QImage(data, w, h, 3 * w, QImage.Format.Format_RGB888)
+                area = p.viewport()
+                if (w > h) != (area.width() > area.height()):            # a wide picture on a tall page: turn it
+                    img = img.transformed(QTransform().rotate(90))
+                s = min(area.width() / img.width(), area.height() / img.height())
+                tw, th = int(img.width() * s), int(img.height() * s)
+                p.drawImage(QRect(area.x() + (area.width() - tw) // 2, area.y() + (area.height() - th) // 2, tw, th), img)
+            p.end()
+            self.say("Sent to the printer.")
+        self.runner.run("Preparing the print", work, done, lambda msg: self.say("Could not print: " + msg.splitlines()[0]))
+
     # ------------------------------------------------------------ copy (one or many pictures)
     def copy_by_uids(self, uids):
         self.copy_cards([c for c in (self._card(u) for u in uids) if c is not None])
@@ -1086,7 +1141,7 @@ class MainWindow(QMainWindow):
             QApplication.clipboard().setMimeData(md)
             for (c, p, src, stem, ext, ver), path in zip(entries, paths):
                 if p is None and not c._dead:
-                    c._export = (ver, path)
+                    c.set_export(ver, path)
             self.say("Copied %d picture(s). Paste them anywhere with Ctrl+V." % len(paths))
         self.runner.run("Copying %d picture(s)" % len(entries) if len(entries) > 1 else "Copying " + cards[0].name,
                         work, done, lambda msg: self.say("Could not copy: " + msg.splitlines()[0]))
@@ -1191,93 +1246,168 @@ class MainWindow(QMainWindow):
         if d and os.path.isdir(d):
             QDesktopServices.openUrl(QUrl.fromLocalFile(d))
 
-    def _need_dir(self):
+    def _need_dir(self, why=""):
+        """The remembered save folder; asked for (and remembered) when there is none yet."""
         d = self._dir()
         if d and os.path.isdir(d):
             return d
+        if why:
+            QMessageBox.information(self, "Save folder", why)
         return self.choose_dir() or None
 
     def _fail_box(self, title):
         return lambda msg: QMessageBox.warning(self, title, "Could not save:\n%s" % msg.splitlines()[0])
 
-    def _save_job(self, card, path):
-        """Render + write in a worker thread (progress bar); PDF is chosen by the file name."""
-        src = card.render_source()
-        mode = self._pdf_mode() if path.lower().endswith(".pdf") else None
-        if path.lower().endswith(".pdf") and mode is None:
-            return
+    # ------------------------------------------------------------ saving, like Photoshop
+    #   Save        = the picture replaces its original file.  A picture that has no file of its own (phone, clipboard)
+    #                 goes to the remembered save folder (asked once, then used every time until it is changed).
+    #   Save as     = choose folder, name and format (JPG / PNG / PDF); that folder is remembered.
+    #   Save all    = replace the originals, or a folder (choose / remembered).
+    BASIC = (".jpg", ".jpeg", ".png")
 
-        def work(progress):
-            progress(0.1, "rendering")
-            img = src()
-            progress(0.7, "writing")
-            if mode is not None:
-                core.save_pdf([img], path, mode)
-            else:
-                core.save_image(img, path)
-            return path
+    def _basic_ext(self, card):
+        e = os.path.splitext(card.name)[1].lower()
+        return ".jpg" if e in (".jpg", ".jpeg") else ".png"
 
-        def done(p):
-            card.mark_saved(p)
-            self.say("Saved: " + p)
-        self.runner.run("Saving " + card.name, work, done, self._fail_box("Save"))
+    def _folder_path(self, card, folder, fmt="same", taken=None):
+        stem = os.path.splitext(card.name)[0] + ("_edited" if card.origin == "file" else "")
+        ext = self._basic_ext(card) if fmt == "same" else "." + fmt
+        p = core.unique_path(folder, stem, ext)
+        n = 2
+        while taken is not None and p in taken:
+            p = os.path.join(folder, "%s (%d)%s" % (stem, n, ext))
+            n += 1
+        if taken is not None:
+            taken.add(p)
+        return p
 
-    def save_card(self, card):
-        d = self._need_dir()
-        if not d:
-            return
-        stem, ext = card.out_name()
-        self._save_job(card, core.unique_path(d, stem, ext))
+    def _confirm_replace(self, n):
+        if not self.settings.value("confirm_replace", True, type=bool) or self._replace_ok:
+            return True
+        box = QMessageBox(self)
+        box.setWindowTitle("Save")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText("Save replaces the original file%s with the edited picture.\nUse 'Save as' to keep the original." %
+                    ("" if n == 1 else "s (%d pictures)" % n))
+        chk = QCheckBox("Do not ask again")
+        box.setCheckBox(chk)
+        box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        box.button(QMessageBox.StandardButton.Yes).setText("Replace")
+        box.button(QMessageBox.StandardButton.No).setText("Cancel")
+        if box.exec() != QMessageBox.StandardButton.Yes:
+            return False
+        self._replace_ok = True
+        if chk.isChecked():
+            self.settings.setValue("confirm_replace", False)
+        return True
 
-    def save_card_as(self, card):
-        stem, ext = card.out_name()
-        start = os.path.join(self._dir() or os.path.dirname(card.path), stem + ext)
-        path, _ = QFileDialog.getSaveFileName(self, "Save as", start,
-                                              "Pictures (*.jpg *.png *.webp *.bmp *.tif);;PDF document (*.pdf);;All files (*)")
-        if not path:
-            return
-        if not os.path.splitext(path)[1]:
-            path += ext
-        self._save_job(card, path)
-
-    def save_all(self):
-        todo = [c for c in self.carousel.cards if c.is_unsaved()]
-        if not todo:
-            self.say("Nothing to save: no edited picture.")
-            return
-        d = self._need_dir()
-        if not d:
-            return
-        jobs, used = [], set()
-        for c in todo:
-            stem, ext = c.out_name()
-            p = core.unique_path(d, stem, ext)
-            n = 2
-            while p in used:
-                p = os.path.join(d, "%s (%d)%s" % (stem, n, ext))
-                n += 1
-            used.add(p)
-            jobs.append((c, p, c.render_source()))
+    def _write_job(self, entries, label):
+        """entries = [(card, path, replace)].  Rendering and writing happen in a worker thread; a replaced original is
+        first copied to a temporary place (Reset / Compare still show it) and written through a temporary file."""
+        pdf_mode = None
+        if any(p.lower().endswith(".pdf") for _c, p, _r in entries):
+            pdf_mode = self._pdf_mode()
+            if pdf_mode is None:
+                return
+        jobs = [(c, p, r, c.render_source(), c.uid) for c, p, r in entries]
 
         def work(progress):
             ok, failed = [], []
-            for i, (c, p, src) in enumerate(jobs):
+            for i, (c, p, rep, src, uid) in enumerate(jobs):
                 progress(i / len(jobs), "%d / %d" % (i + 1, len(jobs)))
                 try:
-                    core.save_image(src(), p)
-                    ok.append((c, p))
+                    bk = core.backup_original(p, uid) if rep else None
+                    img = src()
+                    if p.lower().endswith(".pdf"):
+                        core.save_pdf([img], p, pdf_mode)
+                    elif rep:
+                        core.write_replacing(img, p)
+                    else:
+                        core.save_image(img, p)
+                    ok.append((c, p, bk))
                 except Exception as ex:
                     failed.append("%s: %s" % (c.name, ex))
             return ok, failed
 
         def done(r):
             ok, failed = r
-            for c, p in ok:
+            for c, p, bk in ok:
+                if bk:
+                    c.orig_path = c.orig_path or bk
                 c.mark_saved(p)
-            self.say("Saved %d picture(s) in %s" % (len(ok), d))
+                it = self.items.get(c.uid)
+                if it is not None and bk:
+                    QThreadPool.globalInstance().start(ThumbJob(c.uid, p, self.thumbs))
+            if len(ok) == 1:
+                self.say(("Saved (original replaced): " if jobs[0][2] else "Saved: ") + ok[0][1])
+            elif ok:
+                self.say("Saved %d picture(s)." % len(ok))
             if failed:
-                QMessageBox.warning(self, "Save all", "Some pictures could not be saved:\n" + "\n".join(failed))
-        self.runner.run("Saving pictures", work, done, self._fail_box("Save all"))
+                QMessageBox.warning(self, "Save", "Some pictures could not be saved:\n" + "\n".join(failed))
+        self.runner.run(label, work, done, self._fail_box("Save"))
+
+    def save_card(self, card):
+        """Save (Ctrl+S)."""
+        if self._busy():
+            return
+        if card.can_replace():
+            if self._confirm_replace(1):
+                self._write_job([(card, card.path, True)], "Saving " + card.name)
+            return
+        d = self._need_dir("This picture came from the phone or the clipboard, so there is no original file to replace.\n\n"
+                           "Choose the folder where such pictures are saved. It is remembered and used every time\n"
+                           "(change it with 'Save as...' or the folder button at the top).")
+        if d:
+            self._write_job([(card, self._folder_path(card, d), False)], "Saving " + card.name)
+
+    def save_card_as(self, card):
+        """Save as...: folder, name and format (JPG, PNG, PDF) are chosen; the folder is remembered."""
+        if self._busy():
+            return
+        ext = self._basic_ext(card)
+        start_dir = self._dir() if (card.origin != "file" or not os.path.isdir(os.path.dirname(card.path))) else os.path.dirname(card.path)
+        start = os.path.join(start_dir or os.path.expanduser("~"), os.path.splitext(card.name)[0] + ext)
+        filters = "JPG picture (*.jpg);;PNG picture (*.png);;PDF document (*.pdf)"
+        sel = "JPG picture (*.jpg)" if ext == ".jpg" else "PNG picture (*.png)"
+        path, flt = QFileDialog.getSaveFileName(self, "Save as", start, filters, sel)
+        if not path:
+            return
+        want = ".pdf" if "pdf" in flt.lower() else (".jpg" if "jpg" in flt.lower() else ".png")
+        cur = os.path.splitext(path)[1].lower()
+        if cur not in self.BASIC + (".pdf",):
+            path = os.path.splitext(path)[0] + want
+        self.settings.setValue("save_dir", os.path.dirname(path))
+        self._refresh_dir()
+        same = os.path.abspath(path) == os.path.abspath(card.path) and card.can_replace()
+        self._write_job([(card, path, same)], "Saving " + os.path.basename(path))
+
+    def save_all(self):
+        """Save all: replace the originals or a folder - chosen in the dialog, remembered."""
+        if self._busy():
+            return
+        todo = [c for c in self.carousel.cards if c.is_unsaved()]
+        if not todo:
+            self.say("Nothing to save: no edited picture.")
+            return
+        n_rep = sum(1 for c in todo if c.can_replace())
+        dlg = SaveAllDialog(self, len(todo), n_rep, self._dir(), self.settings.value("saveall_mode", "replace", type=str))
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        r = dlg.result_values()
+        self.settings.setValue("saveall_mode", r["mode"])
+        folder = r["folder"]
+        if folder and r["remember"]:
+            self.settings.setValue("save_dir", folder)
+            self._refresh_dir()
+        if r["mode"] == "replace" and not self._confirm_replace(n_rep):
+            return
+        taken, entries = set(), []
+        for c in todo:
+            if r["mode"] == "replace" and c.can_replace():
+                entries.append((c, c.path, True))
+            else:
+                entries.append((c, self._folder_path(c, folder, r["fmt"] if r["mode"] == "folder" else "same", taken), False))
+        self._write_job(entries, "Saving %d pictures" % len(entries))
 
     def _pdf_mode(self):
         items = ["Same shape as the picture (nothing cut or padded)", "A4 paper (turned to fit each picture)",
@@ -1328,8 +1458,26 @@ class MainWindow(QMainWindow):
 
     def phone_received(self, paths):
         self.show_front()
-        self.add_files(paths)
-        self.say("Received %d picture(s) from the phone." % len(paths))
+        n = self._incoming(paths, "phone")
+        if n < 0:
+            self.say("Received %d picture(s) from the phone (added as overlay pictures)." % len(paths))
+        else:
+            self.say("Received %d picture(s) from the phone." % len(paths))
+
+    def _incoming(self, paths, origin):
+        """Something arrives (drag, paste, phone / QR): while the PICTURE tab is open it becomes an overlay picture on the
+        current page (signature, stamp ...); in any other tab it is a new main picture.  Returns -1 for overlays."""
+        files = [p for p in self._expand(paths)]
+        c = self.carousel.current()
+        if files and c is not None and c.picture_tab_active() and not self.runner.heavy_busy:
+            for p in files:
+                c.add_picture(p)
+            self.say("Added %d picture(s) as overlay on this page." % len(files))
+            return -1
+        for p in files:
+            self._origin[p] = origin
+        self.add_files(files)
+        return len(files)
 
     # ------------------------------------------------------------- settings
     def _toggle_autostart(self, on):

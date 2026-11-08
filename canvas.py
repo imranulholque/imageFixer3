@@ -1,5 +1,6 @@
 """The picture area: zoom, pan, eyedropper, rectangle crop and 4-point (perspective) crop."""
 import math
+import time
 
 import numpy as np
 from PySide6.QtCore import QPointF, QRect, QRectF, Qt, QTimer, Signal
@@ -285,7 +286,9 @@ class ImageCanvas(QWidget):
         self.update()
 
     # ------------------------------------------------------------ transform
-    # The transformed part is a net of points: 2x2 (the four corners) or, for Warp, 4x4.
+    # The transformed part is a net of points: 2x2 (the four corners) or, for Warp, 5x5 (corners, the middle of every
+    # side AND the middle of the picture, so the middle can be bent too).
+    WARP_N = 4
     def start_transform(self, img, x0, y0):
         """img = QImage (RGBA) of the selected pixels, placed at (x0, y0) in preview pixels."""
         w, h = img.width(), img.height()
@@ -300,7 +303,7 @@ class ImageCanvas(QWidget):
     def start_layer_transform(self, img, pts, n):
         """Move / resize / rotate / bend a picture layer: img = QImage (RGBA), pts = its net in preview pixels."""
         self._tf = {"img": img, "w": float(img.width()), "h": float(img.height()), "n": n,
-                    "mode": "warp" if n == 3 else "free", "layer": True, "pts": [QPointF(x, y) for x, y in pts]}
+                    "mode": "warp" if n > 1 else "free", "layer": True, "pts": [QPointF(x, y) for x, y in pts]}
         self._tf_drag = None
         self.mode = self.TRANSFORM
         self._update_cursor()
@@ -358,24 +361,57 @@ class ImageCanvas(QWidget):
         c = self._corners()
         return QPointF(sum(q.x() for q in c) / 4.0, sum(q.y() for q in c) / 4.0)
 
+    def in_transform(self):
+        return self.mode == self.TRANSFORM and self._tf is not None
+
+    def _tf_push(self, coalesce=0.0):
+        """Remember the net of points so Undo can go back step by step (coalesce: merge quick repeated changes)."""
+        t = self._tf
+        if t is None:
+            return
+        now = time.monotonic()
+        if coalesce and now - t.get("hist_t", 0.0) < coalesce:
+            t["hist_t"] = now
+            return
+        t["hist_t"] = now
+        h = t.setdefault("hist", [])
+        h.append(([QPointF(p) for p in t["pts"]], t["n"], t["mode"]))
+        del h[:-80]
+
+    def tf_undo(self):
+        """One step back inside the running transform.  False = nothing left (the caller cancels the transform)."""
+        t = self._tf
+        if t is None or not t.get("hist"):
+            return False
+        pts, n, mode = t["hist"].pop()
+        t["pts"], t["n"], t["mode"] = pts, n, mode
+        self.update()
+        return True
+
+    def tf_mode_name(self):
+        return None if self._tf is None else self._tf["mode"]
+
     def set_tf_mode(self, m):
         """'free' | 'skew' | 'distort' | 'perspective' | 'warp'"""
         t = self._tf
         if t is None:
             return
+        if t["mode"] != m:
+            self._tf_push()
         t["mode"] = m
         c = self._corners()
         if m == "warp" and t["n"] == 1:
             pts = []
-            for i in range(4):
-                v = i / 3.0
+            N = self.WARP_N
+            for i in range(N + 1):
+                v = i / float(N)
                 l = QPointF(c[0].x() * (1 - v) + c[3].x() * v, c[0].y() * (1 - v) + c[3].y() * v)
                 r = QPointF(c[1].x() * (1 - v) + c[2].x() * v, c[1].y() * (1 - v) + c[2].y() * v)
-                for j in range(4):
-                    u = j / 3.0
+                for j in range(N + 1):
+                    u = j / float(N)
                     pts.append(QPointF(l.x() * (1 - u) + r.x() * u, l.y() * (1 - u) + r.y() * u))
-            t["pts"], t["n"] = pts, 3
-        elif m != "warp" and t["n"] == 3:
+            t["pts"], t["n"] = pts, N
+        elif m != "warp" and t["n"] > 1:
             self._set_corners(c)
         self.update()
 
@@ -383,6 +419,7 @@ class ImageCanvas(QWidget):
         t = self._tf
         if t is None:
             return
+        self._tf_push()
         c = self._tf_center()
         a = math.radians(deg)
         ca, sa = math.cos(a), math.sin(a)
@@ -394,6 +431,7 @@ class ImageCanvas(QWidget):
         t = self._tf
         if t is None:
             return
+        self._tf_push()
         n, c = t["n"], self._tf_center()
         old = t["pts"]
         new = []
@@ -409,6 +447,7 @@ class ImageCanvas(QWidget):
         t = self._tf
         if t is None:
             return
+        self._tf_push(coalesce=0.6)
         t["pts"] = [QPointF(p.x() + dx, p.y() + dy) for p in t["pts"]]
         self.update()
 
@@ -949,6 +988,7 @@ class ImageCanvas(QWidget):
             if hit == "outside":
                 self.layerOutside.emit(ip.x(), ip.y())
                 return
+            self._tf_push()
             self._tf_drag = self._tf_start(hit, ip)
             return
         if self.mode == self.PICK:

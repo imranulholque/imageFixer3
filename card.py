@@ -11,13 +11,13 @@ import numpy as np
 from PIL import Image, ImageChops, ImageFilter, ImageOps
 from PySide6.QtCore import QMimeData, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QDrag, QImage, QPixmap
-from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QColorDialog, QFileDialog, QFrame, QHBoxLayout, QLabel, QMenu,
+from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QColorDialog, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QMenu,
                                QPushButton, QScrollArea, QSizePolicy, QSlider, QStackedWidget, QToolButton,
                                QVBoxLayout, QWidget)
 
 import core
 from canvas import ImageCanvas, np_to_qimage
-from compare import CompareDialog
+from compare import CompareOverlay
 from flow import ElidedLabel, FlowLayout
 from jobs import _log, run_background
 
@@ -26,7 +26,7 @@ EXPORT_DIR = os.path.join(tempfile.gettempdir(), "imagefixer_export")
 # tool key -> (canvas mode, shape)
 TOOL_MODE = {
     "view": (ImageCanvas.VIEW, None), "pick": (ImageCanvas.PICK, None),
-    "quick": (ImageCanvas.SELECT, "quick"), "brush": (ImageCanvas.SELECT, "brush"),
+    "quick": (ImageCanvas.SELECT, "quick"), "brush": (ImageCanvas.SELECT, "brush"), "deselect": (ImageCanvas.SELECT, "brush"),
     "rect": (ImageCanvas.SELECT, "rect"), "ellipse": (ImageCanvas.SELECT, "ellipse"),
     "lasso": (ImageCanvas.SELECT, "lasso"), "color": (ImageCanvas.SELECT, "color"),
     "move": (ImageCanvas.MOVESEL, None), "copy": (ImageCanvas.MOVESEL, None),
@@ -36,12 +36,12 @@ TOOL_MODE = {
     "erase_brush": (ImageCanvas.ERASE, "brush"), "erase_rect": (ImageCanvas.ERASE, "rect"),
     "erase_ellipse": (ImageCanvas.ERASE, "ellipse"), "erase_lasso": (ImageCanvas.ERASE, "lasso"),
 }
-SELECT_KEYS = ("quick", "brush", "rect", "ellipse", "lasso", "color")
+SELECT_KEYS = ("quick", "brush", "rect", "ellipse", "lasso", "color", "deselect")
 MOVE_KEYS = ("move", "copy", "transform")
 ERASE_KEYS = ("erase_brush", "erase_rect", "erase_ellipse", "erase_lasso")
 CROP_KEYS = ("crop", "persp", "crop_circle", "crop_oval", "crop_round")
 CROP_SHAPE = {"crop_circle": "circle", "crop_oval": "oval", "crop_round": "round"}     # canvas shape of the crop box
-NAMES = {"quick": "Quick select", "brush": "Brush select", "rect": "Box", "ellipse": "Ellipse", "lasso": "Freehand",
+NAMES = {"quick": "Quick select", "brush": "Brush select", "deselect": "Deselect brush", "rect": "Box", "ellipse": "Ellipse", "lasso": "Freehand",
          "color": "Color range", "move": "Move", "copy": "Copy", "transform": "Transform",
          "erase_brush": "Brush", "erase_rect": "Box", "erase_ellipse": "Ellipse", "erase_lasso": "Freehand",
          "crop": "Crop", "persp": "Straighten", "crop_circle": "Circle", "crop_oval": "Oval", "crop_round": "Rounded box"}
@@ -50,10 +50,13 @@ HINTS = {
     "pick": "Click a color in the picture (ink, stamp, text): its slider appears in the Adjust tab.",
     "quick": "Brush over an object: the selection grows to its edges.  Shift = add,  Alt = subtract.",
     "brush": "Paint the area to select.  Shift = add,  Alt = subtract.",
+    "deselect": "Paint over a part that was selected by mistake: it is taken out of the selection, but only what looks like "
+                "what you paint over - the edge stays exact.  (Tolerance = how alike.  'Snap' off = plain eraser.)",
     "rect": "Drag a box.  Shift = add,  Alt = subtract.",
     "ellipse": "Drag an ellipse.  Shift = add,  Alt = subtract.",
     "lasso": "Draw freely around an area like with a pen. When you let go it closes by itself.  Shift = add,  Alt = subtract.",
-    "color": "Click a color: every place with that color is selected (Tolerance = how wide).",
+    "color": "Click a color: every place with that color is selected.  Fuzziness = how wide (move it after the click, it updates).  "
+             "Shift+click = add a color,  Alt+click = take a color out.  The clicked color also becomes the fill color.",
     "move": "Drag inside the selection to move it (old place is filled from around).  Alt + drag = copy.",
     "copy": "Drag the selection: a copy is placed there, the original stays.",
     "transform": "Scale / Rotate, Skew, Distort, Perspective, Warp (buttons).  Drag inside = move, round handle = rotate.  Keys: [ ] rotate 1°, Ctrl+[ ] 15°, arrows move.  "
@@ -526,6 +529,7 @@ class Card(QWidget):
     editedChanged = Signal(object)
     removeRequested = Signal(object)
     copyRequested = Signal(object)
+    printRequested = Signal(object)
     saveRequested = Signal(object)
     saveAsRequested = Signal(object)
     saveAllRequested = Signal()
@@ -571,6 +575,11 @@ class Card(QWidget):
         self.shadow_src = None                     # picture before shadow removal: lets the shadow options be changed later
         self.last_action = None                    # the last setting changed: what 'apply to all' copies
         self.keep_ink = True
+        self._cr = None                            # the last Color range click (so Fuzziness can redo it)
+        self._cr_timer = QTimer(self)
+        self._cr_timer.setSingleShot(True)
+        self._cr_timer.setInterval(70)
+        self._cr_timer.timeout.connect(self._recompute_color_range)
         self._pending = None
         self._auto_back = False                    # a picture was opened only to crop it: go back to the page afterwards
         self._focus_id = None
@@ -586,6 +595,8 @@ class Card(QWidget):
         self._loaded = False
         self._failed = False
         self._loading = False
+        self.origin = "file"                      # 'file' = opened from the disk, 'phone' / 'paste' = has no file of its own to replace
+        self.orig_path = None                      # backup of the original file once 'Save' has replaced it
         self._orig_q = None                        # the original picture (QImage) for the comparison, made once
         self._dead = False                         # removed from the window: late results of background work are dropped
         self._tool = "view"
@@ -750,15 +761,21 @@ class Card(QWidget):
         self.btnReset = QPushButton("Reset")
         self.btnReset.setToolTip("Back to the original picture")
         self.btnCompare = QPushButton("Compare")
-        self.btnCompare.setToolTip("See the original and the edited picture together (slider or side by side)")
+        self.btnCompare.setCheckable(True)
+        self.btnCompare.setToolTip("Show the original on the left and the edited picture on the right, in the picture itself.\n"
+                                   "Click again to switch it off.")
         self.btnCompare.hide()                      # only a picture that was changed has something to compare
+        self.btnCmpMode = QPushButton("Slider")
+        self.btnCmpMode.setToolTip("Slider (drag the line)  /  Side by side")
+        self.btnCmpMode.hide()
+        self._cmp = None                            # the overlay while comparing
         self.btnRemove = QPushButton("Remove")
         self.btnRemove.setProperty("danger", True)
         r1.addWidget(self.lblName)
         r1.addWidget(self.lblInfo)
         r1.addWidget(self.lblState)
         r1.addStretch(1)
-        for b in (self.btnCompare, self.btnUndo, self.btnRedo, self.btnReset, self.btnRemove):
+        for b in (self.btnCompare, self.btnCmpMode, self.btnUndo, self.btnRedo, self.btnReset, self.btnRemove):
             r1.addWidget(b)
         root.addLayout(r1)
 
@@ -776,6 +793,7 @@ class Card(QWidget):
             ("Brush select      B", lambda: T("brush")),
             ("Box      M", lambda: T("rect")), ("Ellipse", lambda: T("ellipse")),
             ("Freehand (draw around)      L", lambda: T("lasso")), ("Color range  (click a color)      W", lambda: T("color")),
+            ("Deselect brush  (take parts out, accurate)      Shift+D", lambda: T("deselect")),
             None, ("Select all      Ctrl+A", self.select_all), ("Deselect      Ctrl+D", self.deselect),
             ("Inverse      Ctrl+Shift+I", self.invert_selection)], "Ways to select a part of the picture")
         self.menuMove = self._menu_button("Move", [
@@ -851,7 +869,7 @@ class Card(QWidget):
                                ("skew", "Skew", "Slide a side along itself to slant the part"),
                                ("distort", "Distort", "Drag any corner or side anywhere - makes a crooked part straight"),
                                ("perspective", "Perspective", "Drag a corner: the neighbouring corners move the opposite way"),
-                               ("warp", "Warp", "A net of 16 points: pull points to bend a curved line straight")):
+                               ("warp", "Warp", "A net of 25 points (corners, middle of each side and the middle of the picture): pull points to bend it")):
             b = QPushButton(text)
             b.setCheckable(True)
             b.setToolTip(tip)
@@ -894,8 +912,30 @@ class Card(QWidget):
         self.tolSlider.setFixedWidth(130)
         self.tolSlider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.tolSlider.setToolTip("How different a color may be to still count as the same object")
-        tb.addWidget(self._label("Tolerance"))
+        self.lblTol = self._label("Tolerance")
+        self.lblTolV = self._label("28")
+        self.lblTolV.setMinimumWidth(30)
+        self._tolv, self._fuzz = 28, 50                  # tolerance (quick / deselect) and fuzziness (color range) are kept apart
+        self.chkLocal = QCheckBox("Near the click")
+        self.chkLocal.setToolTip("Color range: only the colors around the place you click (not the same color far away)")
+        self.localSlider = NoWheelSlider(Qt.Orientation.Horizontal)
+        self.localSlider.setRange(3, 80)
+        self.localSlider.setValue(22)
+        self.localSlider.setFixedWidth(90)
+        self.localSlider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.localSlider.setToolTip("How far around the click (percent of the picture)")
+        self.chkSnap = QCheckBox("Snap to edges")
+        self.chkSnap.setChecked(True)
+        self.chkSnap.setToolTip("Deselect brush: take out only what looks like what you paint over (exact edges).\nOff = a plain eraser for the selection.")
+        tb.addWidget(self.lblTol)
         tb.addWidget(self.tolSlider)
+        tb.addWidget(self.lblTolV)
+        tb.addWidget(self.chkLocal)
+        tb.addWidget(self.localSlider)
+        tb.addWidget(self.chkSnap)
+        self.tolSlider.valueChanged.connect(self._tol_changed)
+        self.chkLocal.toggled.connect(lambda _on: self._recompute_color_range())
+        self.localSlider.valueChanged.connect(lambda _v: self._recompute_color_range())
         a.addWidget(self.tolBox)
         self.btnClone = QPushButton("Clear copy spot")
         self.btnClone.setToolTip("Go back to filling from the surroundings")
@@ -980,6 +1020,7 @@ class Card(QWidget):
         self.btnRedo.clicked.connect(self.redo_step)
         self.btnReset.clicked.connect(self.reset_image)
         self.btnCompare.clicked.connect(self.compare)
+        self.btnCmpMode.clicked.connect(self._cmp_mode)
         self.btnRemove.clicked.connect(lambda: self.removeRequested.emit(self))
         self.btnSelVis.toggled.connect(self._toggle_sel_vis)
         self.colors.changed.connect(self._on_adj_changed)
@@ -991,7 +1032,7 @@ class Card(QWidget):
         self.exportReady.connect(self._on_export_ready)
         self._tool_widgets = [self.btnHand, self.btnPick, self.btnApply, self.btnCancel, self.btnSelAll,
                               self.btnDeselect, self.btnInvert, self.btnGrow, self.btnShrink, self.btnSave,
-                              self.btnSaveAs, self.btnPdfAll, self.btnApplyAll, self.btnCopy, self.btnDrag,
+                              self.btnSaveAs, self.btnPdfAll, self.btnPrint, self.btnApplyAll, self.btnCopy, self.btnDrag,
                               self.btnShadow, self.btnFill, self.btnDelete, self.btnPickFill] \
             + list(self.menus.values()) + self.modeBtns
         self._enable_tools(False)
@@ -1052,26 +1093,57 @@ class Card(QWidget):
         gl.addWidget(self._look_row("warm", "Warmth", -100, 100, ("cooler", "", "warmer"),
                                     "Cooler = bluer, warmer = more yellow / red.", ""))
         lay.addWidget(g)
-        g2, gl2 = self._group_box("Fill & delete")
-        fr = QHBoxLayout()
-        self.btnPickFill = QPushButton("Pick color...")
-        self.btnPickFill.setToolTip("Choose the color used by 'Fill selection'")
-        self.swatch = QFrame()
-        self.swatch.setFixedSize(34, 26)
-        fr.addWidget(self.swatch)
-        fr.addWidget(self.btnPickFill, 1)
-        gl2.addLayout(fr)
+        # ---- removing a stamp / mark: its own group, easy to find
+        gs, gls = self._group_box("Remove a stamp or mark")
+        hs = QLabel("Select the stamp (Select menu > Color range is the quickest), then press the button. "
+                    "The place is filled from what is around it.")
+        hs.setObjectName("hint")
+        hs.setWordWrap(True)
+        gls.addWidget(hs)
+        self.chkInk = QCheckBox("Keep the dark writing under the stamp")
+        self.chkInk.setChecked(True)
+        self.chkInk.setToolTip("A coloured stamp on top of a black signature or text: the writing is kept (drawn from what is\n"
+                               "still visible) instead of leaving a white gap.  Switch it off to remove everything.")
+        self.chkInk.toggled.connect(lambda on: setattr(self, "keep_ink", bool(on)))
+        gls.addWidget(self.chkInk)
+        self.btnRemoveStamp = QPushButton("Remove the selected stamp / mark   (Del)")
+        gls.addWidget(self.btnRemoveStamp)
+        lay.addWidget(gs)
+
+        # ---- color range + fill color: one thing
+        g2, gl2 = self._group_box("Color range & fill")
+        hc = QLabel("Choose the Color range tool and click a color: it is selected, and it becomes the fill color. "
+                    "Fuzziness (how wide) is in the bar above the picture.")
+        hc.setObjectName("hint")
+        hc.setWordWrap(True)
+        gl2.addWidget(hc)
+        fr = FlowLayout(hspacing=6, vspacing=6)
+        self.swatch = QPushButton()
+        self.swatch.setFixedSize(40, 30)
+        self.swatch.setToolTip("The fill color. Click to choose another color.")
+        self.edHex = QLineEdit()
+        self.edHex.setFixedWidth(84)
+        self.edHex.setMaxLength(7)
+        self.edHex.setToolTip("Color as #RRGGBB")
+        self.btnPickFill = QPushButton("From picture")
+        self.btnPickFill.setToolTip("Click a spot in the picture: its color becomes the fill color")
+        self.btnPaper = QPushButton("Paper")
+        self.btnPaper.setToolTip("The color of the paper (picture border)")
+        self.btnWhite = QPushButton("White")
+        self.btnBlack = QPushButton("Black")
+        for w in (self.swatch, self.edHex, self.btnPickFill, self.btnPaper, self.btnWhite, self.btnBlack):
+            fr.addWidget(w)
+        fw = QWidget()
+        fw.setLayout(fr)
+        gl2.addWidget(fw)
+        self.chkUseClick = QCheckBox("A Color range click sets the fill color")
+        self.chkUseClick.setChecked(True)
+        gl2.addWidget(self.chkUseClick)
         self.btnFill = QPushButton("Fill selection with this color")
         self.btnDelete = QPushButton("Delete selection  (Del)")
         self.btnDelete.setToolTip("Remove what is selected; the place is filled from its surroundings")
         gl2.addWidget(self.btnFill)
         gl2.addWidget(self.btnDelete)
-        self.chkInk = QCheckBox("Keep dark writing under a removed stamp")
-        self.chkInk.setChecked(True)
-        self.chkInk.setToolTip("Deleting a coloured stamp on top of a black signature: the signature is kept\n"
-                               "(drawn from what is still visible) instead of leaving a white gap.")
-        self.chkInk.toggled.connect(lambda on: setattr(self, "keep_ink", bool(on)))
-        gl2.addWidget(self.chkInk)
         self._paint_swatch()
         lay.addWidget(g2)
         self.colors = ColorList()
@@ -1083,11 +1155,35 @@ class Card(QWidget):
         self.stackPages.addWidget(pg)
         self.btnFill.clicked.connect(self.fill_selection)
         self.btnDelete.clicked.connect(self.delete_selection)
-        self.btnPickFill.clicked.connect(self._pick_fill)
+        self.btnRemoveStamp.clicked.connect(self.delete_selection)
+        self.swatch.clicked.connect(self._pick_fill)
+        self.btnPickFill.clicked.connect(self._eyedrop_fill)
+        self.btnWhite.clicked.connect(lambda: self._set_fill((255, 255, 255)))
+        self.btnBlack.clicked.connect(lambda: self._set_fill((0, 0, 0)))
+        self.btnPaper.clicked.connect(self._paper_fill)
+        self.edHex.editingFinished.connect(self._hex_fill)
 
         # ---------------- Shadow
         pg, lay = self._page()
         lay.addWidget(self._scope_label())
+        gn, gln = self._group_box("Newspaper / book photo  \u2192  white page")
+        hn = QLabel("For a photo of a newspaper or a book page: the text and the shapes stay as they are, the page turns white. "
+                    "One click - then slide the strength down or up. The slider works before and after the click.")
+        hn.setObjectName("hint")
+        hn.setWordWrap(True)
+        gln.addWidget(hn)
+        self.btnNews = QPushButton("Make the page white  (one click)")
+        self.btnNews.setProperty("accent", True)
+        self.btnNews.setMinimumHeight(40)
+        gln.addWidget(self.btnNews)
+        gln.addWidget(self._look_row("news", "White page", 0, 100, ("off", "", "very white"),
+                                     "How strongly the page is made white.  Down = more of the page and its grey tones stay,\n"
+                                     "up = cleaner white.  Works with or without the one-click button.", ""))
+        gln.addWidget(self._look_row("news_keep", "Protect light writing", 0, 100, ("less", "", "more"),
+                                     "Up = pale writing, thin lines and light shapes are kept (a little grey may stay).\n"
+                                     "Down = a cleaner page, but pale details can fade.", ""))
+        lay.addWidget(gn)
+        self.btnNews.clicked.connect(self._news_click)
         g, gl = self._group_box("One-click shadow removal")
         self.btnShadow = QPushButton("Remove shadow  (one click)")
         self.btnShadow.setProperty("accent", True)
@@ -1130,11 +1226,6 @@ class Card(QWidget):
         self.modeOut.idClicked.connect(lambda i: self._shadow_opt("mode", ("color", "gray", "bw")[i]))
         gl.addWidget(self._label("Result"))
         gl.addLayout(mrow)
-        self.chkProtect = QCheckBox("Keep photos / faces untouched")
-        self.chkProtect.setChecked(True)
-        self.chkProtect.setToolTip("Photos (a face on an ID card ...) are found automatically and left as they are.")
-        self.chkProtect.toggled.connect(lambda on: self._shadow_opt("protect", 1 if on else 0))
-        gl.addWidget(self.chkProtect)
         lay.addWidget(g)
         g2, gl2 = self._group_box("Manual shadow removal")
         info = QLabel("Works at once - no click needed.  Select a part of the picture first (Select menu) to fix only "
@@ -1210,6 +1301,10 @@ class Card(QWidget):
         for key, title, caps, tip, val in (
                 ("strength", "Remove more", ("less", "", "more"),
                  "Higher = paper that is a bit grey / dirty also disappears. Lower = keeps faint strokes.", 50),
+                ("fine", "Keep faint strokes", ("less", "", "more"),
+                 "Higher = pale, thin strokes stay (a little more paper noise may come with them - 'Remove specks' takes it out).", 70),
+                ("specks", "Remove specks", ("off", "", "more"),
+                 "Takes dust, paper grain and tiny dots out of the cut picture. Strokes are never touched.", 50),
                 ("soft", "Edge softness", ("sharp", "", "soft"), "How smooth the edge of the ink / stamp is.", 30),
                 ("opacity", "Opacity", ("faint", "", "solid"), "How strongly the picture shows on the page.", 100)):
             row = SliderRow(title, 0, 100, val, caps, tip)
@@ -1251,13 +1346,16 @@ class Card(QWidget):
         self.btnSave = QPushButton("Save")
         self.btnSave.setProperty("accent", True)
         self.btnSave.setMinimumHeight(38)
-        self.btnSave.setToolTip("Save this picture in the save folder (Ctrl+S)")
-        self.btnSaveAs = QPushButton("Save as...  (JPG, PNG, WEBP, BMP, TIF, PDF)")
-        self.btnSaveAll = QPushButton("Save all edited")
-        self.btnSaveAll.setToolTip("Saves every edited picture into the save folder (Ctrl+Shift+S)")
+        self.btnSave.setToolTip("Replaces the original file with the edited picture (Ctrl+S).\nA picture from the phone / clipboard goes to the save folder.")
+        self.btnSaveAs = QPushButton("Save as...  (JPG, PNG, PDF)")
+        self.btnSaveAll = QPushButton("Save all edited...")
+        self.btnSaveAll.setToolTip("Every edited picture: replace the originals or save into a folder you choose (Ctrl+Shift+S)")
+        self.btnPrint = QPushButton("Print...")
+        self.btnPrint.setToolTip("Print this picture (Ctrl+P)")
+        self.btnPrint.clicked.connect(lambda: self.printRequested.emit(self))
         self.btnPdfAll = QPushButton("All pages as one PDF")
         self.btnPdfAll.setToolTip("One PDF with every open picture, one page each, in the order of the thumbnails")
-        for w in (self.btnSave, self.btnSaveAs, self.btnSaveAll, self.btnPdfAll):
+        for w in (self.btnSave, self.btnSaveAs, self.btnSaveAll, self.btnPdfAll, self.btnPrint):
             gl.addWidget(w)
         lay.addWidget(g)
         g, gl = self._group_box("Share")
@@ -1293,6 +1391,90 @@ class Card(QWidget):
     def _paint_swatch(self):
         r, g, b = self.fill_rgb
         self.swatch.setStyleSheet("background: rgb(%d,%d,%d); border-radius: 7px; border: 1px solid #4a5268;" % (r, g, b))
+        if hasattr(self, "edHex") and not self.edHex.hasFocus():
+            self.edHex.setText("#%02X%02X%02X" % (r, g, b))
+
+    def _set_fill(self, rgb):
+        self.fill_rgb = tuple(int(v) for v in rgb)
+        self._paint_swatch()
+
+    def _hex_fill(self):
+        t = self.edHex.text().strip().lstrip("#")
+        if len(t) == 6:
+            try:
+                self._set_fill((int(t[0:2], 16), int(t[2:4], 16), int(t[4:6], 16)))
+                return
+            except ValueError:
+                pass
+        self._paint_swatch()
+
+    def _paper_fill(self):
+        if self._loaded and self.base is not None:
+            self._set_fill(core.border_color(self.base))
+
+    def _eyedrop_fill(self):
+        """'From picture': the next click in the picture gives the fill color."""
+        if not self._loaded:
+            return
+        self._fill_drop = True
+        self.choose_tool("pick")
+        self.message.emit("Click a spot in the picture: its color becomes the fill color.")
+
+    def _tol_mode(self, key):
+        """The same slider is 'Fuzziness' (0..200) for Color range and 'Tolerance' for the brushes."""
+        color = key == "color"
+        self.tolSlider.blockSignals(True)
+        if color:
+            self.tolSlider.setRange(0, 200)
+            self.tolSlider.setValue(self._fuzz)
+            self.lblTol.setText("Fuzziness")
+            self.tolSlider.setToolTip("Color range: how far from the clicked color a color may be and still be taken (like Photoshop)")
+        else:
+            self.tolSlider.setRange(5, 80)
+            self.tolSlider.setValue(self._tolv)
+            self.lblTol.setText("Tolerance")
+            self.tolSlider.setToolTip("How different a color may be to still count as the same object")
+        self.tolSlider.blockSignals(False)
+        self.lblTolV.setText(str(self.tolSlider.value()))
+        self.chkLocal.setVisible(color)
+        self.localSlider.setVisible(color and self.chkLocal.isChecked())
+        self.chkSnap.setVisible(key == "deselect")
+
+    def _tol_changed(self, v):
+        self.lblTolV.setText(str(v))
+        if self._tool == "color":
+            self._fuzz = v
+            self._cr_timer.start()
+        else:
+            self._tolv = v
+
+    def _recompute_color_range(self):
+        """Fuzziness / 'near the click' changed after a click: the same selection, redone (no new undo step)."""
+        self.localSlider.setVisible(self._tool == "color" and self.chkLocal.isChecked())
+        cr = self._cr
+        if cr is None or not self._loaded or self.prev is not cr["prev"] or self._sel_ver != cr["ver"]:
+            return
+        fuzz, local = self._fuzz, (self.localSlider.value() / 100.0 if self.chkLocal.isChecked() else 0.0)
+        prev, lab0 = self.prev, self._lab
+        token = cr["token"] = cr.get("token", 0) + 1
+        rgb, center, base, mode = cr["rgb"], cr["center"], cr["base"], cr["mode"]
+
+        def work(progress):
+            lab = lab0 if lab0 is not None else core.rgb_to_lab(prev)
+            return core.color_range_fuzzy(lab, rgb, fuzz, center, local), lab
+
+        def done(r):
+            if self._dead or cr.get("token") != token or self.prev is not prev or self._cr is not cr:
+                return
+            mask, lab = r
+            if self._lab is None:
+                self._lab = lab
+            new = core.sel_combine(base, mask, mode)
+            self.sel = new
+            self._sel_ver += 1
+            cr["ver"] = self._sel_ver
+            self._sel_changed()
+        run_background(work, done, lambda msg: None)
 
     def _pick_fill(self):
         c = QColorDialog.getColor(QColor(*self.fill_rgb), self, "Fill color")
@@ -1318,7 +1500,11 @@ class Card(QWidget):
         self.btnUndo.setEnabled(bool(self.undo))
         self.btnRedo.setEnabled(bool(self.redo))
         self.btnReset.setEnabled(self._loaded and self.is_edited())
-        self.btnCompare.setVisible(self._loaded and self.is_edited())
+        can_cmp = self._loaded and self.is_edited()
+        self.btnCompare.setVisible(can_cmp)
+        if not can_cmp and self._cmp is not None:          # back to the original: nothing left to compare
+            self._compare_off()
+        self.btnCmpMode.setVisible(can_cmp and self._cmp is not None)
         if self.is_edited():
             self.lblState.setText("edited" if self.is_unsaved() else "saved")
         else:
@@ -1362,18 +1548,27 @@ class Card(QWidget):
         self.runner.run(label, work, done, failed)
 
     def compare(self):
-        """Original vs edited in one window.  The original is read in the background (once)."""
-        if not self._loaded or not self.is_edited() or self.canvas._img is None:
+        """The Compare button: on = the original shows in the picture itself (slider / side by side); click again = off."""
+        if self._cmp is not None:
+            self._compare_off()
             return
-        edited = self.canvas._img.copy()
+        if not self._loaded or not self.is_edited() or self.canvas._img is None:
+            self.btnCompare.setChecked(False)
+            return
+        self._go_move()                                    # the hand: wheel and drag move the picture while comparing
 
         def show(orig):
-            if not self._dead:
-                CompareDialog(orig, edited, self.name, self.window()).exec()
+            if self._dead or self._cmp is not None:
+                return
+            self._cmp = CompareOverlay(self.canvas, orig)
+            self.btnCompare.setChecked(True)
+            self.btnCmpMode.setText("Slider")
+            self.btnCmpMode.setVisible(True)
+            self.message.emit("Drag the line to compare. Wheel = zoom, drag = move. Click Compare again to switch it off.")
         if self._orig_q is not None:
             show(self._orig_q)
             return
-        path = self.path
+        path = self.src_path()
 
         def work(progress):
             progress(0.2, "reading the original")
@@ -1382,12 +1577,57 @@ class Card(QWidget):
 
         def done(q):
             self._orig_q = q
-            QTimer.singleShot(0, lambda: show(q))          # open the window after the job is finished
-        self._job("Preparing the comparison", work, done)
+            show(q)
+
+        def fail(msg):
+            self.btnCompare.setChecked(False)
+            self.message.emit("Could not read the original: " + msg.splitlines()[0])
+        self.btnCompare.setChecked(True)
+        self._job("Preparing the comparison", work, done, fail)
+
+    def _compare_off(self):
+        if self._cmp is not None:
+            self._cmp.close_overlay()
+            self._cmp = None
+        self.btnCompare.setChecked(False)
+        self.btnCmpMode.setVisible(False)
+
+    def _cmp_mode(self):
+        if self._cmp is None:
+            return
+        side = self._cmp.mode == "slider"
+        self._cmp.set_mode("side" if side else "slider")
+        self.btnCmpMode.setText("Side by side" if side else "Slider")
+
+    def picture_tab_active(self):
+        """True while the 'Picture' tab (overlay pictures: signature, stamp ...) is the open tab."""
+        return self._loaded and self.stackPages.currentIndex() == 3
+
+    def src_path(self):
+        """The picture's original file: the saved-over file is backed up when 'Save' replaces it."""
+        return getattr(self, "orig_path", None) or self.path
+
+    def _drop_temp_files(self):
+        """The temporary files of this picture (edited copy for drag / copy / print, backup of a replaced original)."""
+        paths = []
+        if self._export is not None:
+            paths.append(self._export[1])
+            self._export = None
+        if self.orig_path and os.path.dirname(self.orig_path) == core.ORIG_DIR:
+            paths.append(self.orig_path)
+        for p in paths:
+            try:
+                if os.path.dirname(os.path.abspath(p)) in (os.path.abspath(EXPORT_DIR), os.path.abspath(core.ORIG_DIR)):
+                    os.remove(p)
+            except OSError:
+                pass
 
     def dispose(self):
         """The picture is being removed: stop timers, ignore everything that is still being computed for it."""
         self._dead = True
+        self._drop_temp_files()
+        if self._cmp is not None:
+            self._compare_off()
         for t in ("_timer", "_focus_timer", "_gest_timer", "_bg_timer", "_shadow_timer"):
             tm = getattr(self, t, None)
             if tm is not None:
@@ -1643,7 +1883,7 @@ class Card(QWidget):
         if self._loaded or self._failed:
             args = self.render_args()
             return lambda: core.render_full(*args)
-        path, st = self.path, copy.deepcopy(self._pending)
+        path, st = self.src_path(), copy.deepcopy(self._pending)
 
         def make():
             base = core.load_image(path)
@@ -1656,6 +1896,11 @@ class Card(QWidget):
                 base = core.remove_shadow(base, opts["strength"] / 100.0, None, opts)
             return core.render_full(base, copy.deepcopy(st["adjs"]), look, None, [])
         return make
+
+    def can_replace(self):
+        """Save can replace the original file: opened from the disk (not phone / clipboard) and writable."""
+        return (self.origin == "file" and os.path.isfile(self.path) and os.access(self.path, os.W_OK)
+                and os.access(os.path.dirname(self.path) or ".", os.W_OK))
 
     def out_name(self):
         stem = os.path.splitext(self.name)[0]
@@ -1698,9 +1943,6 @@ class Card(QWidget):
             row.set_value(self.look[k])
         for k, row in self.shadowRows.items():
             row.set_value(self.shadow_opts[k])
-        self.chkProtect.blockSignals(True)
-        self.chkProtect.setChecked(bool(self.shadow_opts.get("protect", 1)))
-        self.chkProtect.blockSignals(False)
         i = ("color", "gray", "bw").index(self.shadow_opts.get("mode", "color"))
         self.modeOut.button(i).setChecked(True)
 
@@ -1747,6 +1989,15 @@ class Card(QWidget):
 
     def undo_step(self):
         if not self._loaded:
+            return
+        if self._tool == "transform" and self.canvas.in_transform():       # a transform is running: undo goes back inside it
+            if not self.canvas.tf_undo():
+                self.cancel_pending()                                        # nothing left to step back: untransform
+                self.message.emit("Transform cancelled: everything is as it was before.")
+            else:
+                mode = self.canvas.tf_mode_name()
+                if mode in self.tfBtns:
+                    self.tfBtns[mode].setChecked(True)
             return
         if self._gest:
             self._gest_timer.stop()
@@ -1812,7 +2063,8 @@ class Card(QWidget):
         self._job(label, work, done, fail)
 
     # ------------------------------------------------ picture layers (signature, stamp ...)
-    BG_DEFAULT = {"strength": 50, "soft": 30, "uneven": False, "tint": "orig", "opacity": 100, "remove": True}
+    BG_DEFAULT = {"strength": 50, "soft": 30, "uneven": False, "tint": "orig", "opacity": 100, "remove": True,
+                  "fine": 70, "specks": 50}
 
     def _layer(self, lid):
         for l in self.layers:
@@ -1844,8 +2096,8 @@ class Card(QWidget):
             a = rgba.split()[3]
             sa = a if a.getextrema()[0] < 250 else None          # a PNG that is already transparent keeps its holes
             rgb = rgba.convert("RGB")
-            if max(rgb.size) > 2000:
-                f = 2000.0 / max(rgb.size)
+            if max(rgb.size) > 4800:                                # only a really huge picture is made smaller
+                f = 4800.0 / max(rgb.size)
                 size = (max(1, int(rgb.width * f)), max(1, int(rgb.height * f)))
                 rgb = rgb.resize(size, Image.Resampling.LANCZOS)
                 sa = sa.resize(size, Image.Resampling.LANCZOS) if sa is not None else None
@@ -1948,7 +2200,7 @@ class Card(QWidget):
         self._set_tool("transform")
         self._place_id = lid                           # (_set_tool clears it, so it is set after)
         self.canvas.start_layer_transform(qimg, pts, n)
-        self.tfBtns["warp" if n == 3 else "free"].setChecked(True)
+        self.tfBtns["warp" if n > 1 else "free"].setChecked(True)
         self._refresh_layers_ui()
 
     def _commit_layer_pts(self):
@@ -2123,6 +2375,7 @@ class Card(QWidget):
     def _bg_params(self):
         tint = ("orig", "black", "blue")[max(0, self.tintGroup.checkedId())]
         return {"strength": int(self.bgRows["strength"].sl.value()), "soft": int(self.bgRows["soft"].sl.value()),
+                "fine": int(self.bgRows["fine"].sl.value()), "specks": int(self.bgRows["specks"].sl.value()),
                 "uneven": self.chkUneven.isChecked(), "tint": tint, "opacity": 100, "remove": self.chkBg.isChecked()}
 
     def _bg_apply(self):
@@ -2217,10 +2470,10 @@ class Card(QWidget):
         l = None if self.sel_layer is None else self._layer(self.sel_layer)
         if l is not None and self.ctx is None:
             bg = l.get("bg", self.BG_DEFAULT)
-            for k in ("strength", "soft"):
+            for k, dflt in (("strength", 50), ("soft", 30), ("fine", 70), ("specks", 50)):
                 self.bgRows[k].sl.blockSignals(True)
-                self.bgRows[k].sl.setValue(int(bg.get(k, 50)))
-                self.bgRows[k].val.setText("%d%%" % int(bg.get(k, 50)))
+                self.bgRows[k].sl.setValue(int(bg.get(k, dflt)))
+                self.bgRows[k].val.setText("%d%%" % int(bg.get(k, dflt)))
                 self.bgRows[k].sl.blockSignals(False)
             self.bgRows["opacity"].sl.blockSignals(True)
             self.bgRows["opacity"].sl.setValue(int(l.get("opacity", 100)))
@@ -2360,6 +2613,12 @@ class Card(QWidget):
         x, y = min(max(x, 0), W - 1), min(max(y, 0), H - 1)
         patch = self.prev[max(0, y - 1):y + 2, max(0, x - 1):x + 2].reshape(-1, 3).mean(0)
         rgb = tuple(int(round(float(v))) for v in patch)
+        if getattr(self, "_fill_drop", False):               # the eyedropper of the fill color
+            self._fill_drop = False
+            self._set_fill(rgb)
+            self._go_move()
+            self.message.emit("Fill color: #%02X%02X%02X" % rgb)
+            return
         prev, lab0 = self.prev, self._lab
 
         def work(progress):                          # the colour analysis of a big picture takes a moment: not in the window thread
@@ -2537,31 +2796,72 @@ class Card(QWidget):
         if kind in ("rect", "ellipse", "lasso"):
             self._set_selection(core.shape_mask((W, H), kind, data), mode)
             return
+        if kind == "brush" and self._tool == "deselect":
+            self._deselect_brush(data, size_prev)
+            return
         if kind == "brush":
             self._set_selection(core.shape_mask((W, H), "brush", data, size_prev), mode)
             return
-        tol = float(self.tolSlider.value())
+        tol = float(self._tolv)
         prev = self.prev
+        fuzz = self._fuzz
+        local = self.localSlider.value() / 100.0 if self.chkLocal.isChecked() else 0.0
+        base_sel = self.sel
 
         def work(progress):
             lab = self._lab if self._lab is not None else core.rgb_to_lab(prev)
+            info = None
             if kind == "color":
                 x, y = data
                 x, y = min(max(x, 0), W - 1), min(max(y, 0), H - 1)
                 patch = prev[max(0, y - 1):y + 2, max(0, x - 1):x + 2].reshape(-1, 3).mean(0)
-                mask = core.color_range_mask(lab, tuple(int(round(float(v))) for v in patch), tol)
+                rgb = tuple(int(round(float(v))) for v in patch)
+                mask = core.color_range_fuzzy(lab, rgb, fuzz, (x, y), local)
+                info = (rgb, (x, y))
             else:
                 stroke = core.shape_mask((W, H), "brush", data, size_prev)
                 mask = core.quick_select(lab, stroke, tol)
-            return mask, lab
+            return mask, lab, info
 
         def done(r):
-            mask, lab = r
+            mask, lab, info = r
             if self._lab is None and self.prev is prev:
                 self._lab = lab
             if self.prev is prev:
                 self._set_selection(mask, mode)
+                if info is not None:                           # remember the click: Fuzziness can now redo it live
+                    self._cr = {"prev": prev, "rgb": info[0], "center": info[1], "base": base_sel, "mode": mode,
+                                "ver": self._sel_ver}
+                    if getattr(self, "chkUseClick", None) is not None and self.chkUseClick.isChecked() and mode != "sub":
+                        self.fill_rgb = info[0]                # the clicked color is the fill color now
+                        self._paint_swatch()
         self._job("Selecting", work, done)
+
+    def _deselect_brush(self, data, size_prev):
+        """Take a painted part out of the selection - accurately (only what looks like what was painted over)."""
+        if self.sel is None:
+            self.message.emit("Nothing is selected yet. Select something first, then paint over what should NOT be selected.")
+            return
+        H, W = self.prev.shape[:2]
+        prev, sel = self.prev, self.sel
+        stroke = core.shape_mask((W, H), "brush", data, size_prev)
+        snap, tol = self.chkSnap.isChecked(), float(self._tolv)
+
+        def work(progress):
+            lab = self._lab if self._lab is not None else core.rgb_to_lab(prev)
+            m = core.smart_deselect(sel, lab, stroke, tol, size_prev) if snap else stroke
+            return m, lab
+
+        def done(r):
+            m, lab = r
+            if self._lab is None and self.prev is prev:
+                self._lab = lab
+            if self.prev is prev:
+                self._set_selection(m, "sub")
+        if snap:
+            self._job("Taking it out of the selection", work, done)
+        else:
+            self._set_selection(stroke, "sub")
 
     def _on_move(self, dx, dy, copy_flag):
         if self.ctx is not None:
@@ -2675,8 +2975,9 @@ class Card(QWidget):
         self.tfBox.setVisible(key == "transform")
         self.optsB.setVisible(sel_t or key in MOVE_KEYS)
         self.modeBox.setVisible(sel_t)
-        self.sizeBox.setVisible(key in ("quick", "brush", "erase_brush"))
-        self.tolBox.setVisible(key in ("quick", "color"))
+        self.sizeBox.setVisible(key in ("quick", "brush", "erase_brush", "deselect"))
+        self.tolBox.setVisible(key in ("quick", "color", "deselect"))
+        self._tol_mode(key)
         self.btnClone.setVisible(er and self.clone_src is not None)
         self._sync_brush()
         self.lblHint.setText(HINTS[key])
@@ -2955,6 +3256,23 @@ class Card(QWidget):
 
     MANUAL_SHADOW = ("flat", "flat_size", "shlift", "white", "black")
 
+    def _news_click(self):
+        """One click: the strength is found from the picture, then the slider can take it up or down."""
+        if not self._loaded:
+            return
+        prev = self.prev
+
+        def work(progress):
+            return core.auto_news_strength(prev)
+
+        def done(s):
+            if self.prev is not prev:
+                return
+            self._set_look("news", s)
+            self.lookRows["news"].set_value(s)
+            self.message.emit("Page whitened (%d). Move 'White page' to take it down or up." % s)
+        self._job("Making the page white", work, done)
+
     def _reset_manual_shadow(self):
         if not self._loaded:
             return
@@ -2973,7 +3291,7 @@ class Card(QWidget):
     def reset_image(self):
         if not self._loaded:
             return
-        path = self.path
+        path = self.src_path()
         self._checkpoint()                           # Reset can be undone too
         self.adjs = []
         self.look = core.new_look()
@@ -3025,7 +3343,7 @@ class Card(QWidget):
             self._exporting = False
             if self._dead:
                 return
-            self._export = (ver, path)
+            self.set_export(ver, path)
             self.exportReady.emit()
 
         def fail(msg):
@@ -3035,6 +3353,17 @@ class Card(QWidget):
                 return
             self.message.emit("Could not prepare the picture: " + msg.splitlines()[0])
         run_background(work, done, fail)
+
+    def set_export(self, ver, path):
+        """Remembers the edited copy made for drag / copy / print; the one of an older version is deleted."""
+        old = self._export
+        self._export = (ver, path)
+        if old is not None and old[1] != path:
+            try:
+                if os.path.dirname(os.path.abspath(old[1])) == os.path.abspath(EXPORT_DIR):
+                    os.remove(old[1])
+            except OSError:
+                pass
 
     def export_file(self):
         """The picture with all edits as a file (made now if it is not ready)."""
@@ -3046,7 +3375,7 @@ class Card(QWidget):
         stem, ext = self.out_name()
         path = core.unique_path(EXPORT_DIR, stem, ext)
         core.save_image(self.result_image(), path)
-        self._export = (self._ver, path)
+        self.set_export(self._ver, path)
         return path
 
     def make_mime(self, with_image=True):

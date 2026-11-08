@@ -137,6 +137,10 @@ class _Handler(BaseHTTPRequestHandler):
                 im = Image.open(io.BytesIO(data)).convert("RGB")
                 quad = [(vals[i], vals[i + 1]) for i in range(0, 8, 2)]
                 out = scanner.straighten(im, quad)
+                out = scanner.enhance(out, q.get("look", ["orig"])[0])           # orig | clean | gray | bw
+                turns = int(q.get("rot", ["0"])[0]) % 4
+                if turns:
+                    out = out.rotate(-90 * turns, expand=True)                      # clockwise quarter turns
                 buf = io.BytesIO()
                 out.save(buf, "JPEG", quality=93, subsampling=0)
                 self._send(200, buf.getvalue(), "image/jpeg")
@@ -322,151 +326,201 @@ class PhoneServer(QObject):
 
 PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0e1116">
 <title>Image Fixer</title>
 <style>
+:root{--bg:#0e1116;--card:#171b24;--card2:#1e2330;--line:#2a3144;--txt:#e8eaed;--mut:#8d95a8;--acc:#6366f1;--acc2:#a855f7;--ok:#30a46c;--bad:#e5484d}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#0e1116;color:#e8eaed;
-min-height:100vh;display:flex;flex-direction:column}
-header{padding:14px 16px;display:flex;align-items:center;gap:10px;border-bottom:1px solid #1c2130}
-header b{font-size:18px;flex:1}
-#dot{width:10px;height:10px;border-radius:50%;background:#e5484d}#dot.on{background:#30a46c}
-main{flex:1;padding:16px;display:flex;flex-direction:column;gap:14px}
-.big{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;flex:1;min-height:150px;
-border-radius:22px;border:0;color:#fff;font-size:22px;font-weight:700}
-.big small{font-weight:400;font-size:14px;opacity:.85}
-.choose{background:#222836;border:1px solid #30374a}
-.scan{background:linear-gradient(90deg,#6366f1,#a855f7)}
-button{font:inherit}
-.btn{border:0;border-radius:12px;padding:13px 16px;background:#222836;color:#e8eaed;font-size:16px;border:1px solid #30374a}
-.btn.pri{background:linear-gradient(90deg,#6366f1,#a855f7);border:0;color:#fff;font-weight:600}
+html,body{margin:0;background:var(--bg);color:var(--txt);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+body{min-height:100vh;display:flex;flex-direction:column;padding-bottom:env(safe-area-inset-bottom)}
+header{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:12px;padding:calc(12px + env(safe-area-inset-top)) 16px 12px;background:#0e1116ee;backdrop-filter:blur(8px);border-bottom:1px solid #1c2130}
+.logo{width:36px;height:36px;border-radius:11px;background:linear-gradient(135deg,var(--acc),var(--acc2));display:grid;place-items:center;font-weight:800;font-size:15px}
+header b{font-size:17px;display:block}header small{color:var(--mut);font-size:12px}
+header .t{flex:1}
+#dot{width:11px;height:11px;border-radius:50%;background:var(--bad);box-shadow:0 0 0 4px #e5484d22}#dot.on{background:var(--ok);box-shadow:0 0 0 4px #30a46c22}
+main{flex:1;padding:16px;display:flex;flex-direction:column;gap:14px;max-width:760px;width:100%;margin:0 auto}
+button{font:inherit;color:inherit}
+.card{display:flex;align-items:center;gap:14px;text-align:left;width:100%;padding:18px;border-radius:20px;background:var(--card);border:1px solid var(--line);min-height:84px}
+.card:active{transform:scale(.985)}
+.card .ic{flex:none;width:52px;height:52px;border-radius:16px;display:grid;place-items:center;background:var(--card2);font-size:26px}
+.card b{display:block;font-size:19px}.card small{color:var(--mut);font-size:13.5px;line-height:1.3}
+.card.main{background:linear-gradient(120deg,var(--acc),var(--acc2));border:0;min-height:110px}
+.card.main .ic{background:#ffffff26}.card.main small{color:#fff;opacity:.88}
+.btn{border:1px solid var(--line);border-radius:14px;padding:14px 16px;background:var(--card2);font-size:16px;min-height:50px}
+.btn.pri{background:linear-gradient(90deg,var(--acc),var(--acc2));border:0;color:#fff;font-weight:650}
 .btn.red{background:#3a1b22;border-color:#5a2630;color:#ffb4bd}
-.row{display:flex;gap:10px}.row>*{flex:1}
+.btn:disabled{opacity:.5}
+.row{display:flex;gap:10px;align-items:center}.row>.btn{flex:1}
+.chips{display:flex;gap:8px;flex-wrap:wrap}
+.chip{border:1px solid var(--line);background:var(--card);border-radius:999px;padding:9px 14px;font-size:14.5px;min-height:40px}
+.chip.on{background:var(--acc);border-color:var(--acc);color:#fff}
 .hide{display:none!important}
-#msg{min-height:20px;color:#8d95a8;text-align:center;font-size:14px}
-canvas{width:100%;touch-action:none;border-radius:10px;background:#000}
+.hint{color:var(--mut);font-size:13.5px;line-height:1.35}
+#msg{min-height:20px;color:var(--mut);text-align:center;font-size:14px}
+canvas{width:100%;touch-action:none;border-radius:14px;background:#000;display:block}
+#bar{height:6px;background:#222836;border-radius:3px;overflow:hidden}#bar i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--acc),var(--acc2));transition:width .2s}
 .pages{display:flex;flex-direction:column;gap:10px}
-.pg{display:flex;gap:10px;align-items:center;background:#171b24;border:1px solid #262c3b;border-radius:14px;padding:8px}
-.pg img{width:70px;height:90px;object-fit:cover;border-radius:8px;background:#000}
-.pg .n{flex:1;font-weight:600}
-.pg button{padding:9px 11px;font-size:15px}
-#viewer{position:fixed;inset:0;background:#000d;display:flex;align-items:center;justify-content:center;padding:12px}
-#viewer img{max-width:100%;max-height:100%}
-#bar{height:6px;background:#222836;border-radius:3px;overflow:hidden}#bar i{display:block;height:100%;width:0;background:#6366f1}
+.pg{display:flex;gap:10px;align-items:center;background:var(--card);border:1px solid var(--line);border-radius:16px;padding:8px}
+.pg img{width:64px;height:84px;object-fit:cover;border-radius:10px;background:#000}
+.pg .n{flex:1;font-weight:600;min-width:0}.pg .n small{display:block;color:var(--mut);font-weight:400}
+.pg button{padding:0;width:42px;height:42px;font-size:16px;border-radius:12px}
+.rev{width:100%;border-radius:14px;background:#000;display:block}
+.sw{display:flex;align-items:center;gap:10px;color:var(--mut);font-size:14px}
+.sw input{width:20px;height:20px;accent-color:var(--acc)}
+#viewer{position:fixed;inset:0;background:#000e;display:flex;align-items:center;justify-content:center;padding:12px;z-index:20}
+#viewer img{max-width:100%;max-height:100%;border-radius:8px}
+#banner{position:fixed;left:12px;right:12px;bottom:calc(12px + env(safe-area-inset-bottom));z-index:15;background:#3a1b22;border:1px solid #5a2630;color:#ffb4bd;padding:12px 14px;border-radius:14px;font-size:14px;text-align:center}
+.sent{display:flex;flex-direction:column;gap:6px}.sent div{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px 12px;font-size:14px;color:var(--mut)}.sent b{color:var(--ok)}
 </style></head><body>
-<header><b>Image Fixer</b><span id="st">connecting...</span><span id="dot"></span></header>
+<header><div class="logo">IF</div><div class="t"><b>Image Fixer</b><small id="st">connecting...</small></div><span id="dot"></span></header>
 <main>
  <section id="home" style="display:contents">
-  <button class="big choose" id="bChoose">Choose file<small>pictures from this phone</small></button>
-  <button class="big scan" id="bScan">Scan<small>photograph a paper</small></button>
+  <button class="card main" id="bScan"><span class="ic">&#128247;</span><span><b>Scan a paper</b><small>Take a photo. The page is found, cut out and straightened for you.</small></span></button>
+  <button class="card" id="bChoose"><span class="ic">&#128193;</span><span><b>Send pictures</b><small>Choose photos from this phone. They arrive as they are.</small></span></button>
+  <button class="card" id="bGal"><span class="ic">&#9986;</span><span><b>Scan a saved photo</b><small>Pick a photo of a page and cut the page out.</small></span></button>
+  <div class="sent" id="sent"></div>
  </section>
- <section id="edit" class="hide">
-  <div class="row"><div id="tip" style="flex:3;color:#8d95a8;font-size:14px">Drag the 4 corners onto the corners of the paper.</div></div>
+ <section id="edit" class="hide" style="display:none;flex-direction:column;gap:12px">
+  <div class="hint" id="tip"></div>
+  <div class="chips"><button class="chip" id="eAuto">&#10024; Find paper</button><button class="chip" id="eFull">Whole photo</button><button class="chip" id="eRotL">&#10226; Turn</button><button class="chip" id="eRotR">Turn &#10227;</button></div>
   <canvas id="cv"></canvas>
-  <div class="row"><button class="btn" id="eRetake">Retake</button><button class="btn pri" id="eOk">Crop</button></div>
+  <div class="row"><button class="btn" id="eRetake">Retake</button><button class="btn pri" id="eOk">Cut out</button></div>
  </section>
- <section id="review" class="hide">
-  <img id="rimg" style="width:100%;border-radius:10px;background:#000">
-  <div class="row"><button class="btn" id="rAdj">Adjust corners</button><button class="btn pri" id="rUse">Use this page</button></div>
+ <section id="review" class="hide" style="display:none;flex-direction:column;gap:12px">
+  <img id="rimg" class="rev">
+  <div class="chips" id="looks"><button class="chip" data-l="orig">Original</button><button class="chip on" data-l="clean">Clean</button><button class="chip" data-l="gray">Gray</button><button class="chip" data-l="bw">Black &amp; white</button></div>
+  <div class="row"><button class="btn" id="rRotL">&#10226; Turn</button><button class="btn" id="rRotR">Turn &#10227;</button><button class="btn" id="rAdj">Corners</button></div>
+  <button class="btn pri" id="rUse">Use this page</button>
  </section>
- <section id="list" class="hide">
-  <div class="row" style="align-items:center"><b id="lt" style="flex:2;font-size:18px"></b><button class="btn" id="lHome" style="flex:1">Home</button></div>
+ <section id="list" class="hide" style="display:none;flex-direction:column;gap:12px">
+  <div class="row"><b id="lt" style="flex:2;font-size:19px"></b><button class="btn" id="lHome" style="flex:1">Home</button></div>
   <div class="pages" id="pages"></div>
-  <button class="btn" id="lAdd">+ Add more</button>
-  <button class="btn pri" id="lSend">Send to desktop</button>
+  <label class="sw"><input type="checkbox" id="auto"> Open the camera again after each page</label>
+  <button class="btn" id="lAdd">+ Add another page</button>
+  <button class="btn pri" id="lSend">Send to computer</button>
  </section>
  <div id="bar" class="hide"><i></i></div>
  <div id="msg"></div>
 </main>
+<div id="banner" class="hide">Not connected to the computer. Scan the QR code on the computer again.</div>
 <input type="file" id="fFiles" accept="image/*" multiple class="hide">
 <input type="file" id="fCam" accept="image/*" capture="environment" class="hide">
+<input type="file" id="fGal" accept="image/*" class="hide">
 <div id="viewer" class="hide"><img id="vimg"></div>
 <script>
 const $=id=>document.getElementById(id), base=location.pathname.replace(/\/$/,'');
-let pages=[], retake=-1, cur=null, busy=false;
+let pages=[], retake=-1, cur=null, busy=false, sentLog=[];
 const api=(p,opt)=>fetch(base+p,opt);
-function show(id){for(const s of ['home','edit','review','list'])$(s).classList.toggle('hide',s!==id);
- $('home').style.display=id==='home'?'contents':'';}
-function msg(t,err){$('msg').textContent=t||'';$('msg').style.color=err?'#ffb4bd':'#8d95a8';}
+const DPR=()=>window.devicePixelRatio||1;
+function show(id){for(const s of ['home','edit','review','list']){const e=$(s);const on=s===id;e.classList.toggle('hide',!on);
+  e.style.display=on?(s==='home'?'contents':'flex'):'none';}window.scrollTo(0,0);}
+function msg(t,err){$('msg').textContent=t||'';$('msg').style.color=err?'#ffb4bd':'';}
 function prog(f){$('bar').classList.toggle('hide',f==null);if(f!=null)$('bar').firstChild.style.width=(f*100)+'%';}
-async function ping(){try{const r=await api('/api/ping');if(!r.ok)throw 0;$('dot').className='on';$('st').textContent='connected';}
- catch(e){$('dot').className='';$('st').textContent='not connected';}}
-setInterval(ping,4000);ping();
-
+function buzz(){try{navigator.vibrate&&navigator.vibrate(18);}catch(e){}}
+let fails=0;
+async function ping(){try{const r=await api('/api/ping');if(!r.ok)throw 0;fails=0;$('dot').className='on';$('st').textContent='connected to your computer';$('banner').classList.add('hide');}
+ catch(e){if(++fails>=2){$('dot').className='';$('st').textContent='not connected';$('banner').classList.remove('hide');}}}
+setInterval(ping,3000);ping();
 function loadImg(src){return new Promise((ok,no)=>{const i=new Image();i.onload=()=>ok(i);i.onerror=no;i.src=src;});}
-async function shrink(file,maxSide){ // photo -> upright JPEG blob, not bigger than maxSide
+async function shrink(file,maxSide){ // photo -> upright JPEG blob (EXIF turn applied by the browser), at most maxSide
  const u=URL.createObjectURL(file);const im=await loadImg(u);
- let w=im.naturalWidth,h=im.naturalHeight,s=Math.min(1,maxSide/Math.max(w,h));
+ const w=im.naturalWidth,h=im.naturalHeight,s=Math.min(1,maxSide/Math.max(w,h));
  const c=document.createElement('canvas');c.width=Math.round(w*s);c.height=Math.round(h*s);
- c.getContext('2d').drawImage(im,0,0,c.width,c.height);URL.revokeObjectURL(u);
- return new Promise(r=>c.toBlob(r,'image/jpeg',0.93));}
+ const g=c.getContext('2d');g.imageSmoothingQuality='high';g.drawImage(im,0,0,c.width,c.height);URL.revokeObjectURL(u);
+ return new Promise(r=>c.toBlob(r,'image/jpeg',0.94));}
+async function rotateBlob(blob,turns){ // clockwise quarter turns
+ const u=URL.createObjectURL(blob);const im=await loadImg(u);const t=((turns%4)+4)%4;
+ const c=document.createElement('canvas');c.width=t%2?im.naturalHeight:im.naturalWidth;c.height=t%2?im.naturalWidth:im.naturalHeight;
+ const g=c.getContext('2d');g.translate(c.width/2,c.height/2);g.rotate(t*Math.PI/2);g.drawImage(im,-im.naturalWidth/2,-im.naturalHeight/2);URL.revokeObjectURL(u);
+ return new Promise(r=>c.toBlob(r,'image/jpeg',0.94));}
+function rotQuad(q,w,h,cw){ // image w x h turned a quarter: clockwise (x,y)->(h-y,x), counter-clockwise (x,y)->(y,w-x)
+ return q.map(p=>cw?{x:h-p.y,y:p.x}:{x:p.y,y:w-p.x});}
 
-// ---------- choose files
+// ---------- send pictures as they are
 $('bChoose').onclick=()=>{$('fFiles').value='';$('fFiles').click();};
 $('fFiles').onchange=async e=>{
  const fs=[...e.target.files];if(!fs.length)return;
  const batch=Date.now().toString(36)+Math.random().toString(36).slice(2,6);let ok=0;
- for(let i=0;i<fs.length;i++){msg('Uploading '+(i+1)+' / '+fs.length+' ...');prog(i/fs.length);
-  try{const r=await api('/api/upload?kind=file&batch='+batch+'&i='+i+'&n='+fs.length+'&name='+encodeURIComponent(fs[i].name),
-     {method:'POST',body:fs[i]});const j=await r.json();if(j.ok)ok++;else msg(fs[i].name+': '+j.error,true);}
+ for(let i=0;i<fs.length;i++){msg('Sending '+(i+1)+' of '+fs.length+' ...');prog(i/fs.length);
+  try{const r=await api('/api/upload?kind=file&batch='+batch+'&i='+i+'&n='+fs.length+'&name='+encodeURIComponent(fs[i].name),{method:'POST',body:fs[i]});
+   const j=await r.json();if(j.ok)ok++;else msg(fs[i].name+': '+j.error,true);}
   catch(err){msg('Connection lost. Scan the QR code on the computer again.',true);prog(null);return;}}
- prog(null);msg(ok+' of '+fs.length+' picture(s) sent to the computer');};
+ prog(null);buzz();logSent(ok+' picture'+(ok==1?'':'s'));msg('');};
+function logSent(t){const d=new Date();sentLog.unshift('<b>&#10003;</b> '+t+' sent &middot; '+d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}));
+ sentLog=sentLog.slice(0,4);$('sent').innerHTML=sentLog.map(x=>'<div>'+x+'</div>').join('');}
 
 // ---------- scan
-$('bScan').onclick=()=>{retake=-1;openCam();};
 function openCam(){$('fCam').value='';$('fCam').click();}
-$('fCam').onchange=async e=>{const f=e.target.files[0];if(!f)return;
- msg('Finding the paper ...');prog(0.3);
- try{const blob=await shrink(f,2600);
-  const r=await api('/api/detect',{method:'POST',body:blob});const j=await r.json();
-  if(!j.ok)throw new Error(j.error);
-  cur={orig:blob,w:j.w,h:j.h,quad:j.quad.map(p=>({x:p[0],y:p[1]})),img:await loadImg(URL.createObjectURL(blob))};
-  $('tip').textContent=j.found?'Paper found. Move a corner if the outline is not exact.':'Paper not found - drag the 4 corners onto the paper.';
-  prog(null);msg('');startEdit();
- }catch(err){prog(null);msg('Could not connect to the computer. Scan the QR code again.',true);}};
+$('bScan').onclick=()=>{retake=-1;openCam();};
+$('bGal').onclick=()=>{retake=-1;$('fGal').value='';$('fGal').click();};
+$('fCam').onchange=e=>gotPhoto(e.target.files[0]);$('fGal').onchange=e=>gotPhoto(e.target.files[0]);
+async function detect(blob){const r=await api('/api/detect',{method:'POST',body:blob});const j=await r.json();if(!j.ok)throw new Error(j.error);return j;}
+async function gotPhoto(f){if(!f)return;msg('Finding the paper ...');prog(0.35);
+ try{const blob=await shrink(f,3000);const j=await detect(blob);
+  cur={src:blob,w:j.w,h:j.h,quad:j.quad.map(p=>({x:p[0],y:p[1]})),img:await loadImg(URL.createObjectURL(blob)),look:'clean',rot:0};
+  setTip(j.found);prog(null);msg('');startEdit();
+ }catch(err){prog(null);msg('Could not reach the computer. Scan the QR code again.',true);}}
+function setTip(found){$('tip').textContent=found?'Paper found. Drag a round corner or a square side if the outline is not exact.':'Paper not found. Drag the corners onto the paper, or tap "Whole photo".';}
+$('eAuto').onclick=async()=>{msg('Finding the paper ...');prog(0.35);try{const j=await detect(cur.src);cur.quad=j.quad.map(p=>({x:p[0],y:p[1]}));setTip(j.found);prog(null);msg('');draw();}catch(e){prog(null);msg('Failed. Try again.',true);}};
+$('eFull').onclick=()=>{const m=0.01,w=cur.w,h=cur.h;cur.quad=[{x:w*m,y:h*m},{x:w*(1-m),y:h*m},{x:w*(1-m),y:h*(1-m)},{x:w*m,y:h*(1-m)}];draw();};
+async function turnSrc(cw){msg('');prog(0.4);cur.src=await rotateBlob(cur.src,cw?1:3);cur.quad=rotQuad(cur.quad,cur.w,cur.h,cw);const w=cur.w;cur.w=cur.h;cur.h=w;
+ cur.img=await loadImg(URL.createObjectURL(cur.src));prog(null);startEdit();}
+$('eRotL').onclick=()=>turnSrc(false);$('eRotR').onclick=()=>turnSrc(true);
 
-const cv=$('cv'),cx=cv.getContext('2d');let drag=-1,scale=1,touch=null;
-function startEdit(){show('edit');const W=Math.min(innerWidth-32,900),r=cur.h/cur.w;
- const d=devicePixelRatio||1;cv.style.width=W+'px';cv.style.height=(W*r)+'px';cv.width=W*d;cv.height=W*r*d;scale=cv.width/cur.w;draw();}
-function draw(){cx.clearRect(0,0,cv.width,cv.height);cx.drawImage(cur.img,0,0,cv.width,cv.height);
- const q=cur.quad.map(p=>({x:p.x*scale,y:p.y*scale}));
- cx.save();cx.beginPath();cx.rect(0,0,cv.width,cv.height);cx.moveTo(q[0].x,q[0].y);for(let i=3;i>=0;i--)cx.lineTo(q[i].x,q[i].y);
- cx.closePath();cx.fillStyle='rgba(0,0,0,.45)';cx.fill('evenodd');cx.restore();
- cx.beginPath();q.forEach((p,i)=>i?cx.lineTo(p.x,p.y):cx.moveTo(p.x,p.y));cx.closePath();
- cx.lineWidth=2*(devicePixelRatio||1);cx.strokeStyle='#a5b4fc';cx.stroke();
- const R=13*(devicePixelRatio||1);q.forEach(p=>{cx.beginPath();cx.arc(p.x,p.y,R,0,7);cx.fillStyle='rgba(255,255,255,.9)';cx.fill();cx.lineWidth=3;cx.strokeStyle='#4f46e5';cx.stroke();});
- if(drag>=0){ // magnifier
-  const p=q[drag],M=70*(devicePixelRatio||1),z=3,mx=Math.min(Math.max(p.x,M),cv.width-M),my=p.y>M*2.6?p.y-M*1.6:p.y+M*1.6;
-  cx.save();cx.beginPath();cx.arc(mx,my,M,0,7);cx.clip();
-  cx.drawImage(cur.img,(p.x/scale)-M/z/scale*1,(p.y/scale)-M/z/scale*1,2*M/z/scale,2*M/z/scale,mx-M,my-M,2*M,2*M);
-  cx.restore();cx.beginPath();cx.arc(mx,my,M,0,7);cx.lineWidth=3;cx.strokeStyle='#fff';cx.stroke();
-  cx.beginPath();cx.moveTo(mx-10,my);cx.lineTo(mx+10,my);cx.moveTo(mx,my-10);cx.lineTo(mx,my+10);cx.strokeStyle='#f43f5e';cx.lineWidth=2;cx.stroke();}}
-function pos(e){const r=cv.getBoundingClientRect(),d=cv.width/r.width;return{x:(e.clientX-r.left)*d,y:(e.clientY-r.top)*d};}
-cv.onpointerdown=e=>{const p=pos(e);let best=-1,bd=1e9;cur.quad.forEach((c,i)=>{const d=Math.hypot(c.x*scale-p.x,c.y*scale-p.y);if(d<bd){bd=d;best=i;}});
- if(bd<60*(devicePixelRatio||1)){drag=best;cv.setPointerCapture(e.pointerId);draw();}};
-cv.onpointermove=e=>{if(drag<0)return;const p=pos(e);cur.quad[drag]={x:Math.max(0,Math.min(cur.w,p.x/scale)),y:Math.max(0,Math.min(cur.h,p.y/scale))};draw();};
-cv.onpointerup=cv.onpointercancel=()=>{drag=-1;draw();};
+const cv=$('cv'),cx=cv.getContext('2d');let drag=null,scale=1;
+function startEdit(){show('edit');const W=Math.min(innerWidth-32,740),H=Math.min(W*cur.h/cur.w,innerHeight*0.62),Wd=H*cur.w/cur.h,d=DPR();
+ cv.style.width=Wd+'px';cv.style.height=H+'px';cv.width=Math.round(Wd*d);cv.height=Math.round(H*d);scale=cv.width/cur.w;draw();}
+function mids(q){return q.map((p,i)=>({x:(p.x+q[(i+1)%4].x)/2,y:(p.y+q[(i+1)%4].y)/2}));}
+function draw(){const d=DPR();cx.clearRect(0,0,cv.width,cv.height);cx.imageSmoothingQuality='high';cx.drawImage(cur.img,0,0,cv.width,cv.height);
+ const q=cur.quad.map(p=>({x:p.x*scale,y:p.y*scale})),m=mids(q);
+ cx.save();cx.beginPath();cx.rect(0,0,cv.width,cv.height);cx.moveTo(q[0].x,q[0].y);for(let i=3;i>=0;i--)cx.lineTo(q[i].x,q[i].y);cx.closePath();cx.fillStyle='rgba(0,0,0,.5)';cx.fill('evenodd');cx.restore();
+ cx.beginPath();q.forEach((p,i)=>i?cx.lineTo(p.x,p.y):cx.moveTo(p.x,p.y));cx.closePath();cx.lineWidth=2.4*d;cx.strokeStyle='#a5b4fc';cx.stroke();
+ m.forEach((p,i)=>{const s=9*d;cx.fillStyle='rgba(255,255,255,.92)';cx.strokeStyle='#4f46e5';cx.lineWidth=2.5*d;cx.beginPath();cx.rect(p.x-s,p.y-s,2*s,2*s);cx.fill();cx.stroke();});
+ q.forEach(p=>{cx.beginPath();cx.arc(p.x,p.y,13*d,0,7);cx.fillStyle='rgba(255,255,255,.95)';cx.fill();cx.lineWidth=3*d;cx.strokeStyle='#4f46e5';cx.stroke();});
+ if(drag){const p=drag.kind==='c'?q[drag.i]:m[drag.i],M=64*d,z=3,mx=Math.min(Math.max(p.x,M),cv.width-M),my=p.y>M*2.6?p.y-M*1.7:p.y+M*1.7;
+  cx.save();cx.beginPath();cx.arc(mx,my,M,0,7);cx.clip();cx.fillStyle='#000';cx.fillRect(mx-M,my-M,2*M,2*M);
+  const sw=2*M/z/scale;cx.drawImage(cur.img,p.x/scale-sw/2,p.y/scale-sw/2,sw,sw,mx-M,my-M,2*M,2*M);cx.restore();
+  cx.beginPath();cx.arc(mx,my,M,0,7);cx.lineWidth=3*d;cx.strokeStyle='#fff';cx.stroke();
+  cx.beginPath();cx.moveTo(mx-10*d,my);cx.lineTo(mx+10*d,my);cx.moveTo(mx,my-10*d);cx.lineTo(mx,my+10*d);cx.strokeStyle='#f43f5e';cx.lineWidth=2*d;cx.stroke();}}
+function pos(e){const r=cv.getBoundingClientRect(),k=cv.width/r.width;return{x:(e.clientX-r.left)*k,y:(e.clientY-r.top)*k};}
+cv.onpointerdown=e=>{const p=pos(e),d=DPR(),q=cur.quad.map(a=>({x:a.x*scale,y:a.y*scale})),m=mids(q);let best=null,bd=1e9;
+ q.forEach((c,i)=>{const t=Math.hypot(c.x-p.x,c.y-p.y)-4*d;if(t<bd){bd=t;best={kind:'c',i};}});
+ m.forEach((c,i)=>{const t=Math.hypot(c.x-p.x,c.y-p.y);if(t<bd){bd=t;best={kind:'m',i};}});
+ if(best&&bd<60*d){drag=best;drag.start=cur.quad.map(a=>({x:a.x,y:a.y}));drag.p0=p;cv.setPointerCapture(e.pointerId);buzz();draw();}};
+cv.onpointermove=e=>{if(!drag)return;const p=pos(e),dx=(p.x-drag.p0.x)/scale,dy=(p.y-drag.p0.y)/scale,S=drag.start;
+ const cl=(v,m)=>Math.max(0,Math.min(m,v));
+ if(drag.kind==='c'){cur.quad[drag.i]={x:cl(S[drag.i].x+dx,cur.w),y:cl(S[drag.i].y+dy,cur.h)};}
+ else{const a=S[drag.i],b=S[(drag.i+1)%4],ux=b.x-a.x,uy=b.y-a.y,L=Math.hypot(ux,uy)||1,nx=-uy/L,ny=ux/L,t=dx*nx+dy*ny; // move a side along its normal
+  [drag.i,(drag.i+1)%4].forEach(k=>{cur.quad[k]={x:cl(S[k].x+nx*t,cur.w),y:cl(S[k].y+ny*t,cur.h)};});}
+ draw();};
+cv.onpointerup=cv.onpointercancel=()=>{drag=null;draw();};
 $('eRetake').onclick=()=>openCam();
-async function crop(){msg('Straightening the page ...');prog(0.5);
- const q=cur.quad.map(p=>p.x.toFixed(1)+','+p.y.toFixed(1)).join(',');
- try{const r=await api('/api/warp?q='+q,{method:'POST',body:cur.orig});if(!r.ok)throw 0;
-  cur.result=await r.blob();cur.url=URL.createObjectURL(cur.result);$('rimg').src=cur.url;prog(null);msg('');show('review');
- }catch(e){prog(null);msg('Could not crop. Try again.',true);}}
+function warpUrl(){const q=cur.quad.map(p=>p.x.toFixed(1)+','+p.y.toFixed(1)).join(',');return '/api/warp?q='+q+'&look='+cur.look+'&rot='+cur.rot;}
+async function crop(){msg('Cutting out the page ...');prog(0.5);
+ try{const r=await api(warpUrl(),{method:'POST',body:cur.src});if(!r.ok)throw 0;
+  if(cur.url)URL.revokeObjectURL(cur.url);cur.result=await r.blob();cur.url=URL.createObjectURL(cur.result);$('rimg').src=cur.url;
+  for(const b of document.querySelectorAll('#looks .chip'))b.classList.toggle('on',b.dataset.l===cur.look);
+  prog(null);msg('');show('review');}
+ catch(e){prog(null);msg('Could not cut out the page. Try again.',true);}}
 $('eOk').onclick=crop;
+for(const b of document.querySelectorAll('#looks .chip'))b.onclick=()=>{if(cur.look===b.dataset.l)return;cur.look=b.dataset.l;crop();};
+$('rRotL').onclick=()=>{cur.rot=(cur.rot+3)%4;crop();};$('rRotR').onclick=()=>{cur.rot=(cur.rot+1)%4;crop();};
 $('rAdj').onclick=()=>startEdit();
-$('rUse').onclick=()=>{if(retake>=0)pages[retake]=cur;else pages.push(cur);retake=-1;cur=null;renderList();};
+$('auto').checked=localStorage.getItem('auto')==='1';$('auto').onchange=()=>localStorage.setItem('auto',$('auto').checked?'1':'0');
+$('rUse').onclick=()=>{buzz();if(retake>=0)pages[retake]=cur;else pages.push(cur);const again=retake<0&&$('auto').checked;retake=-1;cur=null;renderList();if(again)openCam();};
 
 // ---------- page list
 function renderList(){show('list');$('lt').textContent=pages.length+' page'+(pages.length==1?'':'s');const box=$('pages');box.innerHTML='';
  pages.forEach((p,i)=>{const d=document.createElement('div');d.className='pg';
-  d.innerHTML='<img src="'+p.url+'"><div class="n">Page '+(i+1)+'</div>';
+  d.innerHTML='<img src="'+p.url+'"><div class="n">Page '+(i+1)+'<small>'+({orig:'Original',clean:'Clean',gray:'Gray',bw:'Black & white'}[p.look]||'')+'</small></div>';
   const mk=(t,fn,c)=>{const b=document.createElement('button');b.className='btn '+(c||'');b.textContent=t;b.onclick=ev=>{ev.stopPropagation();fn();};d.appendChild(b);};
-  mk('▲',()=>{if(i>0){[pages[i-1],pages[i]]=[pages[i],pages[i-1]];renderList();}});
-  mk('▼',()=>{if(i<pages.length-1){[pages[i+1],pages[i]]=[pages[i],pages[i+1]];renderList();}});
-  mk('Redo',()=>{retake=i;openCam();});
-  mk('✕',()=>{pages.splice(i,1);pages.length?renderList():home();},'red');
+  mk('\u25B2',()=>{if(i>0){[pages[i-1],pages[i]]=[pages[i],pages[i-1]];renderList();}});
+  mk('\u25BC',()=>{if(i<pages.length-1){[pages[i+1],pages[i]]=[pages[i],pages[i+1]];renderList();}});
+  mk('\u270E',()=>{cur=p;retake=i;startEdit();});
+  mk('\u2715',()=>{pages.splice(i,1);pages.length?renderList():home();},'red');
   d.querySelector('img').onclick=()=>{$('vimg').src=p.url;$('viewer').classList.remove('hide');};
   box.appendChild(d);});
- $('lSend').textContent='Send '+pages.length+' page'+(pages.length==1?'':'s')+' to desktop';msg('');}
+ $('lSend').textContent='Send '+pages.length+' page'+(pages.length==1?'':'s')+' to computer';msg('');}
 $('viewer').onclick=()=>$('viewer').classList.add('hide');
 function home(){show('home');msg('');}
 $('lHome').onclick=home;$('lAdd').onclick=()=>{retake=-1;openCam();};
@@ -475,7 +529,8 @@ $('lSend').onclick=async()=>{if(busy||!pages.length)return;busy=true;$('lSend').
  try{for(let i=0;i<n;i++){msg('Sending page '+(i+1)+' of '+n+' ...');prog(i/n);
    const r=await api('/api/upload?kind=scan&batch='+batch+'&i='+i+'&n='+n+'&name=page'+(i+1)+'.jpg',{method:'POST',body:pages[i].result});
    const j=await r.json();if(!j.ok)throw new Error(j.error);}
-  prog(null);pages=[];home();msg('✓ '+n+' page'+(n==1?'':'s')+' sent to the computer');
+  prog(null);pages=[];home();buzz();logSent(n+' page'+(n==1?'':'s'));
  }catch(e){prog(null);msg('Sending failed. Check the Wi-Fi and try again (scan the QR code again if needed).',true);}
  busy=false;$('lSend').disabled=false;};
+show('home');
 </script></body></html>"""
