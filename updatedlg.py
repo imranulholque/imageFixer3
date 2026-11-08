@@ -8,7 +8,7 @@ from PySide6.QtWidgets import QMessageBox, QProgressDialog
 
 import updater
 
-CHECK_EVERY_MS = 6 * 60 * 60 * 1000          # while the program stays open
+CHECK_EVERY_MS = 5 * 60 * 1000               # while the program stays open (GitHub allows 60 asks / hour, this is 12)
 FIRST_CHECK_MS = 10 * 1000                   # a few seconds after start, so start-up stays fast
 
 
