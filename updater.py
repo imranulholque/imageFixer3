@@ -224,7 +224,7 @@ def launch_installer(stage_root):
     bat = os.path.join(WORK_DIR, "install.bat")
     with open(bat, "w", encoding="utf-8", newline="") as f:
         f.write(installer_script(stage_root, install_dir(), exe, os.getpid()))
-    flags = 0x08000000 | 0x00000008 | 0x00000200      # no window, detached, own process group
+    flags = 0x08000000 | 0x00000200      # hidden console + own process group (NOT detached: a detached script opens a window for every command it runs)
     subprocess.Popen(["cmd", "/c", bat], creationflags=flags, close_fds=True,
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     log("update to build started; installer launched")
