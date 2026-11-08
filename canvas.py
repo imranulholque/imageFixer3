@@ -35,8 +35,9 @@ class ImageCanvas(QWidget):
     tfCommitted = Signal()                      # a picture layer was moved / resized / rotated (mouse released)
     layerOutside = Signal(float, float)         # click outside the box of the selected picture layer
     layerEditRequested = Signal()               # double click on the selected picture layer
+    paintFinished = Signal(object)              # colour brush stroke: list of (x, y) in preview pixels
 
-    VIEW, PICK, CROP, PERSP, ERASE, SELECT, MOVESEL, TRANSFORM = 0, 1, 2, 3, 4, 5, 6, 7
+    VIEW, PICK, CROP, PERSP, ERASE, SELECT, MOVESEL, TRANSFORM, PAINT = 0, 1, 2, 3, 4, 5, 6, 7, 8
     HIT = 11
     MIN_CROP = 8.0
 
@@ -63,6 +64,8 @@ class ImageCanvas(QWidget):
         self.erase_shape = "brush"
         self.brush_prev = 20.0                # brush size in preview pixels
         self.clone_src = None                 # QPointF, spot to copy from
+        self.paint_rgb = (255, 0, 0)          # colour brush: colour and opacity (only for the live preview of the stroke)
+        self.paint_opacity = 1.0
         self.clone_delta = None               # QPointF, offset source - destination
         self._msg = "Loading..."
         self._masks = {"sel": None, "hl": None}      # float masks (preview size): the selection / the hovered colour
@@ -657,6 +660,11 @@ class ImageCanvas(QWidget):
         self.brush_prev = max(1.0, float(size_prev))
         self.update()
 
+    def set_paint(self, rgb, opacity):
+        self.paint_rgb = tuple(int(v) for v in rgb)
+        self.paint_opacity = max(0.05, min(1.0, float(opacity)))
+        self.update()
+
     def set_clone(self, src, delta):
         self.clone_src = None if src is None else QPointF(src[0], src[1])
         self.clone_delta = None if delta is None else QPointF(delta[0], delta[1])
@@ -729,6 +737,8 @@ class ImageCanvas(QWidget):
             self._paint_erase(p)
         elif self.mode == self.SELECT:
             self._paint_select(p)
+        elif self.mode == self.PAINT:
+            self._paint_colorbrush(p)
 
     def _paint_float(self, p):
         img, x, y = self._float
@@ -772,6 +782,31 @@ class ImageCanvas(QWidget):
                         p.drawRect(r)
         if self.select_shape in ("quick", "brush") and self._hover is not None:
             r = max(2.0, self.quick_prev * z / 2)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(QColor(20, 24, 34), 3))
+            p.drawEllipse(self._hover, r, r)
+            p.setPen(QPen(QColor(255, 255, 255), 1.4))
+            p.drawEllipse(self._hover, r, r)
+
+    def _paint_colorbrush(self, p):
+        """Colour brush: the stroke is shown in the real colour while drawing, plus the size circle under the mouse."""
+        z = self.zoom
+        er = self._erase
+        if er is not None and er["kind"] == "paint":
+            pts = [self.to_wid(q) for q in er["pts"]]
+            col = QColor(*self.paint_rgb)
+            col.setAlphaF(self.paint_opacity)
+            w = max(1.0, self.brush_prev * z)
+            if len(pts) > 1:
+                p.setPen(QPen(col, w, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawPolyline(QPolygonF(pts))
+            else:
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QBrush(col))
+                p.drawEllipse(pts[0], w / 2.0, w / 2.0)
+        if self._hover is not None:
+            r = max(2.0, self.brush_prev * z / 2)
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.setPen(QPen(QColor(20, 24, 34), 3))
             p.drawEllipse(self._hover, r, r)
@@ -1017,6 +1052,9 @@ class ImageCanvas(QWidget):
                 ip = self._inside(ip)
                 self._erase = {"kind": self.select_shape, "pts": [ip]}
                 self.update()
+        elif self.mode == self.PAINT:
+            self._erase = {"kind": "paint", "pts": [self._inside(ip)]}
+            self.update()
         elif self.mode == self.MOVESEL:
             self._start_float(ip, bool(e.modifiers() & Qt.KeyboardModifier.AltModifier) or self.copy_mode)
         elif self.mode == self.ERASE:
@@ -1110,7 +1148,7 @@ class ImageCanvas(QWidget):
         if self._erase is not None:
             ip = self._inside(self.to_img(pos))
             pts = self._erase["pts"]
-            if self._erase["kind"] in ("brush", "lasso", "quick"):
+            if self._erase["kind"] in ("brush", "lasso", "quick", "paint"):
                 last = pts[-1]
                 if math.hypot(ip.x() - last.x(), ip.y() - last.y()) >= max(1.0, 2.0 / self.zoom):
                     pts.append(ip)
@@ -1118,7 +1156,7 @@ class ImageCanvas(QWidget):
                 self._erase["pts"] = [pts[0], ip]
             self.update()
             return
-        if self.mode in (self.PICK, self.ERASE, self.SELECT):
+        if self.mode in (self.PICK, self.ERASE, self.SELECT, self.PAINT):
             self.update()
         elif self.mode in (self.CROP, self.PERSP):
             self._update_cursor(pos)
@@ -1149,6 +1187,11 @@ class ImageCanvas(QWidget):
             self._pan_last = None
             return
         er, self._erase = self._erase, None
+        if er is not None and self.mode == self.PAINT:
+            if e.button() == Qt.MouseButton.LeftButton and er["kind"] == "paint":
+                self.paintFinished.emit([(q.x(), q.y()) for q in er["pts"]])
+            self.update()
+            er = None
         if er is not None and self.mode == self.SELECT and e.button() == Qt.MouseButton.LeftButton:
             pts, kind = er["pts"], er["kind"]
             mod = getattr(self, "_sel_mod", "")
@@ -1184,7 +1227,7 @@ class ImageCanvas(QWidget):
             self.setCursor(C.OpenHandCursor)
         elif self.mode == self.PICK:
             self.setCursor(self._pick_cursor)
-        elif self.mode in (self.ERASE, self.SELECT):
+        elif self.mode in (self.ERASE, self.SELECT, self.PAINT):
             self.setCursor(C.CrossCursor)
         elif self.mode in (self.MOVESEL, self.TRANSFORM):
             self.setCursor(C.SizeAllCursor)
@@ -1234,7 +1277,7 @@ class ImageCanvas(QWidget):
         if self.mode in (self.CROP, self.PERSP, self.TRANSFORM) and e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             self.applyRequested.emit()
             return
-        if self.mode == self.SELECT and e.key() == Qt.Key.Key_Escape:
+        if self.mode in (self.SELECT, self.PAINT) and e.key() == Qt.Key.Key_Escape:
             self._erase = None
             self.update()
             return

@@ -673,7 +673,7 @@ class MainWindow(QMainWindow):
         sc("Escape", cur(lambda c: c.cancel_pending()))
         # tools (single letters, like in a picture editor)
         for key, tool in (("V", "move"), ("M", "rect"), ("L", "lasso"), ("W", "color"), ("B", "brush"),
-                          ("E", "erase_brush"), ("C", "crop"), ("I", "pick"), ("H", "view")):
+                          ("E", "erase_brush"), ("C", "crop"), ("I", "pick"), ("P", "paint"), ("H", "view")):
             sc(key, cur(lambda c, t=tool: c.choose_tool(t)))
         # zoom
         sc("Ctrl+0", cur(lambda c: c.canvas.fit()))

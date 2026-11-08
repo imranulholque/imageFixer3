@@ -1772,6 +1772,40 @@ def sel_grow(m, px):
     return out if float(out.max()) > 0.02 else None
 
 
+def paint_brush(img, pts, brush, rgb, opacity=1.0, softness=0.0, sel=None, alpha=None):
+    """Color brush (like a paint brush in a picture editor).  pts = brush stroke in real picture pixels, brush = width.
+    Paints `rgb` along the stroke.  sel = selection (float 0..1, any size) -> paint only inside it; None = everywhere.
+    alpha = PIL 'L' transparency of a placed picture -> paint only where the picture is (transparent stays transparent).
+    opacity 0..1, softness 0 (hard edge) .. 100 (very soft).  Only the part around the stroke is processed (fast)."""
+    img = img if img.mode == "RGB" else img.convert("RGB")
+    W, H = img.size
+    if not pts:
+        return img
+    w = max(1.0, float(brush))
+    rad = max(0.8, float(softness) / 100.0 * w * 0.5)
+    xs = [float(p[0]) for p in pts]
+    ys = [float(p[1]) for p in pts]
+    pad = w / 2.0 + rad * 3.0 + 3.0
+    x0, y0 = max(0, int(math.floor(min(xs) - pad))), max(0, int(math.floor(min(ys) - pad)))
+    x1, y1 = min(W, int(math.ceil(max(xs) + pad))), min(H, int(math.ceil(max(ys) + pad)))
+    if x1 <= x0 or y1 <= y0:
+        return img
+    local = [(x - x0, y - y0) for x, y in zip(xs, ys)]
+    m = make_mask((x1 - x0, y1 - y0), "brush", local, brush=w).filter(_PilFilter.GaussianBlur(rad))
+    a = np.asarray(m, dtype=np.float32) / 255.0
+    if sel is not None:
+        a = a * resize_mask(sel, (W, H))[y0:y1, x0:x1]
+    if alpha is not None:
+        a = a * (np.asarray(alpha.crop((x0, y0, x1, y1)), dtype=np.float32) / 255.0)
+    a = a * float(max(0.0, min(1.0, opacity)))
+    reg = np.asarray(img.crop((x0, y0, x1, y1)), dtype=np.float32)
+    col = np.array([int(v) for v in rgb], dtype=np.float32)
+    res = reg + (col - reg) * a[..., None]
+    out = img.copy()
+    out.paste(Image.fromarray(np.clip(res + 0.5, 0, 255).astype(np.uint8)), (x0, y0))
+    return out
+
+
 def fill_region(img, mask, rgb):
     """Paints the masked area with one colour. mask = PIL 'L' at the picture's size."""
     solid = Image.new("RGB", img.size, tuple(int(v) for v in rgb))

@@ -1,13 +1,15 @@
 IMAGE FIXER  (Windows)
 ======================
 Clean many text pictures (WhatsApp photos, scans) and print them. One big card per picture - slide to the next.
- Top bar (dropdown menus):  Select v | Move v | Eyedropper | Erase v | Crop v      Right side tabs: Adjust | Shadow | Text | Save
+ Top bar (dropdown menus):  Select v | Move v | Eyedropper | Color Brush | Erase v | Crop v      Right side tabs: Adjust | Shadow | Text | Save
  - Select v:    Quick select, Brush, Box, Ellipse, Freehand, Color range (click a color). Options bar: New / Add / Subtract /
                 Intersect, All / None / Inverse, Grow / Shrink. Shift = add, Alt = subtract.
  - EVERYTHING acts only inside the selection (brightness, contrast, saturation, hue, warmth, color change, shadow removal,
    sharpness, erase). No selection = whole picture. Example: Color range on the red part, Hue +120 -> red becomes green.
  - Delete key:  deletes the selection (filled from the paper around it).   Fill color (Adjust tab) fills it with a color.
  - Move v:      drag = move, Alt + drag = copy, Ctrl+T = Transform (resize / rotate, Enter = apply).
+ - Color Brush (P): paints with the fill color (swatch in the options bar / Adjust tab). Select something first = the color goes ONLY
+                inside the selection; no selection = paint anywhere on the page. Size, Opacity, Softness. One stroke = one Ctrl+Z step.
  - Eyedropper:  click a color -> slider (fade / stronger) and "Change to..." (recolor, shading stays). Respects the selection.
  - Shadow tab:  One-click removal (Strength, Paper whiteness, Text darkness, Shadow size, Even out the light, Shadow depth,
                 Keep paper color, Clean the paper, Color-Gray-B&W) AND Manual shadow removal that works with no click:
@@ -49,7 +51,7 @@ ADDING PICTURES
 KEYS
  Ctrl+Z undo (step by step) ... Ctrl+Y / Ctrl+Shift+Z redo     Del delete selection      Ctrl+T transform
  Ctrl+A all, Ctrl+D none, Ctrl+Shift+I inverse                 Enter / Esc apply / cancel crop or transform
- V move, M box, L freehand, W quick select, B brush select, E erase, C crop, I eyedropper, H hand (Space + drag = pan)
+ V move, M box, L freehand, W quick select, B brush select, E erase, C crop, I eyedropper, P color brush, H hand (Space + drag = pan)
  Ctrl + wheel zoom, Ctrl +/- zoom, Ctrl+0 fit, Ctrl+1 100%     Left / Right previous / next picture
  Ctrl+S save, Ctrl+Shift+S save all edited, Ctrl+C copy picture
 

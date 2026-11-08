@@ -25,7 +25,7 @@ EXPORT_DIR = os.path.join(tempfile.gettempdir(), "imagefixer_export")
 
 # tool key -> (canvas mode, shape)
 TOOL_MODE = {
-    "view": (ImageCanvas.VIEW, None), "pick": (ImageCanvas.PICK, None),
+    "view": (ImageCanvas.VIEW, None), "pick": (ImageCanvas.PICK, None), "paint": (ImageCanvas.PAINT, None),
     "quick": (ImageCanvas.SELECT, "quick"), "brush": (ImageCanvas.SELECT, "brush"), "deselect": (ImageCanvas.SELECT, "brush"),
     "rect": (ImageCanvas.SELECT, "rect"), "ellipse": (ImageCanvas.SELECT, "ellipse"),
     "lasso": (ImageCanvas.SELECT, "lasso"), "color": (ImageCanvas.SELECT, "color"),
@@ -46,6 +46,8 @@ NAMES = {"quick": "Quick select", "brush": "Brush select", "deselect": "Deselect
          "erase_brush": "Brush", "erase_rect": "Box", "erase_ellipse": "Ellipse", "erase_lasso": "Freehand",
          "crop": "Crop", "persp": "Straighten", "crop_circle": "Circle", "crop_oval": "Oval", "crop_round": "Rounded box"}
 HINTS = {
+    "paint": "Paint with the fill color (swatch on the right; also in the Adjust tab).  With a selection the color goes ONLY inside it, "
+             "without a selection you can paint anywhere on the page.  Size / Opacity / Softness like a paint brush.",
     "view": "Hand: drag the picture.  (Hold Space and drag in any tool, or Ctrl + wheel to zoom)",
     "pick": "Click a color in the picture (ink, stamp, text): its slider appears in the Adjust tab.",
     "quick": "Brush over an object: the selection grows to its edges.  Shift = add,  Alt = subtract.",
@@ -794,6 +796,9 @@ class Card(QWidget):
         self.btnPick = QPushButton("Eyedropper")
         self.btnPick.setCheckable(True)
         self.btnPick.setToolTip("Click a color in the picture to change only that color (I)")
+        self.btnPaint = QPushButton("Color Brush")
+        self.btnPaint.setCheckable(True)
+        self.btnPaint.setToolTip("Paint with a color (P). Inside the selection only - or anywhere if nothing is selected.")
         T = self.choose_tool
         self.menuSelect = self._menu_button("Select", [
             ("Brush select      B", lambda: T("brush")),
@@ -834,7 +839,7 @@ class Card(QWidget):
         self.lblZoom.setToolTip("Zoom: Ctrl + mouse wheel,  Ctrl +/-,  Ctrl+0 = fit,  Ctrl+1 = 100%")
         r2.addWidget(self.btnHand)
         r2.addWidget(self._sep())
-        for w in (self.menuSelect, self.menuMove, self.btnPick, self.menuErase, self.menuCrop):
+        for w in (self.menuSelect, self.menuMove, self.btnPick, self.btnPaint, self.menuErase, self.menuCrop):
             r2.addWidget(w)
         r2.addSpacing(10)
         r2.addWidget(self.btnLayerDone)
@@ -908,6 +913,33 @@ class Card(QWidget):
         sb.addWidget(self.sizeSlider)
         sb.addWidget(self.lblSize)
         a.addWidget(self.sizeBox)
+        self.paintBox = QWidget()                       # Color Brush: opacity, softness, color
+        pb = QHBoxLayout(self.paintBox)
+        pb.setContentsMargins(0, 0, 0, 0)
+        pb.setSpacing(6)
+        self.opSlider = NoWheelSlider(Qt.Orientation.Horizontal)
+        self.opSlider.setRange(1, 100)
+        self.opSlider.setValue(100)
+        self.opSlider.setFixedWidth(100)
+        self.opSlider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.opSlider.setToolTip("How strong the color is (100% = fully covers, lower = see-through)")
+        self.lblOp = self._label("100%")
+        self.lblOp.setMinimumWidth(40)
+        self.softSlider = NoWheelSlider(Qt.Orientation.Horizontal)
+        self.softSlider.setRange(0, 100)
+        self.softSlider.setValue(0)
+        self.softSlider.setFixedWidth(100)
+        self.softSlider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.softSlider.setToolTip("Edge of the brush: 0 = sharp, 100 = very soft")
+        self.lblSoft = self._label("0%")
+        self.lblSoft.setMinimumWidth(36)
+        self.brushSwatch = QPushButton()
+        self.brushSwatch.setFixedSize(34, 24)
+        self.brushSwatch.setToolTip("Brush color. Click to choose another color.")
+        for w in (self._label("Opacity"), self.opSlider, self.lblOp, self._label("Softness"), self.softSlider,
+                  self.lblSoft, self._label("Color"), self.brushSwatch):
+            pb.addWidget(w)
+        a.addWidget(self.paintBox)
         self.tolBox = QWidget()
         tb = QHBoxLayout(self.tolBox)
         tb.setContentsMargins(0, 0, 0, 0)
@@ -999,6 +1031,10 @@ class Card(QWidget):
         # --- wiring
         self.btnHand.clicked.connect(lambda: self.choose_tool("view"))
         self.btnPick.clicked.connect(lambda: self.choose_tool("pick"))
+        self.btnPaint.clicked.connect(lambda: self.choose_tool("paint"))
+        self.opSlider.valueChanged.connect(self._sync_paint)
+        self.softSlider.valueChanged.connect(self._sync_paint)
+        self.brushSwatch.clicked.connect(self._pick_fill)
         self.modeGroup.idClicked.connect(lambda i: setattr(self, "sel_mode", ("new", "add", "sub", "int")[i]))
         self.btnSelAll.clicked.connect(self.select_all)
         self.btnDeselect.clicked.connect(self.deselect)
@@ -1013,6 +1049,7 @@ class Card(QWidget):
         self.canvas.applyRequested.connect(self.apply_pending)
         self.canvas.cancelRequested.connect(self.cancel_pending)
         self.canvas.eraseFinished.connect(self._on_erase)
+        self.canvas.paintFinished.connect(self._on_paint)
         self.canvas.sourcePicked.connect(self._on_source)
         self.canvas.selectFinished.connect(self._on_select)
         self.canvas.moveFinished.connect(self._on_move)
@@ -1036,7 +1073,7 @@ class Card(QWidget):
         self.colors.activated.connect(self._set_focus)
         self.colors.selectAdj.connect(self._select_adj)
         self.exportReady.connect(self._on_export_ready)
-        self._tool_widgets = [self.btnHand, self.btnPick, self.btnApply, self.btnCancel, self.btnSelAll,
+        self._tool_widgets = [self.btnHand, self.btnPick, self.btnPaint, self.btnApply, self.btnCancel, self.btnSelAll,
                               self.btnDeselect, self.btnInvert, self.btnGrow, self.btnShrink, self.btnSave,
                               self.btnSaveAs, self.btnPdfAll, self.btnPrint, self.btnApplyAll, self.btnCopy, self.btnDrag,
                               self.btnShadow, self.btnFill, self.btnDelete, self.btnPickFill] \
@@ -1397,6 +1434,9 @@ class Card(QWidget):
     def _paint_swatch(self):
         r, g, b = self.fill_rgb
         self.swatch.setStyleSheet("background: rgb(%d,%d,%d); border-radius: 7px; border: 1px solid #4a5268;" % (r, g, b))
+        if hasattr(self, "brushSwatch"):                 # the Color Brush uses the same color
+            self.brushSwatch.setStyleSheet("background: rgb(%d,%d,%d); border-radius: 5px; border: 1px solid #4a5268;" % (r, g, b))
+            self.canvas.set_paint(self.fill_rgb, self.opSlider.value() / 100.0)
         if hasattr(self, "edHex") and not self.edHex.hasFocus():
             self.edHex.setText("#%02X%02X%02X" % (r, g, b))
 
@@ -2968,6 +3008,7 @@ class Card(QWidget):
             self.canvas.set_erase(SHAPES[key])
         self.btnHand.setChecked(key == "view")
         self.btnPick.setChecked(key == "pick")
+        self.btnPaint.setChecked(key == "paint")
         for fam, keys in (("select", SELECT_KEYS), ("move", MOVE_KEYS), ("erase", ERASE_KEYS), ("crop", CROP_KEYS)):
             b = self.menus[fam]
             on = key in keys
@@ -2977,15 +3018,17 @@ class Card(QWidget):
         pend = key in CROP_KEYS or key == "transform"
         self.btnApply.setVisible(pend)
         self.btnCancel.setVisible(pend)
-        self.optsA.setVisible(sel_t or er or key == "transform")
+        self.optsA.setVisible(sel_t or er or key in ("transform", "paint"))
         self.tfBox.setVisible(key == "transform")
         self.optsB.setVisible(sel_t or key in MOVE_KEYS)
         self.modeBox.setVisible(sel_t)
-        self.sizeBox.setVisible(key in ("quick", "brush", "erase_brush", "deselect"))
+        self.sizeBox.setVisible(key in ("quick", "brush", "erase_brush", "deselect", "paint"))
+        self.paintBox.setVisible(key == "paint")
         self.tolBox.setVisible(key in ("quick", "color", "deselect"))
         self._tol_mode(key)
         self.btnClone.setVisible(er and self.clone_src is not None)
         self._sync_brush()
+        self._sync_paint()
         self.lblHint.setText(HINTS[key])
 
     def set_tf_mode(self, k):
@@ -3039,6 +3082,25 @@ class Card(QWidget):
         self.lblSize.setText("%d px" % size)
         self.canvas.set_brush(size * self.scale)
         self.canvas.set_quick_brush(size * self.scale)
+
+    def _sync_paint(self, *_):
+        self.lblOp.setText("%d%%" % self.opSlider.value())
+        self.lblSoft.setText("%d%%" % self.softSlider.value())
+        self.canvas.set_paint(self.fill_rgb, self.opSlider.value() / 100.0)
+
+    def _on_paint(self, pts):
+        """A Color Brush stroke: paint it with the fill color - inside the selection only, or anywhere without one."""
+        if not self._loaded or not pts:
+            return
+        s = self.scale
+        payload = [(x / s, y / s) for x, y in pts]
+        size, rgb = self.sizeSlider.value(), self.fill_rgb
+        opacity, soft = self.opSlider.value() / 100.0, self.softSlider.value()
+        base, sel, alpha = self.base, self.sel, self.alpha
+        if self.ctx is None:
+            alpha = None
+        self._edit_base("Painting", lambda progress: core.paint_brush(base, payload, size, rgb, opacity, soft, sel, alpha),
+                        msg="Painted. Ctrl+Z undoes the stroke.")
 
     def _on_source(self, x, y):
         self.clone_src = (x, y)

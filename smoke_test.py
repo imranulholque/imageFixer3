@@ -158,6 +158,20 @@ def t_erase():
     c.undo_step(); c.deselect()
 step("erase limited to selection", t_erase)
 
+# 11b color brush: only inside the selection, anywhere without one, one undo step per stroke
+def t_paint():
+    c.sel = None; c.deselect(); c._set_tool("paint"); assert c._tool == "paint"
+    c._set_fill((0, 0, 255)); c.sizeSlider.setValue(40); c.opSlider.setValue(100); c.softSlider.setValue(0)
+    c._on_paint([(400.0, 500.0), (700.0, 500.0)])                       # no selection: paints on the page
+    assert tuple(c.base.getpixel((550, 500))) == (0, 0, 255), c.base.getpixel((550, 500))
+    c.undo_step(); assert tuple(c.base.getpixel((550, 500))) != (0, 0, 255)
+    c._on_select("rect", (80, 80, 200, 240), "new"); c._set_tool("paint")
+    c._on_paint([(20.0, 150.0), (700.0, 150.0)])                        # with a selection: only inside it
+    assert tuple(c.base.getpixel((150, 150))) == (0, 0, 255), c.base.getpixel((150, 150))
+    assert tuple(c.base.getpixel((250, 150))) != (0, 0, 255), "paint went outside selection"
+    c.undo_step(); c.deselect(); c._set_fill((255, 255, 255))
+step("color brush (selection / no selection / undo)", t_paint)
+
 # 12 crop, rotate, reset, undo across base change
 def t_crop():
     c._set_tool("crop"); c.apply_pending(); assert c.base.size[0] < 800 and c.base.size[1] < 600, c.base.size
