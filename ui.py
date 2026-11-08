@@ -438,8 +438,14 @@ class MainWindow(QMainWindow):
         self.btnPdfAll = QPushButton("Save all as PDF")
         self.btnPdfAll.setToolTip("One PDF with every open picture, one page each")
         self.btnPdfAll.clicked.connect(self.save_all_pdf)
+        self.btnApplyAll = QPushButton("Apply last setting to all")
+        self.btnApplyAll.setProperty("good", True)
+        self.btnApplyAll.setToolTip("Copies ONLY the setting you changed last (one slider, the shadow removal, or the picked colors) "
+                                    "to all the other pictures. Crop, erase, move ... are never copied.")
+        self.btnApplyAll.clicked.connect(lambda: self._with_loaded(self.apply_to_all))
         l.addWidget(self.btnChoose)
         l.addWidget(self.btnPhone)
+        l.addWidget(self.btnApplyAll)
         l.addStretch(1)
         self.btnFolder = QPushButton("Save folder: not set")
         self.btnFolder.setMinimumWidth(60)
@@ -486,7 +492,6 @@ class MainWindow(QMainWindow):
         self.actPdfAll = act("All pages as one PDF", self.save_all_pdf)
         self.actPrint = act("Print...   Ctrl+P", lambda: self._with_loaded(lambda c: self.print_cards([c])))
         m.addSeparator()
-        self.actApplyAll = act("Apply last setting to all pictures", lambda: self._with_loaded(self.apply_to_all))
         self.actCopy = act("Copy picture   Ctrl+C", lambda: self._with_loaded(lambda c: c.copy_image()))
         self.btnSaveMore.setMenu(m)
         bl.addWidget(self.btnSave)
@@ -793,6 +798,7 @@ class MainWindow(QMainWindow):
         self.btnOpenDir.setVisible(w >= 880)
         self.btnPhone.setText("Add from phone" if w >= 1000 else "Phone")
         self.btnChoose.setText("+  Choose files" if w >= 900 else "+  Files")
+        self.btnApplyAll.setText("Apply last setting to all" if w >= 1150 else "Apply to all")
         self._refresh_dir()
         if self._phone_dlg is not None and self._phone_dlg.isVisible():
             self._phone_dlg.reposition()
@@ -1119,6 +1125,7 @@ class MainWindow(QMainWindow):
             self.actPdfAll.setEnabled(n > 0)
             for w in (self.btnSave, self.btnSaveMore):
                 w.setEnabled(n > 0)
+            self.btnApplyAll.setEnabled(n > 1)
         for c in (self.carousel.cards if n else []):
             c.btnSaveAll.setText(label)
             c.btnSaveAll.setEnabled(unsaved > 0)

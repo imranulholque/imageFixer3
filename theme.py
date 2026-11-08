@@ -87,6 +87,9 @@ QPushButton[accent="true"]:hover { background: qlineargradient(x1:0,y1:0,x2:1,y2
 QPushButton[accent="true"]:disabled { background: #2a2f3f; color: #6b7388; }
 QPushButton[danger="true"] { background: #3a1b22; border-color: #5a2630; color: #ffb4bd; }
 QPushButton[danger="true"]:hover { background: #4a222b; }
+QPushButton[good="true"] { background: #1c7c54; border: none; color: white; font-weight: 600; }
+QPushButton[good="true"]:hover { background: #22966a; }
+QPushButton[good="true"]:disabled { background: #2a2f3f; color: #6b7388; }
 QToolButton { background: #222836; border: 1px solid #30374a; border-radius: 8px; padding: 4px 10px; }
 QToolButton:hover { background: #2b3246; }
 QToolButton:disabled { color: #5d6475; background: #181c26; border-color: #232838; }
