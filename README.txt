@@ -7,6 +7,9 @@ Clean many text pictures (WhatsApp photos, scans) and print them. One big card p
  - EVERYTHING acts only inside the selection (brightness, contrast, saturation, hue, warmth, color change, shadow removal,
    sharpness, erase). No selection = whole picture. Example: Color range on the red part, Hue +120 -> red becomes green.
  - Color range 'Preview' tick: shows the selection as black and white (white = selected, grey = partly, black = not), like Photoshop; move Fuzziness to see what changes.
+ - Stamp removal is smart: a coloured stamp over writing of ANY other colour (black, grey, blue ink, red ...) is separated from the writing
+                (the stamp colour is learned from the selected pixels, the writing colour from the writing around the stamp), so the letters
+                under the stamp are rebuilt and the faint halo of the stamp goes too. Writing with the SAME colour as the stamp cannot be separated.
  - Delete key:  deletes the selection (filled from the paper around it).   Fill color (Adjust tab) fills it with a color.
  - Move v:      drag = move, Alt + drag = copy, Ctrl+T = Transform (resize / rotate, Enter = apply).
  - Color Brush (P): paints with the fill color (swatch in the options bar / Adjust tab). Select something first = the color goes ONLY
