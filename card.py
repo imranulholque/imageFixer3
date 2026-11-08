@@ -715,10 +715,13 @@ class Card(QWidget):
         """Settings made with a selection active are written into the picture (inside the selection) before the
         selection goes away / changes, so they never spill over to the whole picture.  Returns True when it
         started (then() is called when finished)."""
-        if not self._loaded or self.sel is None or not self._pending_settings():
+        if not self._loaded or not self._pending_settings() or (manual and self.sel is None):
             if manual:
                 self._warn("Nothing to apply: select something and change a setting first.")
             return False
+        # Settings made with NO selection belong to the whole picture: they are written into it now (whole picture),
+        # otherwise the new selection would take them over and the rest of the picture would go back to how it was.
+        whole = self.sel is None
         a0, l0, sel0, base0 = copy.deepcopy(self.adjs), dict(self.look), self.sel, self.base
         self._checkpoint()                           # one undo step brings the settings back
         self.adjs = []
@@ -728,8 +731,11 @@ class Card(QWidget):
 
         def make(progress):
             return core.render_full(base0, a0, l0, sel0), sel0
-        self._edit_base("Applying to the selection", make, after=then, checkpoint=False,
-                        msg="Applied to the selection." if manual else None)
+        self._edit_base("Applying your changes to the whole picture" if whole else "Applying to the selection", make,
+                        after=then, checkpoint=False,
+                        msg=("Applied to the selection." if manual else
+                             ("Your changes so far are part of the picture now. New changes go only to the selection."
+                              if whole else None)))
         return True
 
     def _look_row(self, key, title, lo, hi, caps, tip, unit="%"):
