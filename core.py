@@ -1315,6 +1315,95 @@ def _keep_dark_ink(reg, hole_img, res):
     return res * (1 - s) + gray * s
 
 
+def _top_dir(A):
+    """Main direction (unit vector, pointing to positive values) of the rows of A, and how much of the energy it holds (0..1)."""
+    M = A.T @ A / max(1, len(A))
+    w, ev = np.linalg.eigh(M)
+    k = ev[:, -1].astype(np.float32)
+    if k.sum() < 0:
+        k = -k
+    return k, float(w[-1]) / max(float(w.sum()), 1e-9)
+
+
+def _unmix_stamp(reg, F, hard):
+    """Smart stamp removal.  One coloured stamp lies over writing of ANY other colour (black, grey, blue ink, red ...).
+    Printing is multiplicative, so in log space every pixel is a sum:
+        -log(pixel / paper)  =  t * kt  +  d * ks
+    kt = the writing's colour, ks = the stamp's colour (unit vectors), t / d = how much writing / stamp is in that pixel.
+    ks is learned from the removed (selected) pixels, kt from the writing OUTSIDE the stamp (grey if there is none).
+    Per pixel t and d are solved (both >= 0), then the writing is put back (paper * exp(-t kt)) and the stamp is gone: the
+    letters under the stamp are RECONSTRUCTED.  The faint halo of the stamp around the selection is cleaned the same way.
+    It cannot work when the writing and the stamp have the same colour (then None -> the older method is used).
+    Returns (T, W): T = writing transmittance (h, w, 3), W = where to apply it (h, w, 0..1), or None.
+    reg = uint8 (h, w, 3) region, F = paper estimate (h, w, 3), hard = PIL 'L' mask of the removed thing (same region)."""
+    hm = np.asarray(hard) > 127
+    nh = int(hm.sum())
+    if nh < 30:
+        return None
+    x = np.log(np.maximum(reg.astype(np.float32), 1.0) / np.maximum(F.astype(np.float32), 1.0))
+    A = np.maximum(-x, 0.0)                              # how much each channel is darkened by ink (>= 0)
+    mag = np.sqrt((A ** 2).sum(2))
+    # chroma of the removed pixels must exist (else it is not a coloured stamp: the old method handles it)
+    chroma = np.sqrt(((A - A.mean(2, keepdims=True)) ** 2).sum(2))
+    est = hm & (mag > 0.08)
+    n = int(est.sum())
+    if n < 30 or n < 0.04 * nh or int((hm & (chroma > 0.06)).sum()) < 20:
+        return None
+    # the writing's colour kt: dark / coloured ink pixels outside the stamp and its halo (grey if there is none).
+    # The stamp's colour ks: what is left of the removed pixels when the writing direction is taken out - the writing only
+    # moves a pixel along kt, so the pixels are spread between kt and ks, and the stamp-only pixels sit on the ks end.
+    bb = hard.getbbox()
+    r = int(max(3, min(12, 0.03 * max(bb[2] - bb[0], bb[3] - bb[1]))))
+    hard_b = hard.point(lambda q: 255 if q > 127 else 0)
+    zone_img = hard_b.filter(ImageFilter.MaxFilter(2 * r + 1))
+    zone = np.asarray(zone_img) > 127
+    zone2 = np.asarray(zone_img.filter(ImageFilter.MaxFilter(2 * r + 1))) > 127
+    outside = (~zone2) & (mag > 0.12)
+    Ae = A[est]
+    kt = np.ones(3, np.float32) / np.sqrt(3.0)
+    ks = None
+    for _ in range(2):
+        a_ = Ae @ kt
+        P = Ae - a_[:, None] * kt[None, :]
+        u, ratio_u = _top_dir(P)
+        if ratio_u < 0.7:
+            return None                                   # the removed thing has no single colour
+        if float((P @ u).mean()) < 0:
+            u = -u
+        th = np.arctan2(np.sqrt((P ** 2).sum(1)), a_)
+        big = np.sqrt((Ae ** 2).sum(1)) > 0.25
+        ths = float(np.percentile(th[big] if int(big.sum()) >= 20 else th, 70))
+        ks = (np.cos(ths) * kt + np.sin(ths) * u).astype(np.float32)
+        ks /= max(float(np.linalg.norm(ks)), 1e-6)
+        cosk = (A @ ks) / np.maximum(mag, 1e-6)
+        txt = outside & (cosk < 0.95)
+        if int(txt.sum()) < 40:
+            if int((outside & (cosk >= 0.95)).sum()) >= 150:
+                return None                               # the writing around has the stamp's colour: cannot be told apart
+            break
+        k2, ratio_t = _top_dir(A[txt])
+        if ratio_t < 0.8:
+            break
+        kt = k2
+    c = float(kt @ ks)
+    if c > 0.975:
+        return None                                       # writing and stamp look the same: cannot be told apart
+    det = 1.0 - c * c
+    b1, b2 = A @ kt, A @ ks
+    t = (b1 - c * b2) / det
+    d = (b2 - c * b1) / det
+    t = np.where(t < 0, 0.0, np.where(d < 0, np.maximum(b1, 0.0), t))      # both must be >= 0
+    d = np.where(t <= 0, np.maximum(b2, 0.0), np.where(d < 0, 0.0, d))
+    d95 = float(np.percentile(d[est], 95))
+    if d95 < 0.05:
+        return None
+    t = np.maximum(t - 0.06, 0.0)                        # a little darkening is noise, not writing
+    T = np.exp(-t[..., None] * kt[None, None, :]).astype(np.float32)
+    presence = np.clip(d / (0.2 * d95), 0.0, 1.0)
+    W = np.where(zone, np.maximum(hm.astype(np.float32), presence), 0.0).astype(np.float32)
+    return T, W
+
+
 def _ink_like(reg, F):
     """Pixels that clearly differ from the paper estimate F (dark / coloured: writing, lines, stamps)."""
     d = np.abs(reg.astype(np.float32) - F.astype(np.float32)).sum(2)
@@ -1397,7 +1486,13 @@ def erase_region(img, mask, offset=None, feather=1.5, keep_ink=False):
         if int(ring.sum()) > 50:                   # heal: same texture, but the tone of the new surroundings
             res = src + (np.median(reg[ring].astype(np.float32), axis=0) - np.median(src[ring], axis=0))
     if keep_ink and offset is None:
-        res = _keep_dark_ink(reg, hard.crop(box), res)
+        un = _unmix_stamp(reg, F, hard.crop(box))
+        if un is not None:                                   # coloured stamp over writing: put the writing back
+            T, Wz = un
+            res = res * T
+            soft = np.maximum(soft, Wz[..., None])
+        else:
+            res = _keep_dark_ink(reg, hard.crop(box), res)
     out = reg.astype(np.float32) * (1 - soft) + res * soft
     result = img.copy()
     result.paste(Image.fromarray(np.clip(out + 0.5, 0, 255).astype(np.uint8)), (box[0], box[1]))
