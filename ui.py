@@ -63,9 +63,12 @@ class Strip(QListWidget):
     to other programs."""
     removeRequested = Signal(list)      # uids of the selected pictures
     copyRequested = Signal(list)
+    stepRequested = Signal(int)         # wheel over the thumbnails: +1 = next picture, -1 = previous
 
     def __init__(self):
         super().__init__()
+        self._wheel = 0
+        self._last_wheel = 0.0
         self.provider = None            # provider(list of uids) -> QMimeData
         self.preparer = None            # preparer(uid): make the edited file in the background
         self._press = None
@@ -75,6 +78,22 @@ class Strip(QListWidget):
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._context_menu)
         self.itemEntered.connect(lambda it: self.preparer(it.data(Qt.ItemDataRole.UserRole)) if self.preparer else None)
+
+    def wheelEvent(self, e):
+        # the wheel over the thumbnails changes the picture, one by one
+        d = e.angleDelta().y() or e.angleDelta().x()
+        if not d:
+            e.ignore()
+            return
+        now = time.monotonic()
+        if now - self._last_wheel > 0.6:
+            self._wheel = 0
+        self._last_wheel = now
+        self._wheel += d
+        if abs(self._wheel) >= 120:
+            self.stepRequested.emit(1 if self._wheel < 0 else -1)
+            self._wheel = 0
+        e.accept()
 
     def uids(self):
         """Selected pictures, in the order of the strip."""
@@ -331,23 +350,7 @@ class Carousel(QWidget):
         self._layout()
 
     def wheelEvent(self, e):
-        # Shift + mouse wheel anywhere on a card slides to the next / previous picture
-        if e.modifiers() & Qt.KeyboardModifier.ShiftModifier:
-            d = e.angleDelta().y() or e.angleDelta().x()
-            now = time.monotonic()
-            if now - self._last_wheel > 0.6:
-                self._wheel = 0
-            self._last_wheel = now
-            self._wheel += d
-            if abs(self._wheel) >= 120:
-                if self._wheel < 0:
-                    self.next()
-                else:
-                    self.prev()
-                self._wheel = 0
-            e.accept()
-        else:
-            e.ignore()
+        e.ignore()          # the wheel belongs to whatever is under the pointer (picture, side panel, thumbnails)
 
 
 # ------------------------------------------------------------- main window
@@ -570,6 +573,7 @@ class MainWindow(QMainWindow):
         self.strip = Strip()
         self.strip.provider = self._mime_for
         self.strip.preparer = self._prepare_for
+        self.strip.stepRequested.connect(lambda d: self.carousel.next() if d > 0 else self.carousel.prev())
         self.strip.removeRequested.connect(self.remove_by_uids)
         self.strip.copyRequested.connect(self.copy_by_uids)
         self.strip.setDragEnabled(False)

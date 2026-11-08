@@ -1269,14 +1269,25 @@ class ImageCanvas(QWidget):
 
     # -------------------------------------------------------- wheel / keys
     def wheelEvent(self, e):
-        mods = e.modifiers()
-        if mods & Qt.KeyboardModifier.ShiftModifier or self._img is None:
-            e.ignore()                      # Shift + wheel slides to the next / previous picture
+        if self._img is None:
+            e.ignore()
             return
-        dy = e.angleDelta().y()
+        mods = e.modifiers()
+        dy, dx = e.angleDelta().y(), e.angleDelta().x()
         if mods & Qt.KeyboardModifier.ControlModifier:
-            self._set_zoom(self.zoom * (1.12 ** (dy / 120.0)), e.position())
+            self._set_zoom(self.zoom * (1.12 ** ((dy or dx) / 120.0)), e.position())
             e.accept()
+            return
+        if mods & Qt.KeyboardModifier.ShiftModifier or (dx and not dy):
+            # Shift + wheel (or a sideways wheel / touchpad swipe): the picture moves left / right
+            if self._iw * self.zoom > self.width():
+                self.off = QPointF(self.off.x() + (dy or dx) * 0.5, self.off.y())
+                self._autofit = False
+                self._clamp()
+                self.update()
+                e.accept()
+            else:
+                e.ignore()
             return
         if self._ih * self.zoom > self.height():
             self.off = QPointF(self.off.x(), self.off.y() + dy * 0.5)

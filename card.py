@@ -1371,7 +1371,7 @@ class Card(QWidget):
         gl2.addWidget(self.btnShadowReset)
         shparts["manual"] = g2
         # the three ways side by side: pick one, only that one is shown (faster than scrolling past all of them)
-        self.shStack = QStackedWidget()
+        shorder = []
         seg = QHBoxLayout()
         seg.setSpacing(4)
         self.shSeg = QButtonGroup(self)
@@ -1384,20 +1384,17 @@ class Card(QWidget):
             b.setToolTip(tip)
             self.shSeg.addButton(b, k)
             seg.addWidget(b, 1)
-            self.shStack.addWidget(shparts[key])
+            shorder.append(shparts[key])
         self.shSeg.button(0).setChecked(True)
 
         def sh_page(k):
-            for n in range(self.shStack.count()):                  # a hidden page must not keep the panel tall
-                w_ = self.shStack.widget(n)
-                pol = QSizePolicy.Policy.Preferred if n == k else QSizePolicy.Policy.Ignored
-                w_.setSizePolicy(pol, pol)
-            self.shStack.setCurrentIndex(k)
-            self.shStack.updateGeometry()
+            for n, w_ in enumerate(shorder):                       # hidden groups take no room: the chosen one sits right under the buttons
+                w_.setVisible(n == k)
+        lay.addLayout(seg)
+        for w_ in shorder:
+            lay.addWidget(w_)
         self.shSeg.idClicked.connect(sh_page)
         sh_page(0)
-        lay.addLayout(seg)
-        lay.addWidget(self.shStack)
         lay.addStretch(1)
         self.stackPages.addWidget(pg)
 
