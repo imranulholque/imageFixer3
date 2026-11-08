@@ -2038,16 +2038,16 @@ def homography(src, dst):
     return np.append(h, 1.0).reshape(3, 3)
 
 
-def warp_region(img, mask, grid, n, soft=1.0):
+def warp_region(img, mask, grid, n, soft=1.0, copy=False):
     """Perspective / distort / skew / warp of the selected part.
     grid = (n+1)*(n+1) points (x, y) in picture pixels, row by row: where the corners of the selection (n = 1) or
     the points of a 4x4 net (n = 3) are now.  The selected part is bent onto them; the old place is filled from the
-    surroundings.  Returns (new picture, new mask 'L')."""
+    surroundings (copy=True: the old place stays, only a copy is placed).  Returns (new picture, new mask 'L')."""
     hard = mask.point(lambda v: 255 if v > 16 else 0)
     bbox = hard.getbbox()
     if bbox is None:
         return img, mask
-    base = erase_region(img, mask, None, soft).convert("RGBA")
+    base = (img.copy() if copy else erase_region(img, mask, None, soft)).convert("RGBA")
     patch = img.crop(bbox).convert("RGBA")
     patch.putalpha(mask.crop(bbox))
     layer = warp_layer(patch, img.size, grid, n)

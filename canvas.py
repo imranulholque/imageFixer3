@@ -40,6 +40,7 @@ class ImageCanvas(QWidget):
     eraseFinished = Signal(str, object)   # ('brush'|'rect'|'ellipse'|'lasso', points) in picture pixels
     sourcePicked = Signal(float, float)   # Alt + click: spot to copy from (clone)
     selectFinished = Signal(str, object, str)   # ('quick'|'rect'|'lasso'|'color', data, ''|'add'|'sub') preview pixels
+    tfCopyChanged = Signal(bool)                 # Alt + drag inside Transform: True = a copy will be placed
     moveFinished = Signal(int, int, bool)       # dx, dy (preview pixels), True = copy (original stays)
     viewClicked = Signal(float, float)          # a plain click with the hand tool (select a picture layer there)
     tfCommitted = Signal()                      # a picture layer was moved / resized / rotated (mouse released)
@@ -377,6 +378,15 @@ class ImageCanvas(QWidget):
         rgba[..., 3] = np.clip(m[y0:y1, x0:x1] * 255, 0, 255).astype(np.uint8)
         img = QImage(rgba.data, rgba.shape[1], rgba.shape[0], rgba.shape[1] * 4, QImage.Format.Format_RGBA8888).copy()
         return img, x0, y0
+
+    def transform_copy(self):
+        """True when the transform was started with Alt + drag: apply makes a copy (the old place is not erased)."""
+        return bool(self._tf is not None and self._tf.get("copy"))
+
+    def set_transform_copy(self, on):
+        if self._tf is not None and not self._tf.get("layer"):
+            self._tf["copy"] = bool(on)
+            self.tfCopyChanged.emit(bool(on))
 
     def transform_params(self):
         """(points [(x, y) ...] row by row, n) in preview pixels."""
@@ -1085,6 +1095,10 @@ class ImageCanvas(QWidget):
                 self.layerOutside.emit(ip.x(), ip.y())
                 return
             self._tf_push()
+            if not self._tf.get("layer") and (e.modifiers() & Qt.KeyboardModifier.AltModifier):
+                if not self._tf.get("copy"):                  # Alt + drag: the original stays, a copy is placed
+                    self._tf["copy"] = True
+                    self.tfCopyChanged.emit(True)
             self._tf_drag = self._tf_start(hit, ip)
             return
         if self.mode == self.PICK:

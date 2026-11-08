@@ -61,7 +61,7 @@ HINTS = {
              "Shift+click = add a color,  Alt+click = take a color out.  The clicked color also becomes the fill color.",
     "move": "Drag inside the selection to move it (old place is filled from around).  Alt + drag = copy.",
     "copy": "Drag the selection: a copy is placed there, the original stays.",
-    "transform": "Scale / Rotate, Skew, Distort, Perspective, Warp (buttons).  Drag inside = move, round handle = rotate.  Keys: [ ] rotate 1°, Ctrl+[ ] 15°, arrows move.  "
+    "transform": "Scale / Rotate, Skew, Distort, Perspective, Warp (buttons).  Drag inside = move (Alt + drag = place a copy, the original stays), round handle = rotate.  Keys: [ ] rotate 1°, Ctrl+[ ] 15°, arrows move.  "
                  "Enter = apply,  Esc = cancel.",
     "crop": "Drag the box or its handles, then Apply (Enter).",
     "persp": "Drag the 4 corner points onto the 4 corners of the page, then Apply (Enter).",
@@ -1109,6 +1109,7 @@ class Card(QWidget):
         self.canvas.moveFinished.connect(self._on_move)
         self.canvas.viewClicked.connect(self._on_view_click)
         self.canvas.tfCommitted.connect(self._commit_layer_pts)
+        self.canvas.tfCopyChanged.connect(self._on_tf_copy)
         self.canvas.layerOutside.connect(self._on_layer_outside)
         self.canvas.layerEditRequested.connect(lambda: self.edit_layer(self._place_id) if self._place_id is not None else None)
         self.btnApply.clicked.connect(self.apply_pending)
@@ -3372,11 +3373,16 @@ class Card(QWidget):
                         alpha_make=(lambda progress: shaped()[1]) if inlayer else None,
                         msg="Cropped to the selected shape.")
 
+    def _on_tf_copy(self, on):
+        if on:
+            self.message.emit("Copy mode: the original stays where it is. Press Enter to place the copy.")
+
     def _apply_transform(self):
         p = self.canvas.transform_params()
         if p is None or self.sel is None or not self._loaded:
             return
         pts, n = p
+        copy_flag = self.canvas.transform_copy()
         s = self.scale
         grid = [(x / s, y / s) for x, y in pts]
         sel, base = self.sel, self.base
@@ -3384,10 +3390,10 @@ class Card(QWidget):
 
         def make(progress):
             mask = self._mask_img(sel, base.size)
-            new, nm = core.warp_region(base, mask, grid, n)
+            new, nm = core.warp_region(base, mask, grid, n, copy=copy_flag)
             nsel = core.resize_mask(np.asarray(nm, dtype=np.float32) / 255.0, (W, H))
             return new, (nsel if float(nsel.max()) > 0.02 else None)
-        self._edit_base("Transforming", make, after=self._go_move)
+        self._edit_base("Copying" if copy_flag else "Transforming", make, after=self._go_move)
 
     def rotate(self, deg_ccw):
         """Turn the whole picture (the page, or the picture layer being edited) by deg_ccw; pictures placed on the
