@@ -4,3 +4,4 @@ pillow
 pillow-heif
 segno
 pyinstaller
+pypdfium2

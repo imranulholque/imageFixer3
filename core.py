@@ -42,6 +42,10 @@ try:  # iPhone photos (optional)
 except Exception:
     pass
 
+PDF_EXT = ".pdf"
+PDF_DPI = 200               # a PDF page becomes a picture of about this resolution
+PDF_MAX_SIDE = 4200         # ... but never longer than this (pixels), so a big poster page does not eat all memory
+
 PREVIEW_MAX = 2400          # long side of the on-screen working copy (set at start-up from the screen, see below)
 QUALITY_LEVELS = {"fast": 1800, "balanced": 2400, "sharp": 3200, "max": 4096}
 
@@ -1297,9 +1301,34 @@ def _gray_from_L(L):
     return np.clip(v, 0, 1) * 255.0
 
 
-def _keep_dark_ink(reg, hole_img, res):
+def _writing_color(reg, F, hm, exclude=None):
+    """The real colour of the dark writing AROUND the removed place (outside it and its halo), as float RGB, or None.
+    Used to give the writing under a stamp exactly the colour the same writing has everywhere else - so it never turns
+    grey / bluish / lighter just because it was covered by a stamp.  exclude = pixels that must not count (stamp coloured)."""
+    ys, xs = np.nonzero(hm)
+    if len(ys) == 0:
+        return None
+    r = int(max(3, min(12, 0.03 * max(ys.max() - ys.min(), xs.max() - xs.min()))))
+    z = Image.fromarray((hm * 255).astype(np.uint8)).filter(ImageFilter.MaxFilter(2 * r + 1)).filter(ImageFilter.MaxFilter(2 * r + 1))
+    outside = np.asarray(z) < 128
+    L = rgb_to_lab(reg)[..., 0]
+    Lf = rgb_to_lab(np.clip(F, 0, 255).astype(np.uint8))[..., 0]
+    dark = outside & ((Lf - L) > 30.0)
+    if exclude is not None:
+        dark &= ~exclude
+    n = int(dark.sum())
+    if n < 40:
+        return None
+    pix = reg[dark].astype(np.float32)
+    k = max(20, int(0.35 * n))                              # the darkest part = the core of the strokes, not the soft edges
+    core_px = pix[np.argsort(L[dark])[:k]]
+    return np.median(core_px, axis=0).astype(np.float32)
+
+
+def _keep_dark_ink(reg, hole_img, res, wc=None):
     """A coloured stamp lies on top of black writing: where the removed pixels are clearly DARKER than the stamp ink,
-    the writing is still there - keep it (as neutral dark) instead of painting paper over it."""
+    the writing is still there - keep it instead of painting paper over it.  It gets the colour of the writing around
+    (wc); when there is no writing around, a neutral dark."""
     hm = np.asarray(hole_img) > 127
     if not hm.any():
         return res
@@ -1311,8 +1340,12 @@ def _keep_dark_ink(reg, hole_img, res):
     Lref = float(np.median(L[ink]))
     s = np.clip((Lref - L - 6.0) / (0.4 * Lref + 1.0), 0.0, 1.0) ** 0.7
     s = (s * hm)[..., None].astype(np.float32)
-    gray = np.repeat(_gray_from_L(L)[..., None], 3, 2)
-    return res * (1 - s) + gray * s
+    if wc is not None:
+        dark = np.empty_like(res)
+        dark[...] = np.asarray(wc, np.float32)[None, None, :]
+    else:
+        dark = np.repeat(_gray_from_L(L)[..., None], 3, 2)
+    return res * (1 - s) + dark * s
 
 
 def _top_dir(A):
@@ -1334,7 +1367,8 @@ def _unmix_stamp(reg, F, hard):
     Per pixel t and d are solved (both >= 0), then the writing is put back (paper * exp(-t kt)) and the stamp is gone: the
     letters under the stamp are RECONSTRUCTED.  The faint halo of the stamp around the selection is cleaned the same way.
     It cannot work when the writing and the stamp have the same colour (then None -> the older method is used).
-    Returns (T, W): T = writing transmittance (h, w, 3), W = where to apply it (h, w, 0..1), or None.
+    Returns (T, W, wc, cover) or None: T = writing transmittance (h, w, 3), W = where to apply it (h, w, 0..1),
+    wc = the writing's real colour (or None), cover = how much writing is in each pixel (0..1, or None).
     reg = uint8 (h, w, 3) region, F = paper estimate (h, w, 3), hard = PIL 'L' mask of the removed thing (same region)."""
     hm = np.asarray(hard) > 127
     nh = int(hm.sum())
@@ -1401,7 +1435,18 @@ def _unmix_stamp(reg, F, hard):
     T = np.exp(-t[..., None] * kt[None, None, :]).astype(np.float32)
     presence = np.clip(d / (0.2 * d95), 0.0, 1.0)
     W = np.where(zone, np.maximum(hm.astype(np.float32), presence), 0.0).astype(np.float32)
-    return T, W
+    # the writing's real colour and full strength, from the writing OUTSIDE the stamp: the letters under the stamp are
+    # then drawn in exactly that colour (amount = t / full strength) instead of a colour rebuilt from the mixed pixels
+    cosk = (A @ ks) / np.maximum(mag, 1e-6)
+    txt = outside & (cosk < 0.95)
+    wc, cover = None, None
+    if int(txt.sum()) >= 40:
+        wc = _writing_color(reg, F, hm, exclude=(cosk >= 0.95))
+        t_full = float(np.percentile(A[txt] @ kt, 90)) - 0.06
+        if wc is not None and t_full > 0.12:
+            # strokes are solid: a pixel that is mostly writing is full writing (the stamp makes the estimate a bit weak)
+            cover = np.clip((t / t_full - 0.08) / 0.72, 0.0, 1.0).astype(np.float32)
+    return T, W, wc, cover
 
 
 def _ink_like(reg, F):
@@ -1486,13 +1531,19 @@ def erase_region(img, mask, offset=None, feather=1.5, keep_ink=False):
         if int(ring.sum()) > 50:                   # heal: same texture, but the tone of the new surroundings
             res = src + (np.median(reg[ring].astype(np.float32), axis=0) - np.median(src[ring], axis=0))
     if keep_ink and offset is None:
-        un = _unmix_stamp(reg, F, hard.crop(box))
+        hbox = hard.crop(box)
+        un = _unmix_stamp(reg, F, hbox)
         if un is not None:                                   # coloured stamp over writing: put the writing back
-            T, Wz = un
-            res = res * T
+            T, Wz, wc, cover = un
+            if wc is not None and cover is not None:         # ... in the colour the writing really has
+                tw = np.clip(wc[None, None, :] / np.maximum(F, 1.0), 0.02, 1.0)    # that colour as 'paper x tw' (light-proof)
+                res = res * np.power(tw, cover[..., None])
+            else:
+                res = res * T
             soft = np.maximum(soft, Wz[..., None])
         else:
-            res = _keep_dark_ink(reg, hard.crop(box), res)
+            wc = _writing_color(reg, F, np.asarray(hbox) > 127)
+            res = _keep_dark_ink(reg, hbox, res, wc)
     out = reg.astype(np.float32) * (1 - soft) + res * soft
     result = img.copy()
     result.paste(Image.fromarray(np.clip(out + 0.5, 0, 255).astype(np.uint8)), (box[0], box[1]))
@@ -1773,6 +1824,54 @@ def rotate_image(img, deg_ccw):
         if abs(d - angle) < 1e-6:
             return img.transpose(t)
     return img.rotate(d, resample=Image.Resampling.BICUBIC, expand=True, fillcolor=border_color(img))
+
+
+# ------------------------------------------------------------------ PDF as pictures (like Photoshop)
+def is_pdf(path):
+    return os.path.splitext(str(path))[1].lower() == PDF_EXT
+
+
+def pdf_to_pictures(path, out_dir, progress=None, dpi=PDF_DPI, max_side=PDF_MAX_SIDE):
+    """Every page of a PDF becomes its own PNG picture in out_dir.  Returns the list of file paths (page order).
+    progress(fraction, text) is optional.  Needs the pypdfium2 package (it brings its own PDF engine)."""
+    try:
+        import pypdfium2 as pdfium
+    except Exception as ex:
+        raise RuntimeError("PDF support is missing (pypdfium2 is not installed): %s" % ex)
+    os.makedirs(out_dir, exist_ok=True)
+    base = os.path.splitext(os.path.basename(path))[0] or "PDF"
+    try:
+        doc = pdfium.PdfDocument(path)
+    except Exception as ex:
+        msg = str(ex)
+        if "password" in msg.lower():
+            raise RuntimeError("This PDF is protected by a password.")
+        raise RuntimeError("Cannot open this PDF: %s" % msg)
+    out = []
+    try:
+        n = len(doc)
+        digits = max(2, len(str(n)))
+        for i in range(n):
+            if progress:
+                progress(i / max(1, n), "%s  page %d / %d" % (base, i + 1, n))
+            page = doc[i]
+            try:
+                w, h = page.get_size()                      # PDF points (1/72 inch)
+                scale = dpi / 72.0
+                if max(w, h) * scale > max_side:
+                    scale = max_side / max(w, h)
+                bmp = page.render(scale=scale, rotation=0, may_draw_forms=True)
+                im = bmp.to_pil().convert("RGB")           # pages are drawn on white paper
+            finally:
+                page.close()
+            p = os.path.join(out_dir, "%s_page%0*d.png" % (base, digits, i + 1))
+            im.save(p, "PNG")
+            out.append(p)
+    finally:
+        doc.close()
+    if not out:
+        raise RuntimeError("This PDF has no pages.")
+    return out
 
 
 # ------------------------------------------------------------------------ PDF

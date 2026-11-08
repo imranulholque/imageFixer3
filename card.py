@@ -1,6 +1,6 @@
 """One picture = one card.
 Top: dropdown tool menus (Select / Move / Erase / Crop) + eyedropper.   Middle: the picture.
-Right: tabs  Adjust | Shadow | Text | Save.   Every change acts ONLY inside the selection (if there is one)."""
+Right: tabs  Adjust | Color | Shadow | Text | Picture | Save.   Every change acts ONLY inside the selection (if there is one)."""
 import copy
 import math
 import os
@@ -46,10 +46,10 @@ NAMES = {"quick": "Quick select", "brush": "Brush select", "deselect": "Deselect
          "erase_brush": "Brush", "erase_rect": "Box", "erase_ellipse": "Ellipse", "erase_lasso": "Freehand",
          "crop": "Crop", "persp": "Straighten", "crop_circle": "Circle", "crop_oval": "Oval", "crop_round": "Rounded box"}
 HINTS = {
-    "paint": "Paint with the fill color (swatch on the right; also in the Adjust tab).  With a selection the color goes ONLY inside it, "
+    "paint": "Paint with the fill color (swatch on the right; also in the Color tab).  With a selection the color goes ONLY inside it, "
              "without a selection you can paint anywhere on the page.  Size / Opacity / Softness like a paint brush.",
     "view": "Hand: drag the picture.  (Hold Space and drag in any tool, or Ctrl + wheel to zoom)",
-    "pick": "Click a color in the picture (ink, stamp, text): its slider appears in the Adjust tab.",
+    "pick": "Click a color in the picture (ink, stamp, text): its slider appears in the Color tab.",
     "quick": "Brush over an object: the selection grows to its edges.  Shift = add,  Alt = subtract.",
     "brush": "Paint the area to select.  Shift = add,  Alt = subtract.",
     "deselect": "Paint over a part that was selected by mistake: it is taken out of the selection, but only what looks like "
@@ -528,6 +528,7 @@ class DragHandle(QPushButton):
 
 
 class Card(QWidget):
+    TAB_ADJUST, TAB_COLOR, TAB_SHADOW, TAB_TEXT, TAB_PICTURE, TAB_SAVE = range(6)   # order of the side tabs
     editedChanged = Signal(object)
     removeRequested = Signal(object)
     copyRequested = Signal(object)
@@ -1100,7 +1101,7 @@ class Card(QWidget):
         side = QWidget()
         side.setObjectName("panel")
         side.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        side.setFixedWidth(344)
+        side.setFixedWidth(376)               # six tabs now (Color has its own)
         self._side = side
         v = QVBoxLayout(side)
         v.setContentsMargins(12, 8, 6, 8)
@@ -1110,11 +1111,13 @@ class Card(QWidget):
         self.tabGroup = QButtonGroup(self)
         self.tabGroup.setExclusive(True)
         self.stackPages = QStackedWidget()
-        names = ("Adjust", "Shadow", "Text", "Picture", "Save")
+        names = ("Adjust", "Color", "Shadow", "Text", "Picture", "Save")
         for i, n in enumerate(names):
             b = QPushButton(n)
             b.setCheckable(True)
             b.setProperty("tab", True)
+            if n == "Color":
+                b.setToolTip("Remove a stamp or mark, Color range & fill, Picked colors")
             self.tabGroup.addButton(b, i)
             tabs.addWidget(b, 1)
         self.tabGroup.button(0).setChecked(True)
@@ -1141,6 +1144,12 @@ class Card(QWidget):
         gl.addWidget(self._look_row("warm", "Warmth", -100, 100, ("cooler", "", "warmer"),
                                     "Cooler = bluer, warmer = more yellow / red.", ""))
         lay.addWidget(g)
+        lay.addStretch(1)
+        self.stackPages.addWidget(pg)
+
+        # ---------------- Color tab: stamp removal, color range & fill, picked colors (their own tab)
+        pg, lay = self._page()
+        lay.addWidget(self._scope_label())
         # ---- removing a stamp / mark: its own group, easy to find
         gs, gls = self._group_box("Remove a stamp or mark")
         hs = QLabel("Select the stamp (Select menu > Color range is the quickest), then press the button. "
@@ -1509,28 +1518,24 @@ class Card(QWidget):
         """Fuzziness / 'near the click' changed after a click: the same selection, redone (no new undo step)."""
         self.localSlider.setVisible(self._tool == "color" and self.chkLocal.isChecked())
         cr = self._cr
-        if cr is None or not self._loaded or self.prev is not cr["prev"] or self._sel_ver != cr["ver"]:
+        if cr is None or not self._loaded or self._sel_ver != cr["ver"]:
+            return                                          # something else changed the selection since the click
+        lab = cr["lab"]
+        if self.prev is None or lab.shape[:2] != self.prev.shape[:2]:
             return
         fuzz, local = self._fuzz, (self.localSlider.value() / 100.0 if self.chkLocal.isChecked() else 0.0)
-        prev, lab0 = self.prev, self._lab
         token = cr["token"] = cr.get("token", 0) + 1
         rgb, center, base, mode = cr["rgb"], cr["center"], cr["base"], cr["mode"]
 
         def work(progress):
-            lab = lab0 if lab0 is not None else core.rgb_to_lab(prev)
-            return core.color_range_fuzzy(lab, rgb, fuzz, center, local), lab
+            return core.color_range_fuzzy(lab, rgb, fuzz, center, local)
 
-        def done(r):
-            if self._dead or cr.get("token") != token or self.prev is not prev or self._cr is not cr:
+        def done(mask):
+            if self._dead or cr.get("token") != token or self._cr is not cr or self._sel_ver != cr["ver"]:
                 return
-            mask, lab = r
-            if self._lab is None:
-                self._lab = lab
-            new = core.sel_combine(base, mask, mode)
-            self.sel = new
-            self._sel_ver += 1
-            cr["ver"] = self._sel_ver
+            self.sel = core.sel_combine(base, mask, mode)
             self._sel_changed()
+            cr["ver"] = self._sel_ver
         run_background(work, done, lambda msg: None)
 
     def _pick_fill(self):
@@ -1658,7 +1663,7 @@ class Card(QWidget):
 
     def picture_tab_active(self):
         """True while the 'Picture' tab (overlay pictures: signature, stamp ...) is the open tab."""
-        return self._loaded and self.stackPages.currentIndex() == 3
+        return self._loaded and self.stackPages.currentIndex() == self.TAB_PICTURE
 
     def src_path(self):
         """The picture's original file: the saved-over file is backed up when 'Save' replaces it."""
@@ -2184,7 +2189,7 @@ class Card(QWidget):
             self.ops += 1
             self.sel_layer = layer["id"]
             self._touch()
-            self.show_tab(3)
+            self.show_tab(self.TAB_PICTURE)
             self._refresh_layers_ui()
             self.place_layer_tool(layer["id"])
             self.message.emit("Picture added. Drag it, corner handles resize, the round handle rotates. "
@@ -2692,7 +2697,7 @@ class Card(QWidget):
         self._job("Analysing colors", work, done)
 
     def _after_pick(self, kind, items, L):
-        self.show_tab(0)
+        self.show_tab(self.TAB_COLOR)
         if kind == "color":
             new = items[0]
             for a in self.adjs:
@@ -2758,15 +2763,22 @@ class Card(QWidget):
         self._timer.start()                          # every edit is limited to the selection
         self._touch()
 
-    def _set_selection(self, mask, mode=None):
-        if self._bake(lambda: self._set_selection(mask, mode)):
+    def _set_selection(self, mask, mode=None, after=None):
+        """after(base_selection) is called once the selection is really in place (also when the settings had to be
+        written into the picture first) - the Color range click uses it to remember itself for the live sliders."""
+        if self._bake(lambda: self._set_selection(mask, mode, after)):
             return
-        new = core.sel_combine(self.sel, mask, mode or self.sel_mode)
-        if new is None and self.sel is None:
+        base = self.sel
+        new = core.sel_combine(base, mask, mode or self.sel_mode)
+        if new is None and base is None:
+            if after is not None:
+                after(base)
             return
         self._checkpoint()
         self.sel = new
         self._sel_changed()
+        if after is not None:
+            after(base)
 
     def select_all(self):
         if not self._loaded:
@@ -2885,13 +2897,17 @@ class Card(QWidget):
             if self._lab is None and self.prev is prev:
                 self._lab = lab
             if self.prev is prev:
-                self._set_selection(mask, mode)
-                if info is not None:                           # remember the click: Fuzziness can now redo it live
-                    self._cr = {"prev": prev, "rgb": info[0], "center": info[1], "base": base_sel, "mode": mode,
-                                "ver": self._sel_ver}
-                    if getattr(self, "chkUseClick", None) is not None and self.chkUseClick.isChecked() and mode != "sub":
-                        self.fill_rgb = info[0]                # the clicked color is the fill color now
-                        self._paint_swatch()
+                def remember(base):
+                    # the click is remembered only NOW, when the selection is really in place, so that Fuzziness /
+                    # 'Near the click' can redo it live (before, it was remembered too early and the sliders did nothing)
+                    if info is not None:
+                        self._cr = {"lab": lab, "rgb": info[0], "center": info[1], "base": base, "mode": mode,
+                                    "ver": self._sel_ver}
+                self._set_selection(mask, mode, after=remember)
+                if info is not None and getattr(self, "chkUseClick", None) is not None \
+                        and self.chkUseClick.isChecked() and mode != "sub":
+                    self.fill_rgb = info[0]                    # the clicked color is the fill color now
+                    self._paint_swatch()
         self._job("Selecting", work, done)
 
     def _deselect_brush(self, data, size_prev):

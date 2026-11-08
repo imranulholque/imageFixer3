@@ -20,7 +20,7 @@ from savedlg import SaveAllDialog
 from jobs import JobRunner
 from theme import logo_pixmap, make_icon, scaled_qss
 
-FILTER = "Pictures (%s);;All files (*)" % " ".join("*" + e for e in sorted(core.IMG_EXT))
+FILTER = "Pictures and PDF (%s);;All files (*)" % " ".join("*" + e for e in sorted(core.IMG_EXT | {core.PDF_EXT}))
 
 
 # --------------------------------------------------------------- thumbnails
@@ -373,6 +373,7 @@ class MainWindow(QMainWindow):
         core.purge_dir(EXPORT_DIR, older_than=6 * 3600)         # leftovers of an earlier run
         core.purge_dir(core.ORIG_DIR, older_than=6 * 3600)
         self._replace_ok = False                   # 'Save replaces the original' was confirmed in this session
+        self._pdf_n = 0
         self._origin = {}                          # path -> 'phone' / 'paste' for pictures that have no file of their own
         self._add_queue = []                       # pictures waiting to get their card (added in small slices)
         self._add_total = 0
@@ -824,6 +825,8 @@ class MainWindow(QMainWindow):
         paths = [u.toLocalFile() for u in md.urls() if u.isLocalFile()] if md.hasUrls() else []
         if paths:
             self._incoming(paths, "file")
+        elif self._take_pdf_data(md):
+            pass
         elif md.hasImage():
             self._add_qimage(md.imageData())
         e.acceptProposedAction()
@@ -838,10 +841,26 @@ class MainWindow(QMainWindow):
             if paths:
                 self._incoming(paths, "file")
                 return
+        if self._take_pdf_data(md):
+            return
         if md.hasImage():
             self._add_qimage(cb.image())
             return
-        self.say("Nothing to paste. Copy picture files in Explorer first.")
+        self.say("Nothing to paste. Copy picture or PDF files in Explorer first.")
+
+    def _take_pdf_data(self, md):
+        """A PDF that arrives as data (not as a file): written to a temporary file and opened like any PDF."""
+        if not md.hasFormat("application/pdf"):
+            return False
+        data = bytes(md.data("application/pdf"))
+        if not data.startswith(b"%PDF"):
+            return False
+        self._paste_n += 1
+        p = os.path.join(self.tmp, "pasted_%s_%d.pdf" % (time.strftime("%H%M%S"), self._paste_n))
+        with open(p, "wb") as f:
+            f.write(data)
+        self._incoming([p], "paste")
+        return True
 
     def _add_qimage(self, img):
         if img is None or not isinstance(img, QImage) or img.isNull():
@@ -871,12 +890,43 @@ class MainWindow(QMainWindow):
                     pass
             else:
                 out.append(p)
-        return [p for p in out if os.path.isfile(p) and os.path.splitext(p)[1].lower() in core.IMG_EXT]
+        ok = core.IMG_EXT | {core.PDF_EXT}
+        return [p for p in out if os.path.isfile(p) and os.path.splitext(p)[1].lower() in ok]
+
+    def _open_pdfs(self, pdfs, then):
+        """PDF -> pictures, like Photoshop: every page becomes its own picture (its own card).  The pages are drawn in a
+        worker thread; then(list of png paths) is called when they are ready."""
+        for pdf in pdfs:
+            self._pdf_n += 1
+            out_dir = os.path.join(self.tmp, "pdf%d" % self._pdf_n)
+            name = os.path.basename(pdf)
+
+            def work(progress, pdf=pdf, out_dir=out_dir):
+                return core.pdf_to_pictures(pdf, out_dir, progress)
+
+            def done(pages, name=name):
+                self.say("%s: %d page(s) opened as pictures." % (name, len(pages)))
+                then(pages)
+
+            def fail(msg, name=name):
+                QMessageBox.warning(self, "PDF", "Could not open %s:\n%s" % (name, msg.splitlines()[0]))
+            self.runner.run("Opening " + name, work, done, fail, light=True)
 
     def add_files(self, paths):
+        paths = self._expand(paths)
+        pdfs = [p for p in paths if core.is_pdf(p)]
+        if pdfs:
+            def pages_ready(pages):
+                for p in pages:
+                    self._origin[p] = "pdf"
+                self.add_files(pages)
+            self._open_pdfs(pdfs, pages_ready)
+            paths = [p for p in paths if not core.is_pdf(p)]
+            if not paths:
+                return
         have = {c.path for c in self.carousel.cards} | set(self._add_queue)
         files = []
-        for p in self._expand(paths):
+        for p in paths:
             if p not in have:
                 have.add(p)
                 files.append(p)
@@ -1468,6 +1518,12 @@ class MainWindow(QMainWindow):
         """Something arrives (drag, paste, phone / QR): while the PICTURE tab is open it becomes an overlay picture on the
         current page (signature, stamp ...); in any other tab it is a new main picture.  Returns -1 for overlays."""
         files = [p for p in self._expand(paths)]
+        pdfs = [p for p in files if core.is_pdf(p)]
+        if pdfs:
+            self._open_pdfs(pdfs, lambda pages: self._incoming(pages, "pdf"))
+            files = [p for p in files if not core.is_pdf(p)]
+            if not files:
+                return len(pdfs)
         c = self.carousel.current()
         if files and c is not None and c.picture_tab_active() and not self.runner.heavy_busy:
             for p in files:

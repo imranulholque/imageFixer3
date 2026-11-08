@@ -443,10 +443,23 @@ def t_incoming_routing():
     c.tabGroup.button(0).click()                                   # Adjust tab: a new picture arrives -> a new main picture
     n0 = len(w.carousel.cards); w._incoming([q], "phone"); _pump(lambda: not w._adding and len(w.carousel.cards) == n0 + 1)
     assert len(w.carousel.cards) == n0 + 1 and w.carousel.cards[-1].origin == "phone" and not w.carousel.cards[-1].can_replace()
-    c.tabGroup.button(3).click()                                   # Picture tab: it becomes an overlay on this page
+    c.tabGroup.button(c.TAB_PICTURE).click()                      # Picture tab: it becomes an overlay on this page
     w._incoming([q], "file"); _pump(lambda: len(c.layers) == 1 and not w.runner.busy)
     assert len(c.layers) == 1 and len(w.carousel.cards) == n0 + 1, "overlay, not a new picture"
 step("incoming pictures: overlay in the Picture tab, main picture elsewhere", t_incoming_routing)
+
+def t_pdf_pages():
+    from PIL import Image
+    pages = [Image.new("RGB", (400, 560), c) for c in ((255, 255, 255), (240, 230, 200), (200, 220, 255))]
+    pdf = d + "/doc.pdf"; pages[0].save(pdf, save_all=True, append_images=pages[1:])
+    n0 = len(w.carousel.cards)
+    w.carousel.cards[0].tabGroup.button(w.carousel.cards[0].TAB_ADJUST).click()
+    w.add_files([pdf]); _pump(lambda: not w._adding and not w.runner.busy and len(w.carousel.cards) == n0 + 3, 30)
+    assert len(w.carousel.cards) == n0 + 3, "every PDF page is its own card"
+    assert all(not c.can_replace() for c in w.carousel.cards[-3:]), "PDF pages never replace the PDF"
+step("PDF: every page opens as its own picture", t_pdf_pages)
+
+
 
 
 def t_bake_global_before_select():

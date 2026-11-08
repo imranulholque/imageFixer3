@@ -1,7 +1,7 @@
 IMAGE FIXER  (Windows)
 ======================
 Clean many text pictures (WhatsApp photos, scans) and print them. One big card per picture - slide to the next.
- Top bar (dropdown menus):  Select v | Move v | Eyedropper | Color Brush | Erase v | Crop v      Right side tabs: Adjust | Shadow | Text | Save
+ Top bar (dropdown menus):  Select v | Move v | Eyedropper | Color Brush | Erase v | Crop v      Right side tabs: Adjust | Color | Shadow | Text | Picture | Save
  - Select v:    Quick select, Brush, Box, Ellipse, Freehand, Color range (click a color). Options bar: New / Add / Subtract /
                 Intersect, All / None / Inverse, Grow / Shrink. Shift = add, Alt = subtract.
  - EVERYTHING acts only inside the selection (brightness, contrast, saturation, hue, warmth, color change, shadow removal,
@@ -10,9 +10,9 @@ Clean many text pictures (WhatsApp photos, scans) and print them. One big card p
  - Stamp removal is smart: a coloured stamp over writing of ANY other colour (black, grey, blue ink, red ...) is separated from the writing
                 (the stamp colour is learned from the selected pixels, the writing colour from the writing around the stamp), so the letters
                 under the stamp are rebuilt and the faint halo of the stamp goes too. Writing with the SAME colour as the stamp cannot be separated.
- - Delete key:  deletes the selection (filled from the paper around it).   Fill color (Adjust tab) fills it with a color.
+ - Delete key:  deletes the selection (filled from the paper around it).   Fill color (Color tab) fills it with a color.
  - Move v:      drag = move, Alt + drag = copy, Ctrl+T = Transform (resize / rotate, Enter = apply).
- - Color Brush (P): paints with the fill color (swatch in the options bar / Adjust tab). Select something first = the color goes ONLY
+ - Color Brush (P): paints with the fill color (swatch in the options bar / Color tab). Select something first = the color goes ONLY
                 inside the selection; no selection = paint anywhere on the page. Size, Opacity, Softness. One stroke = one Ctrl+Z step.
  - Eyedropper:  click a color -> slider (fade / stronger) and "Change to..." (recolor, shading stays). Respects the selection.
  - Shadow tab:  One-click removal (Strength, Paper whiteness, Text darkness, Shadow size, Even out the light, Shadow depth,
@@ -24,6 +24,10 @@ Clean many text pictures (WhatsApp photos, scans) and print them. One big card p
                 A picture you placed (signature, stamp ...): select it, then pick any crop - it is cropped alone and becomes
                 transparent outside the shape. (Click outside the picture first to crop the page instead.)
 Slow work shows a progress bar at the bottom; the window stays usable.
+
+PDF FILES
+ Open, drag in, or paste (Ctrl+V) a PDF like a picture: every page becomes its own picture (its own card), like Photoshop.
+ Pages are drawn at about 200 dpi. Save puts them in the save folder (the PDF itself is never changed); 'Save all as PDF' makes a new PDF.
 
 SAVING
  Save / Save as (JPG, PNG, WEBP, BMP, TIF, PDF). "Save all edited" saves the edited pictures.
@@ -104,7 +108,7 @@ NEW (round 5)
 - Compare is shown IN the picture (slider or side by side); click it again to switch it off.
 - Select: Color range has Fuzziness (updates live after the click, optional 'Near the click'); new Deselect brush (Select menu) takes
   parts out of a selection accurately; the clicked color becomes the fill color; Fill / Delete / eyedropper / hex in one group;
-  'Remove a stamp or mark' (keep dark writing) is its own group at the top of the Adjust tab.
+  'Remove a stamp or mark' (keep dark writing) is its own group at the top of the Color tab (Color tab = stamp removal, Color range & fill, Picked colors).
 - Shadow tab: Newspaper / book photo -> white page (one click + slider, both directions); 'keep photos and faces' removed.
 - Text options are stronger at 100% (faint writing gets dark, the paper stays white).
 - Overlay background cut: paper noise is measured, specks removed (new sliders Keep faint strokes / Remove specks); pictures keep their

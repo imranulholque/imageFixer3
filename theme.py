@@ -93,7 +93,7 @@ QToolButton:disabled { color: #5d6475; background: #181c26; border-color: #23283
 QToolButton[active="true"] { background: #4f46e5; border-color: #6366f1; color: white; }
 QToolButton::menu-indicator { image: none; width: 0px; }
 QPushButton[tab="true"] { background: transparent; border: none; border-bottom: 2px solid transparent; border-radius: 0;
-  padding: 7px 6px; font-weight: 600; color: #9aa3b8; }
+  padding: 7px 3px; font-weight: 600; color: #9aa3b8; }
 QPushButton[tab="true"]:hover { color: white; background: #171c28; }
 QPushButton[tab="true"]:checked { background: transparent; color: white; border-bottom: 2px solid #818cf8; }
 QProgressBar { background: #222836; border: none; border-radius: 4px; height: 8px; text-align: center; }
