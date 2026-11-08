@@ -74,6 +74,7 @@ class ImageCanvas(QWidget):
         self.sel_visible = True
         self.sel_preview = False              # Color range preview: the selection shown as a white (selected) / black picture
         self._pv = None                       # (mask version, QImage) cache of that preview
+        self._ring = None                     # Color range 'Near the click': (x, y, radius) in picture pixels, drawn as a circle
         self.select_shape = "quick"
         self.copy_mode = False
         self.quick_prev = 20.0                # quick-select brush size in preview pixels
@@ -137,6 +138,11 @@ class ImageCanvas(QWidget):
         self._masks["hl"] = mask
         self._mver["hl"] += 1
         self._sync_ants()
+        self.update()
+
+    def set_ring(self, ring):
+        """The reach of 'Near the click' as a circle around the click, so moving its slider can be seen.  None = hide."""
+        self._ring = ring
         self.update()
 
     def set_sel_preview(self, on):
@@ -763,6 +769,8 @@ class ImageCanvas(QWidget):
             self._paint_erase(p)
         elif self.mode == self.SELECT:
             self._paint_select(p)
+            if self._ring is not None:
+                self._paint_ring(p)
         elif self.mode == self.PAINT:
             self._paint_colorbrush(p)
 
@@ -777,6 +785,21 @@ class ImageCanvas(QWidget):
         p.setPen(QPen(QColor(255, 255, 255), 1.2, Qt.PenStyle.DashLine))
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawRect(QRectF(tl.x(), tl.y(), img.width() * self.zoom, img.height() * self.zoom))
+
+    def _paint_ring(self, p):
+        cx, cy, R = self._ring
+        c = self.to_wid(QPointF(cx, cy))
+        r = R * self.zoom
+        p.save()
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(QColor(0, 0, 0, 220), 3.4))
+        p.drawEllipse(c, r, r)
+        p.setPen(QPen(QColor(255, 214, 10), 1.8, Qt.PenStyle.DashLine))
+        p.drawEllipse(c, r, r)
+        p.setPen(QPen(QColor(255, 214, 10), 1.8))
+        p.drawLine(QPointF(c.x() - 6, c.y()), QPointF(c.x() + 6, c.y()))
+        p.drawLine(QPointF(c.x(), c.y() - 6), QPointF(c.x(), c.y() + 6))
+        p.restore()
 
     def _paint_select(self, p):
         """Shape being drawn: only an outline (no coloured overlay), so the picture stays visible."""

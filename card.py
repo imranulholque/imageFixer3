@@ -997,9 +997,11 @@ class Card(QWidget):
         self.localSlider = NoWheelSlider(Qt.Orientation.Horizontal)
         self.localSlider.setRange(3, 80)
         self.localSlider.setValue(22)
-        self.localSlider.setFixedWidth(90)
+        self.localSlider.setFixedWidth(120)
+        self.lblLocalV = self._label("22%")
+        self.lblLocalV.setMinimumWidth(34)
         self.localSlider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.localSlider.setToolTip("How far around the click (percent of the picture)")
+        self.localSlider.setToolTip("How far around the click (percent of the picture). The yellow circle on the picture shows it.")
         self.chkPrev = QCheckBox("Preview")
         self.chkPrev.setToolTip("Show the selection as black and white (white = selected, grey = partly, black = not selected),\n"
                                 "like the preview in Photoshop's Color Range. Move Fuzziness to see what changes.")
@@ -1011,12 +1013,13 @@ class Card(QWidget):
         tb.addWidget(self.lblTolV)
         tb.addWidget(self.chkLocal)
         tb.addWidget(self.localSlider)
+        tb.addWidget(self.lblLocalV)
         tb.addWidget(self.chkSnap)
         tb.addWidget(self.chkPrev)
         self.chkPrev.toggled.connect(lambda _on: self._sync_preview())
         self.tolSlider.valueChanged.connect(self._tol_changed)
         self.chkLocal.toggled.connect(lambda _on: self._recompute_color_range())
-        self.localSlider.valueChanged.connect(lambda _v: self._recompute_color_range())
+        self.localSlider.valueChanged.connect(lambda v: (self.lblLocalV.setText("%d%%" % v), self._recompute_color_range()))
         a.addWidget(self.tolBox)
         self.btnClone = QPushButton("Clear copy spot")
         self.btnClone.setToolTip("Go back to filling from the surroundings")
@@ -1575,6 +1578,8 @@ class Card(QWidget):
         self.lblTolV.setText(str(self.tolSlider.value()))
         self.chkLocal.setVisible(color)
         self.localSlider.setVisible(color and self.chkLocal.isChecked())
+        self.lblLocalV.setVisible(color and self.chkLocal.isChecked())
+        self._update_ring()
         self.chkSnap.setVisible(key == "deselect")
         self.chkPrev.setVisible(color)
         self._sync_preview()
@@ -1593,7 +1598,10 @@ class Card(QWidget):
 
     def _recompute_color_range(self):
         """Fuzziness / 'near the click' changed after a click: the same selection, redone (no new undo step)."""
-        self.localSlider.setVisible(self._tool == "color" and self.chkLocal.isChecked())
+        on = self._tool == "color" and self.chkLocal.isChecked()
+        self.localSlider.setVisible(on)
+        self.lblLocalV.setVisible(on)
+        self._update_ring()
         cr = self._cr
         if cr is None or not self._loaded or self.sel is not cr["sel"]:
             return                                          # the selection was changed by something else since the click
@@ -1613,7 +1621,22 @@ class Card(QWidget):
             self.sel = core.sel_combine(base, mask, mode)
             self._sel_changed()
             cr["sel"] = self.sel
+            self._update_ring()
         run_background(work, done, lambda msg: None)
+
+    def _update_ring(self):
+        """'Near the click' on: a yellow circle around the click shows how far it reaches (moves live with the slider)."""
+        cr = getattr(self, "_cr", None)
+        if not hasattr(self, "chkLocal") or not hasattr(self, "canvas"):
+            return
+        ok = (self._tool == "color" and self.chkLocal.isChecked() and cr is not None and self.prev is not None
+              and self.sel is cr["sel"])
+        if not ok:
+            self.canvas.set_ring(None)
+            return
+        H, W = self.prev.shape[:2]
+        R = max(8.0, self.localSlider.value() / 100.0 * max(H, W))
+        self.canvas.set_ring((cr["center"][0], cr["center"][1], R))
 
     def _pick_fill(self):
         c = QColorDialog.getColor(QColor(*self.fill_rgb), self, "Fill color")
@@ -2837,6 +2860,7 @@ class Card(QWidget):
     def _sel_changed(self):
         self._sel_ver += 1
         self.canvas.set_selection(self.sel)
+        self._update_ring()
         self._hl_key = None
         self._sel_label()
         self._timer.start()                          # every edit is limited to the selection
@@ -2982,6 +3006,7 @@ class Card(QWidget):
                     if info is not None:
                         self._cr = {"lab": lab, "rgb": info[0], "center": info[1], "base": base, "mode": mode,
                                     "sel": self.sel}
+                        self._update_ring()
                 self._set_selection(mask, mode, after=remember)
                 if info is not None and getattr(self, "chkUseClick", None) is not None \
                         and self.chkUseClick.isChecked() and mode != "sub":
