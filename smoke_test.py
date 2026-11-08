@@ -434,5 +434,18 @@ def t_incoming_routing():
     assert len(c.layers) == 1 and len(w.carousel.cards) == n0 + 1, "overlay, not a new picture"
 step("incoming pictures: overlay in the Picture tab, main picture elsewhere", t_incoming_routing)
 
+
+def t_bake_global_before_select():
+    cc = cardmod.Card(p); cc.message.connect(lambda t: None); cc.ensure_loaded()
+    cc._set_look("news", 80)                                       # a setting for the WHOLE picture (no selection)
+    assert cc.sel is None and cc._pending_settings()
+    H, W = cc.prev.shape[:2]
+    m = np.zeros((H, W), np.float32); m[:, :W // 3] = 1
+    cc._set_selection(m, "new")                                    # now a selection: the setting must stay everywhere
+    assert cc.sel is not None and not cc._pending_settings(), "the whole-picture setting must be written into the picture first"
+    out = np.asarray(cc.result_image()).astype(np.float32)
+    assert out[:, -20:].mean() >= out[:, :20].mean() - 3, "the area outside the selection must keep the change"
+step("settings made before a selection stay on the whole picture", t_bake_global_before_select)
+
 print("\nFAILED:" if steps else "\nALL OK", steps, flush=True)
 sys.exit(1 if steps else 0)
