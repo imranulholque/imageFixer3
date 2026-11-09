@@ -6,7 +6,7 @@ import tempfile
 import traceback
 
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
@@ -40,7 +40,9 @@ def changed_where():
 steps = []
 def step(name, fn):
     try: fn(); print("PASS", name)
-    except Exception: print("FAIL", name); traceback.print_exc(); steps.append(name)
+    except Exception:
+        why = traceback.format_exc().strip().splitlines()[-1]          # the cause on the FAIL line itself
+        print("FAIL", name, "->", why); traceback.print_exc(); steps.append(name)
 
 # 1 select a box then hue only changes inside
 def t_select_hue():

@@ -1,0 +1,312 @@
+--- a/core.py	2026-11-09 17:15:51.000000000 +0600
++++ b/core.py	2026-11-09 17:20:33.908209111 +0600
+@@ -1451,8 +1451,13 @@
+ 
+ def _ink_like(reg, F):
+     """Pixels that clearly differ from the paper estimate F (dark / coloured: writing, lines, stamps)."""
+-    d = np.abs(reg.astype(np.float32) - F.astype(np.float32)).sum(2)
+-    return d > 22.0
++    diff = reg.astype(np.float32) - F.astype(np.float32)
++    d = np.abs(diff).sum(2)
++    # adaptive: grainy / ash paper has more noise than clean white paper, so the limit follows the picture's own noise,
++    # but a faint (light blue, pencil) stroke must still count as ink - else it leaks into the fill as a bluish smear
++    thr = float(np.clip(3.2 * float(np.median(d)) + 4.0, 12.0, 22.0))
++    dark = (F.astype(np.float32).mean(2) - reg.astype(np.float32).mean(2)) > thr * 0.33    # ink always darkens paper
++    return (d > thr) | (dark & (d > thr * 0.6))
+ 
+ 
+ def _grow_over_ink(reg, hole):
+@@ -1473,10 +1478,30 @@
+     """1 where a valid pixel looks like plain paper (not ink, not the dim halo around ink)."""
+     F = fill_background(reg, valid)
+     ink = _ink_like(reg, F)
+-    ink = np.asarray(Image.fromarray((ink * 255).astype(np.uint8)).filter(ImageFilter.MaxFilter(5))) > 127
++    ink = np.asarray(Image.fromarray((ink * 255).astype(np.uint8)).filter(ImageFilter.MaxFilter(7))) > 127
+     return (~ink).astype(np.float32)
+ 
+ 
++def _refine_valid(reg, valid, F):
++    """Second pass for the fill: with a first paper estimate F, drop the valid pixels that are still slightly darker or
++    tinted than F (the faint edge of pen strokes next to the hole), so they cannot tint / darken the fill.
++    Only used when enough clean paper is left; otherwise the old valid mask is returned."""
++    diff = reg.astype(np.float32) - F
++    L = diff.mean(2)
++    tint = np.abs(diff - L[..., None]).sum(2)                # colour shift away from the paper tone
++    ok = valid > 0.5
++    if int(ok.sum()) < 200:
++        return valid
++    sl = 1.4826 * float(np.median(np.abs(L[ok] - np.median(L[ok]))))
++    st = 1.4826 * float(np.median(np.abs(tint[ok] - np.median(tint[ok]))))
++    bad = ok & ((L < -max(3.0, 2.5 * sl)) | (tint > max(6.0, np.median(tint[ok]) + 3.0 * st)))
++    if not bad.any():
++        return valid
++    bad = np.asarray(Image.fromarray((bad * 255).astype(np.uint8)).filter(ImageFilter.MaxFilter(5))) > 127
++    v2 = valid * (~bad)
++    return v2.astype(np.float32) if float((v2 > 0.5).sum()) > 0.25 * float(ok.sum()) else valid
++
++
+ def erase_region(img, mask, offset=None, feather=1.5, keep_ink=False):
+     """Removes what is under the mask and puts there what surrounds it, so it looks as if nothing was there.
+     offset=(dx,dy): copy from that spot instead (clone / heal): the texture comes from (x+dx, y+dy),
+@@ -1499,6 +1524,9 @@
+     if offset is None:                                       # only real paper counts for the fill, never ink / halo
+         valid = valid * _paper_like(reg, valid)
+     F = fill_background(reg, valid).astype(np.float32)
++    if offset is None:
++        valid = _refine_valid(reg, valid, F)                 # 2nd look with the better paper estimate: faint ink halos out
++        F = fill_background(reg, valid).astype(np.float32)
+ 
+     # soft edge: grow a little, then blur, so nothing of the old picture is left at the border
+     f = max(0.8, float(feather))
+--- a/card.py	2026-11-09 17:15:51.000000000 +0600
++++ b/card.py	2026-11-09 17:20:45.997032186 +0600
+@@ -3547,7 +3547,8 @@
+                 self.canvas.set_clone(self.clone_src, (self.clone_off[0] * s, self.clone_off[1] * s))
+             offset = self.clone_off
+         size = self.sizeSlider.value()
+-        base, sel, ink = self.base, self.sel, self.keep_ink
++        base, sel = self.base, self.sel
++        ink = False        # the eraser removes EVERYTHING it covers (handwriting too); 'keep writing under a stamp' is only for stamp removal
+         if kind in ("brush", "lasso"):
+             er_rect = self._bbox_rect(data, size * s / 2.0 + 2 if kind == "brush" else 0.0)
+         else:
+--- a/canvas.py	2026-11-09 17:15:51.000000000 +0600
++++ b/canvas.py	2026-11-09 17:20:45.997628810 +0600
+@@ -1065,37 +1065,51 @@
+ 
+     def _paint_erase(self, p):
+         z = self.zoom
+-        red = QColor(239, 68, 68, 120)
++        red = QColor(239, 68, 68, 140)
+         er = self._erase
+-        # what is being drawn
++        # what is being drawn.  Every outline is drawn twice (dark below, white on top) so it is visible on white paper too,
++        # and the area that will be erased is tinted red, so you can see exactly how much is selected.
+         if er is not None:
+             pts = [self.to_wid(q) for q in er["pts"]]
+             kind = er["kind"]
++            rnd = (Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+             if kind == "brush":
+-                pen = QPen(red, max(1.0, self.brush_prev * z), Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
+-                           Qt.PenJoinStyle.RoundJoin)
+-                p.setPen(pen)
+-                p.setBrush(Qt.BrushStyle.NoBrush)
++                w = max(1.0, self.brush_prev * z)
+                 if len(pts) > 1:
++                    p.setBrush(Qt.BrushStyle.NoBrush)
++                    p.setPen(QPen(red, w, Qt.PenStyle.SolidLine, *rnd))
+                     p.drawPolyline(QPolygonF(pts))
+                 else:
+                     p.setPen(Qt.PenStyle.NoPen)
+                     p.setBrush(QBrush(red))
+-                    r = max(1.0, self.brush_prev * z / 2)
+-                    p.drawEllipse(pts[0], r, r)
++                    p.drawEllipse(pts[0], w / 2.0, w / 2.0)
+             else:
+-                p.setPen(QPen(QColor(255, 255, 255), 1.6, Qt.PenStyle.DashLine))
+-                p.setBrush(QBrush(red))
++                shape = QPainterPath()
+                 if kind == "lasso":
+-                    p.setBrush(Qt.BrushStyle.NoBrush)
+                     if len(pts) > 1:
+-                        p.drawPolyline(QPolygonF(pts))
++                        shape.addPolygon(QPolygonF(pts))
++                        shape.closeSubpath()                   # it closes by itself when you let go: show that area
+                 else:
+                     rect = QRectF(pts[0], pts[-1]).normalized()
+                     if kind == "rect":
+-                        p.drawRect(rect)
++                        shape.addRect(rect)
+                     else:
+-                        p.drawEllipse(rect)
++                        shape.addEllipse(rect)
++                if not shape.isEmpty():
++                    p.setPen(Qt.PenStyle.NoPen)
++                    p.setBrush(QBrush(red))
++                    p.drawPath(shape)                          # red area = what will be erased
++                    p.setBrush(Qt.BrushStyle.NoBrush)
++                    p.setPen(QPen(QColor(0, 0, 0, 230), 3.4, Qt.PenStyle.SolidLine, *rnd))
++                    p.drawPath(shape)
++                    p.setPen(QPen(QColor(255, 255, 255), 1.6, Qt.PenStyle.DashLine, *rnd))
++                    p.drawPath(shape)
++                if kind == "lasso" and len(pts) > 1:           # the free line itself, dark + white, always visible
++                    p.setBrush(Qt.BrushStyle.NoBrush)
++                    p.setPen(QPen(QColor(0, 0, 0, 230), 3.4, Qt.PenStyle.SolidLine, *rnd))
++                    p.drawPolyline(QPolygonF(pts))
++                    p.setPen(QPen(QColor(255, 255, 255), 1.6, Qt.PenStyle.SolidLine, *rnd))
++                    p.drawPolyline(QPolygonF(pts))
+         # where the clone comes from
+         if self.clone_src is not None:
+             pos = self.clone_src
+--- a/ui.py	2026-11-09 17:15:51.000000000 +0600
++++ b/ui.py	2026-11-09 17:54:21.187377839 +0600
+@@ -4,10 +4,10 @@
+ import time
+ 
+ from PIL import Image, ImageOps
+-from PySide6.QtCore import (QEasingCurve, QEvent, QItemSelectionModel, QObject, QRect, QRunnable, QSettings, QSize, Qt, QThreadPool, QTimer,
++from PySide6.QtCore import (QEasingCurve, QEvent, QItemSelectionModel, QObject, QPointF, QRect, QRunnable, QSettings, QSize, Qt, QThreadPool, QTimer,
+                             QUrl, QVariantAnimation, Signal)
+ from PySide6.QtCore import QMimeData
+-from PySide6.QtGui import (QAction, QActionGroup, QColor, QDesktopServices, QDrag, QFontMetrics, QIcon, QImage,
++from PySide6.QtGui import (QAction, QActionGroup, QColor, QCursor, QDesktopServices, QMouseEvent, QDrag, QFontMetrics, QIcon, QImage,
+                            QKeySequence, QPainter, QPixmap, QShortcut, QTransform)
+ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QDialog, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel,
+                                QListView, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QProgressBar,
+@@ -167,8 +167,38 @@
+             if self._press_item is not None:
+                 self.preparer(self._press_item.data(Qt.ItemDataRole.UserRole))
+ 
++    def _end_band(self):
++        """The selection box (rubber band) sticks to the mouse when Qt never gets the button release (window lost focus,
++        a menu / drag swallowed it, touchpad tap-drag ...).  End it the way a real release would."""
++        try:
++            if self.state() == QAbstractItemView.State.DragSelectingState:
++                gp = QCursor.pos()
++                p = QPointF(self.viewport().mapFromGlobal(gp))
++                ev = QMouseEvent(QEvent.Type.MouseButtonRelease, p, QPointF(gp), Qt.MouseButton.LeftButton,
++                                 Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier)
++                QListWidget.mouseReleaseEvent(self, ev)
++        except Exception:
++            pass
++        self._press = None
++        self._press_item = None
++
++    def focusOutEvent(self, e):
++        self._end_band()
++        super().focusOutEvent(e)
++
++    def leaveEvent(self, e):
++        if not (QApplication.mouseButtons() & Qt.MouseButton.LeftButton):
++            self._end_band()
++        super().leaveEvent(e)
++
++    def hideEvent(self, e):
++        self._end_band()
++        super().hideEvent(e)
++
+     def mouseMoveEvent(self, e):
+         """Our own drag start (Qt's list drag does not start in this layout): press a thumbnail, move a little."""
++        if not (e.buttons() & Qt.MouseButton.LeftButton):    # button is NOT down: a box that still follows the mouse is stuck
++            self._end_band()
+         if (self._press is not None and self._press_item is not None and (e.buttons() & Qt.MouseButton.LeftButton)
+                 and (e.position().toPoint() - self._press).manhattanLength() >= QApplication.startDragDistance()):
+             it = self._press_item
+--- a/updater.py	2026-11-09 17:15:51.000000000 +0600
++++ b/updater.py	2026-11-09 17:50:32.714646277 +0600
+@@ -110,33 +110,78 @@
+ 
+ 
+ # --------------------------------------------------------------- downloading
+-def download(url, dest, size=0, sha256="", progress=None, cancelled=None):
+-    """Streams url to dest. progress(done, total). cancelled() -> True stops it."""
+-    req = urllib.request.Request(url, headers={"User-Agent": "ImageFixer-updater"})
+-    h = hashlib.sha256()
+-    done = 0
+-    try:
+-        with urllib.request.urlopen(req, timeout=30) as r, open(dest, "wb") as f:
+-            total = int(r.headers.get("Content-Length") or size or 0)
+-            while True:
+-                if cancelled is not None and cancelled():
+-                    raise UpdateError("cancelled")
+-                chunk = r.read(256 * 1024)
+-                if not chunk:
+-                    break
+-                f.write(chunk)
+-                h.update(chunk)
+-                done += len(chunk)
+-                if progress is not None:
+-                    progress(done, total)
+-    except UpdateError:
+-        raise
+-    except Exception as e:
+-        raise UpdateError("Download failed (%s)." % (getattr(e, "reason", None) or e))
++def download(url, dest, size=0, sha256="", progress=None, cancelled=None, retries=8):
++    """Streams url to dest. progress(done, total). cancelled() -> True stops it.
++    A connection that drops half way (the file is big, Wi-Fi hiccups, GitHub closes the stream) does NOT fail the update:
++    the download goes on from where it stopped (HTTP Range), up to `retries` times in a row without progress."""
++    done, total, fails = 0, int(size or 0), 0
++    open(dest, "wb").close()
++    last_err = None
++    while True:
++        if cancelled is not None and cancelled():
++            raise UpdateError("cancelled")
++        if total and done >= total:
++            break
++        headers = {"User-Agent": 'ImageFixer-updater'}
++        if done:
++            headers["Range"] = "bytes=%d-" % done
++        before = done
++        try:
++            with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30) as r:
++                if done and getattr(r, "status", 200) != 206:     # the server ignored Range: start again from 0
++                    done = 0
++                cr = r.headers.get("Content-Range") or ""
++                m = re.search(r"/(\d+)\s*$", cr)
++                clen = int(r.headers.get("Content-Length") or 0)
++                if m:
++                    total = int(m.group(1))
++                elif clen and not total:
++                    total = done + clen
++                with open(dest, "r+b") as f:
++                    f.seek(done)
++                    f.truncate()
++                    while True:
++                        if cancelled is not None and cancelled():
++                            raise UpdateError("cancelled")
++                        chunk = r.read(256 * 1024)
++                        if not chunk:
++                            break
++                        f.write(chunk)
++                        done += len(chunk)
++                        if progress is not None:
++                            progress(done, total)
++            last_err = None
++        except UpdateError:
++            raise
++        except urllib.error.HTTPError as e:
++            if e.code == 416 and total and done >= total:         # nothing left to ask for
++                break
++            last_err = "%s %s" % (e.code, e.reason)
++        except Exception as e:
++            last_err = getattr(e, "reason", None) or e
++        if total and done >= total:
++            break
++        if not total and last_err is None:
++            break                                                  # size unknown: a clean end of stream is the end
++        fails = 0 if done > before else fails + 1                  # only attempts that got nothing count
++        if fails > retries:
++            if last_err:
++                raise UpdateError("Download failed (%s)." % last_err)
++            raise UpdateError("The download is incomplete (%d of %d bytes)." % (done, total))
++        log("download stopped at %d of %d bytes (%s) - continuing" % (done, total, last_err or "stream ended early"))
++        for _ in range(min(2 * (fails + 1), 10)):                  # short wait, still cancellable
++            if cancelled is not None and cancelled():
++                raise UpdateError("cancelled")
++            time.sleep(0.5)
+     if size and done != size:
+         raise UpdateError("The download is incomplete (%d of %d bytes)." % (done, size))
+-    if sha256 and h.hexdigest() != sha256.lower():
+-        raise UpdateError("The downloaded file is damaged (checksum does not match).")
++    if sha256:
++        h = hashlib.sha256()
++        with open(dest, "rb") as f:
++            for blk in iter(lambda: f.read(1024 * 1024), b""):
++                h.update(blk)
++        if h.hexdigest() != sha256.lower():
++            raise UpdateError("The downloaded file is damaged (checksum does not match).")
+ 
+ 
+ def stage(zip_path, stage_dir):
+--- a/.github/workflows/build.yml	2026-11-09 17:15:51.000000000 +0600
++++ b/.github/workflows/build.yml	2026-11-09 17:54:21.187671444 +0600
+@@ -3,6 +3,9 @@
+   push:
+     branches: ["**"]
+   workflow_dispatch:
++# GitHub is moving JavaScript actions from Node 20 to Node 24: run them on 24 now (removes the deprecation warning).
++env:
++  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+ # Needed to publish the Release that the program's auto update reads.
+ permissions:
+   contents: write
