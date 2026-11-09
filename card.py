@@ -3833,11 +3833,12 @@ class Card(QWidget):
         self._exporting = True
         ver, args = self._ver, self.render_args()
         stem, ext = self.out_name()
+        src_path = self.path
 
         def work(progress):
             os.makedirs(EXPORT_DIR, exist_ok=True)
             path = core.unique_path(EXPORT_DIR, stem, ext)
-            core.save_image(core.render_full(*args), path)
+            core.save_image(core.render_full(*args), path, src=src_path)
             return path
 
         def done(path):
@@ -3875,7 +3876,7 @@ class Card(QWidget):
         os.makedirs(EXPORT_DIR, exist_ok=True)
         stem, ext = self.out_name()
         path = core.unique_path(EXPORT_DIR, stem, ext)
-        core.save_image(self.result_image(), path)
+        core.save_image(self.result_image(), path, src=self.path)
         self.set_export(self._ver, path)
         return path
 

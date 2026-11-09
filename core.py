@@ -1605,7 +1605,7 @@ def write_replacing(img, path):
     d, n = os.path.split(path)
     tmp = os.path.join(d, ".~if_" + n)
     try:
-        save_image(img, tmp)
+        save_image(img, tmp, src=path)          # the file being replaced still holds the dpi / colour profile
         os.replace(tmp, path)
     finally:
         if os.path.exists(tmp):
@@ -1639,20 +1639,45 @@ def unique_path(folder, base, ext):
     return p
 
 
-def save_image(img, path):
+EXPORT_DPI = 300            # used when the source file says nothing: other programs then show a sensible size, not "72 dpi"
+
+
+def source_meta(path):
+    """Resolution (dpi) and colour profile of the source file, so a saved / dragged copy keeps them."""
+    meta = {}
+    try:
+        with Image.open(path) as im:
+            dpi = im.info.get("dpi")
+            if dpi and float(dpi[0]) > 1 and float(dpi[1]) > 1:
+                meta["dpi"] = (float(dpi[0]), float(dpi[1]))
+            icc = im.info.get("icc_profile")
+            if icc:
+                meta["icc_profile"] = icc
+    except Exception:
+        pass
+    return meta
+
+
+def save_image(img, path, src=None):
+    """src = path of the original file (optional): its dpi and colour profile are written into the new file.
+    EXIF is not copied on purpose: the picture is already turned upright, a copied orientation tag would turn it twice."""
     e = os.path.splitext(path)[1].lower()
+    meta = source_meta(src) if src and os.path.isfile(src) else {}
+    kw = {"dpi": meta.get("dpi", (EXPORT_DPI, EXPORT_DPI))}
+    if "icc_profile" in meta:
+        kw["icc_profile"] = meta["icc_profile"]
     if e in (".jpg", ".jpeg"):
-        img.save(path, "JPEG", quality=95, subsampling=0, optimize=True)   # 4:4:4 keeps thin text sharp
+        img.save(path, "JPEG", quality=98, subsampling=0, optimize=True, **kw)   # 4:4:4 keeps thin text sharp
     elif e == ".webp":
-        img.save(path, "WEBP", quality=95)
+        img.save(path, "WEBP", quality=98, method=6, **({"icc_profile": kw["icc_profile"]} if "icc_profile" in kw else {}))
     elif e in (".tif", ".tiff"):
-        img.save(path, "TIFF", compression="tiff_lzw")
+        img.save(path, "TIFF", compression="tiff_lzw", **kw)
     elif e == ".bmp":
         img.save(path, "BMP")
     elif e == ".pdf":
         save_pdf([img], path)
     else:
-        img.save(path, "PNG")
+        img.save(path, "PNG", **kw)
 
 
 # ------------------------------------------------------------------- selection

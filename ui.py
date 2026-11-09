@@ -1445,7 +1445,7 @@ class MainWindow(QMainWindow):
                 progress(i / len(entries), "%d / %d" % (i + 1, len(entries)))
                 if p is None:
                     p = core.unique_path(EXPORT_DIR, stem, ext)
-                    core.save_image(src(), p)
+                    core.save_image(src(), p, src=c.path)
                 out.append(p)
             qimg = QImage(out[0]) if len(out) == 1 else None
             return out, qimg
@@ -1663,7 +1663,7 @@ class MainWindow(QMainWindow):
                     elif rep:
                         core.write_replacing(img, p)
                     else:
-                        core.save_image(img, p)
+                        core.save_image(img, p, src=c.path)
                     ok.append((c, p, bk))
                 except Exception as ex:
                     failed.append("%s: %s" % (c.name, ex))
