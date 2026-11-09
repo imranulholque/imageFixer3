@@ -18,6 +18,7 @@ import updater
 import winutil
 from card import CROP_KEYS, EXPORT_DIR, Card
 from feedback import DropOverlay, install_ripples
+from flow import ElidedLabel
 from savedlg import SaveAllDialog
 from jobs import JobRunner
 from updatedlg import UpdateManager
@@ -376,6 +377,7 @@ class MainWindow(QMainWindow):
         geo = scr.availableGeometry() if scr is not None else QRect(0, 0, 1366, 768)
         self._screen_long = max(geo.width(), geo.height()) * (scr.devicePixelRatio() if scr is not None else 1.0)
         self._ui_scale = 1.0
+        self._compact_style = False                # small window: tighter buttons / text (see _fit_layout)
         core.purge_dir(EXPORT_DIR, older_than=6 * 3600)         # leftovers of an earlier run
         core.purge_dir(core.ORIG_DIR, older_than=6 * 3600)
         self._replace_ok = False                   # 'Save replaces the original' was confirmed in this session
@@ -386,8 +388,8 @@ class MainWindow(QMainWindow):
         self._add_done = 0
         self._add_first = None
         self._adding = False
-        # a small screen must never be forced wider / taller than it is
-        self.setMinimumSize(min(940, int(geo.width() * 0.92)), min(600, int(geo.height() * 0.88)))
+        # the window can be made small (split screen, multitasking): the layout adapts in _fit_layout
+        self.setMinimumSize(min(480, int(geo.width() * 0.5)), min(340, int(geo.height() * 0.5)))
         self._apply_quality(self.settings.value("quality", "auto", type=str), say=False)
 
         central = QWidget()
@@ -422,8 +424,10 @@ class MainWindow(QMainWindow):
         l = QHBoxLayout(h)
         l.setContentsMargins(16, 10, 16, 10)
         l.setSpacing(10)
+        self.hdrLayout = l
         logo = QLabel()
         logo.setPixmap(logo_pixmap(30))
+        self.lblLogo = logo
         brand = QLabel("Image Fixer")
         brand.setObjectName("brand")
         by = QLabel("by " + AUTHOR)
@@ -471,9 +475,34 @@ class MainWindow(QMainWindow):
         self.btnSettings.setMenu(self._build_menu())
         for b in (self.btnFolder, self.btnOpenDir, self.btnClear):
             l.addWidget(b)
+        self.btnMore = QPushButton("\u22ef")          # small window: the less used buttons live in this menu
+        self.btnMore.setToolTip("More: save folder, apply to all, clear all ...")
+        self.btnMore.setMenu(self._build_more_menu())
+        self.btnMore.hide()
+        l.addWidget(self.btnMore)
         l.addWidget(self._build_save_group())
         l.addWidget(self.btnSettings)
         return h
+
+    def _build_more_menu(self):
+        """The buttons that do not fit in the top bar of a small window."""
+        m = QMenu(self)
+
+        def act(text, fn):
+            a = QAction(text, self)
+            a.triggered.connect(lambda _=False: fn())
+            m.addAction(a)
+            return a
+        act("Apply last setting to all", lambda: self._with_loaded(self.apply_to_all))
+        act("Choose save folder...", self.choose_dir)
+        self.actMoreOpen = act("Open save folder", self.open_dir)
+        m.addSeparator()
+        act("Save all edited...", self.save_all)
+        act("All pages as one PDF", self.save_all_pdf)
+        m.addSeparator()
+        act("Clear all", self.clear_all)
+        m.aboutToShow.connect(lambda: self.actMoreOpen.setEnabled(bool(self._dir())))
+        return m
 
     def _build_save_group(self):
         """Save (this picture) + a small arrow with the other ways to save / share. Sits left of Settings."""
@@ -593,6 +622,7 @@ class MainWindow(QMainWindow):
         w = QWidget()
         l = QVBoxLayout(w)
         l.setContentsMargins(60, 40, 60, 40)
+        self._empty_lay = l
         zone = QFrame()
         zone.setObjectName("dropzone")
         z = QVBoxLayout(zone)
@@ -601,17 +631,20 @@ class MainWindow(QMainWindow):
         ico = QLabel()
         ico.setPixmap(logo_pixmap(84))
         ico.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._empty_ico = ico
         t = QLabel("Drop pictures here")
         t.setObjectName("big")
         t.setAlignment(Qt.AlignmentFlag.AlignCenter)
         s = QLabel("or press Ctrl+V to paste copied pictures\n"
                    "or select pictures in Explorer, right-click > Send to > Image Fixer")
         s.setObjectName("muted")
+        s.setWordWrap(True)
         s.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._empty_sub = s
         b = QPushButton("+  Choose files")
         b.setProperty("accent", True)
         b.setMinimumHeight(40)
-        b.setMinimumWidth(180)
+        b.setMinimumWidth(120)
         b.clicked.connect(self.choose_files)
         z.addWidget(ico)
         z.addWidget(t)
@@ -639,6 +672,7 @@ class MainWindow(QMainWindow):
         b = QHBoxLayout(bar)
         b.setContentsMargins(12, 8, 12, 8)
         b.setSpacing(8)
+        self.barLayout = b
         self.btnPrev = QPushButton("\u2039")
         self.btnPrev.setObjectName("nav")
         self.btnNext = QPushButton("\u203a")
@@ -681,12 +715,11 @@ class MainWindow(QMainWindow):
         self.lblCount = QLabel("")
         self.lblCount.setObjectName("muted")
         self.lblCount.setMinimumWidth(96)
-        self.lblStatus = QLabel("")
+        self.lblStatus = ElidedLabel("")           # long text ends with '...' (full text in the tooltip): never pushes the window wider
         self.lblStatus.setObjectName("muted")
-        self.lblStatus.setMinimumWidth(120)
+        self.lblStatus.setMinimumWidth(40)
         self.lblStatus.setMaximumWidth(420)
         self.lblStatus.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
-        self.lblStatus.setWordWrap(True)
         b.addWidget(self.btnPrev)
         b.addWidget(self.strip, 1)
         b.addWidget(self.btnNext)
@@ -846,23 +879,77 @@ class MainWindow(QMainWindow):
         super().resizeEvent(e)
         self._fit_layout()
 
+    def _thumb_px_for(self, h):
+        return int(round((44 if h < 560 else 56 if h < 720 else 64 if h < 1000 else 80) * self._ui_scale))
+
     def _fit_layout(self):
-        """Small window: shorter texts, thumbnails that fit the height.  Nothing is cut off or pushed out."""
-        if not hasattr(self, "btnChoose"):
+        """The window follows its size (split screen, multitasking): the top bar, the bottom bar, the thumbnails and the
+        empty page shrink step by step.  Nothing is cut off or pushed out; less used buttons move into the ... menu."""
+        if not hasattr(self, "btnMore") or not hasattr(self, "strip"):
             return
         w, h = self.width(), self.height()
-        self.lblBrand.setVisible(w >= 1050)
-        self.btnOpenDir.setVisible(w >= 880)
-        self.btnPhone.setText("Add from phone" if w >= 1000 else "Phone")
-        self.btnChoose.setText("+  Choose files" if w >= 900 else "+  Files")
-        self.btnApplyAll.setText("Apply last setting to all" if w >= 1150 else "Apply to all")
+        # tighter buttons / smaller text in a small window (with a little hysteresis, so it never flickers)
+        want = (w < 800 or h < 640) if not self._compact_style else not (w >= 860 and h >= 700)
+        if want != self._compact_style:
+            self._compact_style = want
+            QTimer.singleShot(0, self._restyle)
         self._refresh_dir()
+        self._fit_header(w)
+        self._fit_bar(w)
+        # the empty page (drop zone)
+        small = h < 560 or w < 600
+        self._empty_lay.setContentsMargins(*((14, 10, 14, 10) if small else (60, 40, 60, 40)))
+        self._empty_ico.setVisible(h >= 520)
+        self._empty_sub.setVisible(h >= 400)
         if self._phone_dlg is not None and self._phone_dlg.isVisible():
             self._phone_dlg.reposition()
-        px = int(round((56 if h < 720 else 64 if h < 1000 else 80) * self._ui_scale))
+        # thumbnails: smaller when the window is low; a very low window keeps only the arrows + counter
+        self.strip.setVisible(h >= 470)
+        px = self._thumb_px_for(h)
         if px != self._thumb_px:
             self._thumb_px = px
             self._apply_thumb_size()
+
+    def _fit_header(self, w):
+        """Top bar: the first of these steps that fits the width is used (measured, not guessed)."""
+        lay = self.hdrLayout
+        small = w < 700
+        lay.setContentsMargins(*((8, 6, 8, 6) if small else (16, 10, 16, 10)))
+        lay.setSpacing(6 if small else 10)
+
+        def step(k):
+            self.lblBrand.setVisible(k < 1)
+            self.btnPhone.setText("Add from phone" if k < 2 else "Phone")
+            self.btnChoose.setText("+  Choose files" if k < 2 else "+  Files")
+            self.btnApplyAll.setText("Apply last setting to all" if k < 2 else "Apply to all")
+            more = k >= 3                                  # folder, open, clear, apply-to-all go into the ... menu
+            for b in (self.btnFolder, self.btnOpenDir, self.btnClear, self.btnApplyAll):
+                b.setVisible(not more)
+            self.btnMore.setVisible(more)
+            self.lblLogo.setVisible(k < 4)
+            self.btnSettings.setText("Settings" if k < 5 else "\u2699")
+        for k in range(6):
+            step(k)
+            lay.invalidate()
+            if lay.sizeHint().width() <= w:
+                break
+
+    def _fit_bar(self, w):
+        """Bottom bar (thumbnails, arrows, counter, status) in a narrow window."""
+        tight = w < 760
+        bl = self.barLayout
+        bl.setContentsMargins(*((6, 4, 6, 4) if tight else (12, 8, 12, 8)))
+        bl.setSpacing(4 if tight else 8)
+        self.progress.setFixedWidth(80 if tight else 130)
+        self.lblCount.setMinimumWidth(0 if tight else 96)
+        self.lblStatus.setMaximumWidth(min(420, max(60, int(w * 0.3))))
+        self.btnPageL.setVisible(w >= 560)
+        self.btnPageR.setVisible(w >= 560)
+
+    def _restyle(self):
+        """Tighter / normal style sheet after the window became small / big again."""
+        QApplication.instance().setStyleSheet(scaled_qss(self._ui_scale, self._compact_style))
+        self._fit_layout()
 
     def _thumb_hint(self):
         return QSize(self._thumb_px + 32, self._thumb_px + 26)
@@ -895,9 +982,9 @@ class MainWindow(QMainWindow):
         else:
             f = {"small": 0.9, "normal": 1.0, "large": 1.15, "xl": 1.3}.get(mode, 1.0)
         self._ui_scale = f
-        QApplication.instance().setStyleSheet(scaled_qss(f))
+        QApplication.instance().setStyleSheet(scaled_qss(f, self._compact_style))
         if hasattr(self, "strip"):
-            self._thumb_px = int(round((56 if self.height() < 720 else 64 if self.height() < 1000 else 80) * f))
+            self._thumb_px = self._thumb_px_for(self.height())
             self._apply_thumb_size()
         if say:
             self.say("Interface size changed.")

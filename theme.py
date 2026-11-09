@@ -164,9 +164,17 @@ QToolTip { background: #222836; color: #e8eaed; border: 1px solid #3a4260; paddi
 """
 
 
-def scaled_qss(factor):
-    """The style sheet with every font size multiplied (interface size setting)."""
+def scaled_qss(factor, compact=False):
+    """The style sheet with every font size multiplied (interface size setting).
+    compact = small window: tighter button padding and slightly smaller text, so more fits."""
     import re
+    q = QSS
+    if compact:
+        q = (q.replace("padding: 4px 10px;", "padding: 2px 6px;")
+              .replace("padding: 5px 8px;", "padding: 3px 6px;")
+              .replace("QMenu::item { padding: 8px 24px 8px 14px;", "QMenu::item { padding: 6px 20px 6px 12px;")
+              .replace("QPushButton#nav { font-size: 20px; padding: 2px 12px; }", "QPushButton#nav { font-size: 20px; padding: 2px 8px; }"))
+        factor = factor * 0.94
     if abs(factor - 1.0) < 0.01:
-        return QSS
-    return re.sub(r"font-size:\s*(\d+)px", lambda m: "font-size: %dpx" % max(9, int(round(int(m.group(1)) * factor))), QSS)
+        return q
+    return re.sub(r"font-size:\s*(\d+)px", lambda m: "font-size: %dpx" % max(9, int(round(int(m.group(1)) * factor))), q)

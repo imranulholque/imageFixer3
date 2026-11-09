@@ -584,6 +584,7 @@ class DragHandle(QPushButton):
 
 class _SideSync(QObject):
     moved = Signal(int)
+    panelChanged = Signal(bool)                # the Panel button (show / hide the side panel) was pressed on one picture
 
 
 _SIDE_SYNC = None
@@ -600,6 +601,9 @@ def side_sync():
 class Card(QWidget):
     TAB_ADJUST, TAB_COLOR, TAB_SHADOW, TAB_TEXT, TAB_PICTURE = range(5)   # order of the side tabs
     SIDE_W = 350                                                                     # width of the side panel (shared, drag to change)
+    NARROW_W = 720                                                                   # a narrower picture card: the panel goes UNDER the picture
+    SHORT_H = 520                                                                    # a lower card: the hint line is hidden (warnings still show)
+    PANEL_USER = None                                                                # None = automatic; True / False = chosen with the Panel button (all pictures)
     editedChanged = Signal(object)
     removeRequested = Signal(object)
     copyRequested = Signal(object)
@@ -700,6 +704,10 @@ class Card(QWidget):
         self._shadow_timer.setSingleShot(True)
         self._shadow_timer.setInterval(450)
         self._shadow_timer.timeout.connect(lambda: self._auto_shadow(live=True))
+        self._vertical = None                      # panel under (True) / beside (False) the picture; None = not placed yet
+        self._panel_shown = None
+        self._short = False
+        self._hint_warn = False
         self._build()
 
     # ------------------------------------------------------------------ ui helpers
@@ -846,6 +854,8 @@ class Card(QWidget):
         root = QVBoxLayout(self)
         root.setContentsMargins(10, 6, 8, 4)
         root.setSpacing(4)
+        self._root = root
+        self._r1 = None
 
         # --- row 1: name + history
         r1 = QHBoxLayout()
@@ -871,11 +881,17 @@ class Card(QWidget):
         self._cmp = None                            # the overlay while comparing
         self.btnRemove = QPushButton("Remove")
         self.btnRemove.setProperty("danger", True)
+        self.btnRemove.setToolTip("Remove this picture from the list (the file on the disk is not touched)")
+        self.btnPanel = QPushButton("Panel")
+        self.btnPanel.setCheckable(True)
+        self.btnPanel.setChecked(True)
+        self.btnPanel.setToolTip("Show / hide the side panel (Adjust, Color, Shadow ...) to give the picture more room")
+        self._r1 = r1
         r1.addWidget(self.lblName)
         r1.addWidget(self.lblInfo)
         r1.addWidget(self.lblState)
         r1.addStretch(1)
-        for b in (self.btnCompare, self.btnCmpMode, self.btnUndo, self.btnRedo, self.btnReset, self.btnRemove):
+        for b in (self.btnPanel, self.btnCompare, self.btnCmpMode, self.btnUndo, self.btnRedo, self.btnReset, self.btnRemove):
             r1.addWidget(b)
         root.addLayout(r1)
 
@@ -1121,7 +1137,7 @@ class Card(QWidget):
         # --- body: picture + tabs
         self.canvas = ImageCanvas()
         self.canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.canvas.setMinimumSize(200, 200)
+        self.canvas.setMinimumSize(120, 100)             # a small window must still be possible
         self.split = QSplitter(Qt.Orientation.Horizontal)          # drag the bar between picture and panel to resize
         self.split.setChildrenCollapsible(False)
         self.split.setHandleWidth(8)
@@ -1131,7 +1147,6 @@ class Card(QWidget):
         self.split.setStretchFactor(1, 0)
         self.split.handle(1).setCursor(Qt.CursorShape.SplitHCursor)
         self.split.handle(1).setToolTip("Drag to make the panel wider or narrower")
-        self._split_init = False
         self.split.splitterMoved.connect(self._side_moved)
         side_sync().moved.connect(self._side_set)
         root.addWidget(self.split, 1)
@@ -1176,6 +1191,8 @@ class Card(QWidget):
         self.btnCompare.clicked.connect(self.compare)
         self.btnCmpMode.clicked.connect(self._cmp_mode)
         self.btnRemove.clicked.connect(lambda: self.removeRequested.emit(self))
+        self.btnPanel.clicked.connect(self._panel_clicked)
+        side_sync().panelChanged.connect(self._on_panel_sync)       # bound method: disconnects itself when the card is deleted
         self.btnSelVis.toggled.connect(self._toggle_sel_vis)
         self.colors.changed.connect(self._on_adj_changed)
         self.colors.removeAdj.connect(self._remove_adj)
@@ -1196,18 +1213,92 @@ class Card(QWidget):
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
-        if not self._split_init and self.width() > 500:        # first time: the panel gets the remembered width
-            self._split_init = True
-            w = min(Card.SIDE_W, int(self.width() * 0.6))
-            self.split.setSizes([self.width() - w, w])
+        self._fit_card()
+
+    def _fit_card(self):
+        """The card follows its own size: narrow = the panel goes under the picture, low = the hint line is hidden,
+        very small = the panel is hidden (the Panel button brings it back).  Nothing is cut off."""
+        if not hasattr(self, "split") or not hasattr(self, "_side") or self._dead:
+            return
+        w, h = self.width(), self.height()
+        if w < 120 or h < 120:
+            return
+        vertical = w < self.NARROW_W
+        tiny = (vertical and h < 560) or h < 340
+        short = h < self.SHORT_H
+        compact = w < 640
+        narrow = w < 560
+        # --- text of the top row
+        self.lblInfo.setVisible(not narrow)
+        self.lblState.setVisible(w >= 520)
+        self.btnUndo.setText("\u21b6" if compact else "\u21b6 Undo")
+        self.btnRedo.setText("\u21b7" if compact else "Redo \u21b7")
+        self.btnRemove.setText("\u2715" if compact else "Remove")
+        self._r1.setSpacing(4 if compact else 8)
+        self._root.setContentsMargins(*((6, 4, 4, 2) if compact or short else (10, 6, 8, 4)))
+        self._root.setSpacing(3 if short else 4)
+        self._short = short
+        self._sync_hint()
+        # --- panel: beside or under the picture, shown or hidden
+        user = Card.PANEL_USER
+        show = (not tiny) if user is None else bool(user)
+        self.btnPanel.blockSignals(True)
+        self.btnPanel.setChecked(show)
+        self.btnPanel.blockSignals(False)
+        replace = False
+        if vertical != self._vertical:
+            self._vertical = vertical
+            self.split.setOrientation(Qt.Orientation.Vertical if vertical else Qt.Orientation.Horizontal)
+            self.split.setStretchFactor(0, 3 if vertical else 1)
+            self.split.setStretchFactor(1, 2 if vertical else 0)
+            self._side.setMinimumWidth(0 if vertical else 290)
+            self._side.setMinimumHeight(110 if vertical else 0)
+            self.split.handle(1).setToolTip("Drag to make the panel %s" % ("higher or lower" if vertical else "wider or narrower"))
+            replace = True
+        if show != self._panel_shown:
+            self._panel_shown = show
+            self._side.setVisible(show)
+            replace = show
+        if replace or (show and not vertical and self._side.width() > w * 0.55):
+            QTimer.singleShot(0, self._place_split)
+
+    def _place_split(self):
+        """Sizes of picture and panel (the panel width is the shared, remembered one)."""
+        if self._dead or self._side.isHidden():
+            return
+        self.split.blockSignals(True)
+        if self._vertical:
+            total = max(1, self.split.height())
+            ph = max(110, int(total * 0.42))
+            self.split.setSizes([max(60, total - ph), ph])
+        else:
+            total = max(1, self.split.width())
+            sw = max(290, min(Card.SIDE_W, int(total * 0.5)))
+            self.split.setSizes([max(60, total - sw), sw])
+        self.split.blockSignals(False)
+
+    def _on_panel_sync(self, _on=False):
+        if not self._dead:
+            self._fit_card()
+
+    def _panel_clicked(self, on):
+        Card.PANEL_USER = bool(on)
+        side_sync().panelChanged.emit(bool(on))
+
+    def _sync_hint(self):
+        self.lblHint.setVisible((not self._short) or self._hint_warn)
 
     def _side_moved(self, _pos=0, _idx=0):
+        if self._vertical:
+            return                                             # under the picture: the height is not the shared width
         w = self.split.sizes()[1]
         if w >= 200:
             Card.SIDE_W = w                                    # every picture's panel follows
             side_sync().moved.emit(w)
 
     def _side_set(self, w):
+        if self._vertical or self._side.isHidden():
+            return
         sz = self.split.sizes()
         total = sum(sz)
         if total <= 0 or abs(sz[1] - w) < 3:
@@ -3069,7 +3160,14 @@ class Card(QWidget):
         self.canvas.fx.warn(head.rstrip("."), rest)
         self.message.emit(text)
         self.lblHint.setText("\u26a0  " + text)
-        QTimer.singleShot(5000, lambda: self.lblHint.setText(HINTS.get(self._tool, "")))
+        self._hint_warn = True
+        self._sync_hint()
+        QTimer.singleShot(5000, self._end_warn)
+
+    def _end_warn(self):
+        self._hint_warn = False
+        self.lblHint.setText(HINTS.get(self._tool, ""))
+        self._sync_hint()
 
     def _select_adj(self, aid):
         """'Select this color': the places of a picked color become the selection."""
