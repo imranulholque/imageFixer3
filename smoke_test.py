@@ -248,6 +248,7 @@ def t_multi_remove():
         w.strip.item(r).setSelected(True)
     uids = w.strip.uids()
     assert len(uids) == 3
+    w.runner.wait_idle()                           # thumbnail clicks start loading jobs; removing is refused while they run
     w.remove_by_uids(uids)
     assert len(w.carousel.cards) == 2 and w.strip.count() == 2 and len(w.items) == 2
     assert [c.uid for c in w.carousel.cards] == [w.strip.item(i).data(Qt.ItemDataRole.UserRole) for i in range(2)]
@@ -447,6 +448,7 @@ def t_incoming_routing():
     c.tabGroup.button(0).click()                                   # Adjust tab: a new picture arrives -> a new main picture
     n0 = len(w.carousel.cards); w._incoming([q], "phone"); _pump(lambda: not w._adding and len(w.carousel.cards) == n0 + 1); w.runner.wait_idle()
     assert len(w.carousel.cards) == n0 + 1 and w.carousel.cards[-1].origin == "phone" and not w.carousel.cards[-1].can_replace()
+    w.carousel.go_to(0, animate=False); _pump(lambda: c._loaded and not w.runner.busy)   # the new picture opened by itself: go back to this one
     c.tabGroup.button(c.TAB_PICTURE).click()                      # Picture tab: it becomes an overlay on this page
     w._incoming([q], "file"); _pump(lambda: len(c.layers) == 1 and not w.runner.busy)
     assert len(c.layers) == 1 and len(w.carousel.cards) == n0 + 1, "overlay, not a new picture"
