@@ -67,6 +67,9 @@ def t_undo():
     c.redo_step(); assert c.look["bright"] == 40
     c.redo_step(); assert c.look["contrast"] == 20
     c.undo_step(); c.undo_step()
+    # the hue (120) is still set here. Any new selection now WRITES pending settings into the picture (inside the old box),
+    # which turned the red box green for all later tests. Clear the settings so the picture stays as it was.
+    c.look = core.new_look(); c.adjs = []; c.colors.rebuild(c.adjs); c._sync_sliders(); c._end_gesture()
 step("undo/redo sliders", t_undo)
 
 # 3 selection undo
