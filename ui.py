@@ -4,10 +4,10 @@ import tempfile
 import time
 
 from PIL import Image, ImageOps
-from PySide6.QtCore import (QEasingCurve, QEvent, QItemSelectionModel, QObject, QRect, QRunnable, QSettings, QSize, Qt, QThreadPool, QTimer,
+from PySide6.QtCore import (QEasingCurve, QEvent, QItemSelectionModel, QObject, QPointF, QRect, QRunnable, QSettings, QSize, Qt, QThreadPool, QTimer,
                             QUrl, QVariantAnimation, Signal)
 from PySide6.QtCore import QMimeData
-from PySide6.QtGui import (QAction, QActionGroup, QColor, QDesktopServices, QDrag, QFontMetrics, QIcon, QImage,
+from PySide6.QtGui import (QAction, QActionGroup, QColor, QCursor, QDesktopServices, QMouseEvent, QDrag, QFontMetrics, QIcon, QImage,
                            QKeySequence, QPainter, QPixmap, QShortcut, QTransform)
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QDialog, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel,
                                QListView, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QProgressBar,
@@ -167,8 +167,35 @@ class Strip(QListWidget):
             if self._press_item is not None:
                 self.preparer(self._press_item.data(Qt.ItemDataRole.UserRole))
 
+    def _end_band(self):
+        """The selection box (rubber band) sticks to the mouse when Qt never gets the button release (window lost focus,
+        a menu / drag swallowed it, touchpad tap-drag ...).  End it the way a real release would."""
+        if self.state() == QAbstractItemView.State.DragSelectingState:
+            gp = QCursor.pos()
+            p = QPointF(self.viewport().mapFromGlobal(gp))
+            ev = QMouseEvent(QEvent.Type.MouseButtonRelease, p, QPointF(gp), Qt.MouseButton.LeftButton,
+                             Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier)
+            QListWidget.mouseReleaseEvent(self, ev)
+        self._press = None
+        self._press_item = None
+
+    def focusOutEvent(self, e):
+        self._end_band()
+        super().focusOutEvent(e)
+
+    def leaveEvent(self, e):
+        if not (QApplication.mouseButtons() & Qt.MouseButton.LeftButton):
+            self._end_band()
+        super().leaveEvent(e)
+
+    def hideEvent(self, e):
+        self._end_band()
+        super().hideEvent(e)
+
     def mouseMoveEvent(self, e):
         """Our own drag start (Qt's list drag does not start in this layout): press a thumbnail, move a little."""
+        if not (e.buttons() & Qt.MouseButton.LeftButton):    # button is NOT down: a box that still follows the mouse is stuck
+            self._end_band()
         if (self._press is not None and self._press_item is not None and (e.buttons() & Qt.MouseButton.LeftButton)
                 and (e.position().toPoint() - self._press).manhattanLength() >= QApplication.startDragDistance()):
             it = self._press_item
