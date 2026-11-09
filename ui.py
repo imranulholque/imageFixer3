@@ -16,11 +16,12 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QDial
 import core
 import updater
 import winutil
-from card import EXPORT_DIR, Card
+from card import CROP_KEYS, EXPORT_DIR, Card
+from feedback import DropOverlay, install_ripples
 from savedlg import SaveAllDialog
 from jobs import JobRunner
 from updatedlg import UpdateManager
-from theme import logo_pixmap, make_icon, scaled_qss
+from theme import AUTHOR, logo_pixmap, make_icon, scaled_qss
 
 FILTER = "Pictures and PDF (%s);;All files (*)" % " ".join("*" + e for e in sorted(core.IMG_EXT | {core.PDF_EXT}))
 
@@ -368,7 +369,7 @@ class MainWindow(QMainWindow):
         self.phone = None
         self.phone_tunnel = None
         self._phone_dlg = None
-        self.setWindowTitle("Image Fixer")
+        self.setWindowTitle("Image Fixer  -  by " + AUTHOR)
         self.setWindowIcon(make_icon())
         self.setAcceptDrops(True)
         scr = QApplication.primaryScreen()
@@ -406,6 +407,8 @@ class MainWindow(QMainWindow):
         self.thumbs.done.connect(self._thumb_done)
         self._build_tray()
         self._build_shortcuts()
+        self.drop = DropOverlay(self)              # dims the window and shows a drop zone while files are dragged over it
+        install_ripples(QApplication.instance())   # every button gives a soft wave where it is pressed
         self.updater.start()                      # auto update: looks for a new build a few seconds after start (if switched on)
         self._apply_ui_size(self.settings.value("ui_size", "auto", type=str), say=False)
         self._fit_layout()
@@ -423,9 +426,17 @@ class MainWindow(QMainWindow):
         logo.setPixmap(logo_pixmap(30))
         brand = QLabel("Image Fixer")
         brand.setObjectName("brand")
-        self.lblBrand = brand
+        by = QLabel("by " + AUTHOR)
+        by.setObjectName("muted")
+        box = QWidget()
+        bv = QVBoxLayout(box)
+        bv.setContentsMargins(0, 0, 0, 0)
+        bv.setSpacing(0)
+        bv.addWidget(brand)
+        bv.addWidget(by)
+        self.lblBrand = box
         l.addWidget(logo)
-        l.addWidget(brand)
+        l.addWidget(box)
         l.addSpacing(14)
         self.btnChoose = QPushButton("+  Choose files")
         self.btnChoose.setProperty("accent", True)
@@ -536,6 +547,9 @@ class MainWindow(QMainWindow):
         m.addAction(self.actUpdReady)
         m.addAction(self.actUpdNow)
         m.addAction(self.actUpdVer)
+        self.actAbout = QAction("About Image Fixer  (made by %s)" % AUTHOR, self)
+        self.actAbout.triggered.connect(self.about)
+        m.addAction(self.actAbout)
         m.addSeparator()
         a = QAction("Choose save folder...", self)
         a.triggered.connect(self.choose_dir)
@@ -552,6 +566,15 @@ class MainWindow(QMainWindow):
         q.triggered.connect(self.quit_app)
         m.addAction(q)
         return m
+
+    def about(self):
+        box = QMessageBox(self)
+        box.setWindowTitle("About Image Fixer")
+        box.setIconPixmap(logo_pixmap(72))
+        box.setTextFormat(Qt.TextFormat.RichText)
+        box.setText("<span style='font-size:18px; font-weight:700'>Image Fixer</span><br>"
+                    "Made by <b>%s</b><br><br>Version: %s" % (AUTHOR, updater.version_text()))
+        box.exec()
 
     def _radio_menu(self, menu, title, key, fn, choices):
         sub = menu.addMenu(title)
@@ -595,6 +618,11 @@ class MainWindow(QMainWindow):
         z.addWidget(s)
         z.addSpacing(8)
         z.addWidget(b, 0, Qt.AlignmentFlag.AlignCenter)
+        z.addSpacing(10)
+        credit = QLabel("Made by " + AUTHOR)
+        credit.setObjectName("muted")
+        credit.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        z.addWidget(credit)
         l.addWidget(zone)
         return w
 
@@ -675,7 +703,7 @@ class MainWindow(QMainWindow):
         if not QSystemTrayIcon.isSystemTrayAvailable():
             return
         self.tray = QSystemTrayIcon(make_icon(), self)
-        self.tray.setToolTip("Image Fixer")
+        self.tray.setToolTip("Image Fixer  -  by " + AUTHOR)
         m = QMenu()
         o = QAction("Open Image Fixer", self)
         o.triggered.connect(self.show_front)
@@ -699,9 +727,33 @@ class MainWindow(QMainWindow):
             else:
                 self.show_front()
 
+    KEY_NAMES = {"Left": "\u2190", "Right": "\u2192", "Up": "\u2191", "Down": "\u2193", "Delete": "Del",
+                 "Return": "Enter", "Escape": "Esc"}
+
+    def _key_chip(self, keys, label):
+        """A shortcut was pressed: show its key caps and what it does on the picture (label may be a function)."""
+        c = self.carousel.current()
+        if c is None or self.runner.busy:
+            return
+        text = label() if callable(label) else label
+        if not text:
+            return
+        parts = (keys[:-2].split("+") + ["+"]) if keys.endswith("++") else keys.split("+")
+        c.canvas.fx.key([self.KEY_NAMES.get(k, k) for k in parts], text)
+
+    def _tf_active(self):
+        c = self.carousel.current()
+        return c is not None and c._tool == "transform"
+
+    def _pending_active(self):
+        c = self.carousel.current()
+        return c is not None and (c._tool in CROP_KEYS or c._tool == "transform")
+
     def _build_shortcuts(self):
-        def sc(keys, fn):
+        def sc(keys, fn, label=None):
             s = QShortcut(QKeySequence(keys), self)
+            if label:
+                s.activated.connect(lambda k=keys, t=label: self._key_chip(k, t))
             s.activated.connect(fn)
 
         def cur(fn):
@@ -714,49 +766,54 @@ class MainWindow(QMainWindow):
                 self.carousel.prev()
             elif dx > 0:
                 self.carousel.next()
-        sc("Left", lambda: arrow(-1, 0))
-        sc("Right", lambda: arrow(1, 0))
-        sc("Up", lambda: arrow(0, -1))
-        sc("Down", lambda: arrow(0, 1))
-        sc("Shift+Left", lambda: arrow(-10, 0) if (self.carousel.current() is not None and self.carousel.current()._tool == "transform") else None)
-        sc("Shift+Right", lambda: arrow(10, 0) if (self.carousel.current() is not None and self.carousel.current()._tool == "transform") else None)
-        sc("Shift+Up", lambda: arrow(0, -10) if (self.carousel.current() is not None and self.carousel.current()._tool == "transform") else None)
-        sc("Shift+Down", lambda: arrow(0, 10) if (self.carousel.current() is not None and self.carousel.current()._tool == "transform") else None)
+
+        def nudge(n):
+            return lambda: ("Nudge %d px" % n) if self._tf_active() else None
+        sc("Left", lambda: arrow(-1, 0), lambda: "Nudge 1 px" if self._tf_active() else "Previous picture")
+        sc("Right", lambda: arrow(1, 0), lambda: "Nudge 1 px" if self._tf_active() else "Next picture")
+        sc("Up", lambda: arrow(0, -1), nudge(1))
+        sc("Down", lambda: arrow(0, 1), nudge(1))
+        sc("Shift+Left", lambda: arrow(-10, 0) if (self.carousel.current() is not None and self.carousel.current()._tool == "transform") else None, nudge(10))
+        sc("Shift+Right", lambda: arrow(10, 0) if (self.carousel.current() is not None and self.carousel.current()._tool == "transform") else None, nudge(10))
+        sc("Shift+Up", lambda: arrow(0, -10) if (self.carousel.current() is not None and self.carousel.current()._tool == "transform") else None, nudge(10))
+        sc("Shift+Down", lambda: arrow(0, 10) if (self.carousel.current() is not None and self.carousel.current()._tool == "transform") else None, nudge(10))
         for keys, deg in (("[", -1), ("]", 1), ("Ctrl+[", -15), ("Ctrl+]", 15),
                           ("Ctrl+Alt+Left", -90), ("Ctrl+Alt+Right", 90)):
-            sc(keys, lambda d=deg: self._with_current(lambda c: c.tf_rotate(d)))
-        sc("R", lambda: self._with_current(lambda c: c.rotate_key(-90.0)))      # 90° right: the selected picture, else the page
-        sc("Shift+R", lambda: self._with_current(lambda c: c.rotate_key(90.0)))   # 90° left
-        sc("Ctrl+V", self.paste)
-        sc("Ctrl+C", cur(lambda c: self.copy_cards([c])))
-        sc("Ctrl+P", cur(lambda c: self.print_cards([c])))
+            sc(keys, lambda d=deg: self._with_current(lambda c: c.tf_rotate(d)),
+               lambda d=deg: ("Rotate %d\u00b0 %s" % (abs(d), "left" if d < 0 else "right")) if self._tf_active() else None)
+        sc("R", lambda: self._with_current(lambda c: c.rotate_key(-90.0)), "Turn 90\u00b0 right")      # the selected picture, else the page
+        sc("Shift+R", lambda: self._with_current(lambda c: c.rotate_key(90.0)), "Turn 90\u00b0 left")
+        sc("Ctrl+V", self.paste, "Paste")
+        sc("Ctrl+C", cur(lambda c: self.copy_cards([c])), "Copy picture")
+        sc("Ctrl+P", cur(lambda c: self.print_cards([c])), "Print")
         sc("Ctrl+O", self.choose_files)
-        sc("Ctrl+S", cur(self.save_card))
-        sc("Ctrl+Shift+S", self.save_all)
+        sc("Ctrl+S", cur(self.save_card), "Save")
+        sc("Ctrl+Shift+S", self.save_all, "Save all edited")
         # history
-        sc("Ctrl+Z", cur(lambda c: c.undo_step()))
-        sc("Ctrl+Y", cur(lambda c: c.redo_step()))
-        sc("Ctrl+Shift+Z", cur(lambda c: c.redo_step()))
+        sc("Ctrl+Z", cur(lambda c: c.undo_step()), "Undo")
+        sc("Ctrl+Y", cur(lambda c: c.redo_step()), "Redo")
+        sc("Ctrl+Shift+Z", cur(lambda c: c.redo_step()), "Redo")
         # selection / editing
-        sc("Ctrl+A", cur(lambda c: c.select_all()))
-        sc("Ctrl+D", cur(lambda c: c.deselect()))
-        sc("Ctrl+Shift+I", cur(lambda c: c.invert_selection()))
-        sc("Ctrl+T", cur(lambda c: c.start_transform()))
-        sc("Delete", cur(lambda c: c.delete_selection()))
-        sc("Backspace", cur(lambda c: c.delete_selection()))
-        sc("Return", cur(lambda c: c.apply_pending()))
-        sc("Enter", cur(lambda c: c.apply_pending()))
-        sc("Escape", cur(lambda c: c.cancel_pending()))
-        # tools (single letters, like in a picture editor)
+        sc("Ctrl+A", cur(lambda c: c.select_all()), "Select all")
+        sc("Ctrl+D", cur(lambda c: c.deselect()), "Deselect")
+        sc("Ctrl+Shift+I", cur(lambda c: c.invert_selection()), "Invert selection")
+        sc("Ctrl+T", cur(lambda c: c.start_transform()), "Transform")
+        del_label = lambda: "Delete selection" if (self.carousel.current() is not None and self.carousel.current().sel is not None) else None
+        sc("Delete", cur(lambda c: c.delete_selection()), del_label)
+        sc("Backspace", cur(lambda c: c.delete_selection()), del_label)
+        sc("Return", cur(lambda c: c.apply_pending()), lambda: "Apply" if self._pending_active() else None)
+        sc("Enter", cur(lambda c: c.apply_pending()), lambda: "Apply" if self._pending_active() else None)
+        sc("Escape", cur(lambda c: c.cancel_pending()), lambda: "Cancel" if self._pending_active() else None)
+        # tools (single letters, like in a picture editor): the toast of the tool says the letter
         for key, tool in (("V", "move"), ("M", "rect"), ("L", "lasso"), ("W", "color"), ("B", "brush"),
                           ("E", "erase_brush"), ("C", "crop"), ("I", "pick"), ("P", "paint"), ("H", "view")):
             sc(key, cur(lambda c, t=tool: c.choose_tool(t)))
         # zoom
-        sc("Ctrl+0", cur(lambda c: c.canvas.fit()))
-        sc("Ctrl+1", cur(lambda c: c.canvas.zoom_to(1.0 / max(c.scale, 1e-6))))
-        sc("Ctrl+=", cur(lambda c: c.canvas.zoom_by(1.25)))
-        sc("Ctrl++", cur(lambda c: c.canvas.zoom_by(1.25)))
-        sc("Ctrl+-", cur(lambda c: c.canvas.zoom_by(0.8)))
+        sc("Ctrl+0", cur(lambda c: c.canvas.fit()), "Fit to window")
+        sc("Ctrl+1", cur(lambda c: c.canvas.zoom_to(1.0 / max(c.scale, 1e-6))), "Actual size")
+        sc("Ctrl+=", cur(lambda c: c.canvas.zoom_by(1.25)), "Zoom in")
+        sc("Ctrl++", cur(lambda c: c.canvas.zoom_by(1.25)), "Zoom in")
+        sc("Ctrl+-", cur(lambda c: c.canvas.zoom_by(0.8)), "Zoom out")
 
     def _with_current(self, fn):
         c = self.carousel.current()
@@ -895,8 +952,14 @@ class MainWindow(QMainWindow):
         md = e.mimeData()
         if md.hasUrls() or md.hasImage():
             e.acceptProposedAction()
+            self.drop.present()
+
+    def dragLeaveEvent(self, e):
+        self.drop.dismiss()
+        super().dragLeaveEvent(e)
 
     def dropEvent(self, e):
+        self.drop.dismiss()
         md = e.mimeData()
         paths = [u.toLocalFile() for u in md.urls() if u.isLocalFile()] if md.hasUrls() else []
         if paths:
@@ -1237,6 +1300,14 @@ class MainWindow(QMainWindow):
     def copy_by_uids(self, uids):
         self.copy_cards([c for c in (self._card(u) for u in uids) if c is not None])
 
+    @staticmethod
+    def _fx(card):
+        """The feedback layer of a card's picture, or None (card gone)."""
+        try:
+            return None if card is None or card._dead else card.canvas.fx
+        except Exception:
+            return None
+
     def copy_cards(self, cards):
         """Ctrl+C: the pictures (with their edits) go to the clipboard.  Rendering happens in a worker thread."""
         cards = [c for c in cards if c is not None]
@@ -1265,6 +1336,11 @@ class MainWindow(QMainWindow):
             qimg = QImage(out[0]) if len(out) == 1 else None
             return out, qimg
 
+        for c in cards:
+            fx = self._fx(c)
+            if fx is not None:
+                fx.busy("copy", "Copying the picture\u2026")
+
         def done(r):
             paths, qimg = r
             md = QMimeData()
@@ -1276,8 +1352,21 @@ class MainWindow(QMainWindow):
                 if p is None and not c._dead:
                     c.set_export(ver, path)
             self.say("Copied %d picture(s). Paste them anywhere with Ctrl+V." % len(paths))
+            for c in cards:
+                fx = self._fx(c)
+                if fx is not None:
+                    fx.done("copy", "Picture copied", "paste it anywhere with Ctrl+V")
+                    fx.pulse("copy")
+
+        def copy_failed(msg):
+            for c in cards:
+                fx = self._fx(c)
+                if fx is not None:
+                    fx.cancel_busy()
+                    fx.fail("Could not copy", msg.splitlines()[0])
+            self.say("Could not copy: " + msg.splitlines()[0])
         self.runner.run("Copying %d picture(s)" % len(entries) if len(entries) > 1 else "Copying " + cards[0].name,
-                        work, done, lambda msg: self.say("Could not copy: " + msg.splitlines()[0]))
+                        work, done, copy_failed)
 
     # ------------------------------------------------------------ page order
     def move_page(self, d):
@@ -1443,6 +1532,10 @@ class MainWindow(QMainWindow):
             if pdf_mode is None:
                 return
         jobs = [(c, p, r, c.render_source(), c.uid) for c, p, r in entries]
+        for c, _p, _r, _s, _u in jobs:
+            fx = self._fx(c)
+            if fx is not None:
+                fx.busy("save", "Saving\u2026")
 
         def work(progress):
             ok, failed = [], []
@@ -1464,6 +1557,15 @@ class MainWindow(QMainWindow):
 
         def done(r):
             ok, failed = r
+            for c, _p, _r, _s, _u in jobs:                    # the 'Saving...' toast ends here for every picture
+                fx = self._fx(c)
+                if fx is not None:
+                    fx.cancel_busy()
+            for c, p, bk in ok:
+                fx = self._fx(c)
+                if fx is not None:
+                    fx.done("save", "Saved", os.path.basename(p) + ("  (original replaced)" if bk else ""))
+                    fx.pulse("save")
             for c, p, bk in ok:
                 if bk:
                     c.orig_path = c.orig_path or bk
@@ -1477,7 +1579,15 @@ class MainWindow(QMainWindow):
                 self.say("Saved %d picture(s)." % len(ok))
             if failed:
                 QMessageBox.warning(self, "Save", "Some pictures could not be saved:\n" + "\n".join(failed))
-        self.runner.run(label, work, done, self._fail_box("Save"))
+        fail_box = self._fail_box("Save")
+
+        def save_failed(msg):
+            for c, _p, _r, _s, _u in jobs:
+                fx = self._fx(c)
+                if fx is not None:
+                    fx.cancel_busy()
+            fail_box(msg)
+        self.runner.run(label, work, done, save_failed)
 
     def save_card(self, card):
         """Save (Ctrl+S)."""

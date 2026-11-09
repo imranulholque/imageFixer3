@@ -8,6 +8,7 @@ from PySide6.QtGui import QBrush, QColor, QImage, QPainter, QPainterPath, QPen, 
 from PySide6.QtWidgets import QApplication, QWidget
 
 import core
+from feedback import Effects, rotate_cursor
 from theme import dropper_cursor, move_selection_cursor
 
 
@@ -110,6 +111,10 @@ class ImageCanvas(QWidget):
         self._ants_timer.setInterval(200)
         self._ants_timer.timeout.connect(self._tick)
         self._pick_cursor = dropper_cursor()
+        self._rot_cursor = rotate_cursor()
+        self.unit = 1.0                       # real picture pixels per preview pixel (set by the card): sizes in the HUD are real
+        self._hud_on = False
+        self.fx = Effects(self)               # toast, key chip, pulses, drag HUD, zoom badge (feedback.py)
         self.setCursor(Qt.CursorShape.OpenHandCursor)
 
     # ------------------------------------------------------------ content
@@ -297,6 +302,8 @@ class ImageCanvas(QWidget):
     def fit(self):
         self._autofit = True
         self._fit()
+        if self._img is not None:
+            self.fx.zoom_badge("Fit  %d%%" % round(self.zoom / max(self.unit, 1e-6) * 100.0))
 
     def _set_zoom(self, z, anchor=None):
         if self._iw <= 0:
@@ -311,6 +318,7 @@ class ImageCanvas(QWidget):
         self._clamp()
         self.zoomChanged.emit(self.zoom)
         self.update()
+        self.fx.zoom_badge("%d%%" % round(self.zoom / max(self.unit, 1e-6) * 100.0))
 
     def zoom_by(self, factor):
         self._set_zoom(self.zoom * factor)
@@ -496,6 +504,8 @@ class ImageCanvas(QWidget):
         t["pts"] = [QPointF(c.x() + (p.x() - c.x()) * ca - (p.y() - c.y()) * sa,
                             c.y() + (p.x() - c.x()) * sa + (p.y() - c.y()) * ca) for p in t["pts"]]
         self.update()
+        self.fx.pulse("rotate", self._tf_bbox(), "pulse", 0.45)
+        self.fx.info("rotate", "Rotated %g\u00b0" % abs(deg), "clockwise" if deg > 0 else "counter-clockwise")
 
     def tf_flip(self, horizontal):
         t = self._tf
@@ -512,6 +522,13 @@ class ImageCanvas(QWidget):
         # keep the picture itself in place: only the pixels are mirrored, so mirror the points' content
         t["pts"] = new
         self.update()
+        self.fx.pulse("resize", self._tf_bbox(), "pulse", 0.45)
+        self.fx.info("resize", "Flipped", "left \u2194 right" if horizontal else "top \u2195 bottom")
+
+    def _tf_bbox(self):
+        pts = self._tf["pts"]
+        xs, ys = [q.x() for q in pts], [q.y() for q in pts]
+        return QRectF(QPointF(min(xs), min(ys)), QPointF(max(xs), max(ys)))
 
     def tf_nudge(self, dx, dy):
         t = self._tf
@@ -817,18 +834,158 @@ class ImageCanvas(QWidget):
                 self._paint_ring(p)
         elif self.mode == self.PAINT:
             self._paint_colorbrush(p)
+        self.fx.paint(p)
+        self._paint_hud(p)
+
+    # ---------------------------------------------------- live feedback while dragging
+    def _hud_info(self):
+        """(kind, text) for the chip that follows the mouse, or None.  Shows what the drag does, in real pixels."""
+        u = self.unit
+        mods = QApplication.keyboardModifiers()
+        shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+        alt = bool(mods & Qt.KeyboardModifier.AltModifier)
+        if self._selmove is not None:
+            dx, dy = self._selmove["d"]
+            return "move", "Move outline  %+d, %+d px" % (round(dx * u), round(dy * u))
+        if self._float_start is not None:
+            dx, dy = self._float_d
+            copy = bool(self._float_start[1])
+            return ("copy" if copy else "move"), "%s  %+d, %+d px" % ("Copy" if copy else "Move", round(dx * u), round(dy * u))
+        if self._tf_drag is not None and self._tf is not None:
+            return self._tf_hud()
+        if self._drag is not None and self.mode == self.CROP and self._drag[0] in ("new", "move", "h") \
+                and not self._crop.isNull():
+            return "crop", "%d \u00d7 %d px" % (round(self._crop.width() * u), round(self._crop.height() * u))
+        er = self._erase
+        if er is not None and er["kind"] in ("rect", "ellipse") and len(er["pts"]) == 2:
+            w = abs(er["pts"][0].x() - er["pts"][1].x()) * u
+            h = abs(er["pts"][0].y() - er["pts"][1].y()) * u
+            txt = "%d \u00d7 %d px" % (round(w), round(h))
+            if self.mode == self.SELECT:
+                mod = getattr(self, "_sel_mod", "")
+                return "select", ("Add  " if mod == "add" else "Subtract  " if mod == "sub" else "") + txt
+            return "erase", txt
+        if self._hover is None or self._img is None:
+            return None
+        if self.mode == self.SELECT and shift:
+            return "select", "Add to selection"
+        if self.mode == self.SELECT and alt:
+            return "select", "Take out of selection"
+        if self.mode == self.MOVESEL and (alt or self.copy_mode):
+            return "copy", "Copy: the original stays"
+        if self.mode == self.ERASE and alt:
+            return "copy", "Click the spot to copy from"
+        if self.mode == self.TRANSFORM and alt:
+            return "copy", "Drag to place a copy"
+        if shift and self.mode in (self.MOVESEL, self.TRANSFORM):
+            return "move", "Dead straight"
+        return None
+
+    def _tf_hud(self):
+        t, d, u = self._tf, self._tf_drag, self.unit
+        pre = "Copy  " if t.get("copy") else ""
+        c = self._corners()
+        if d[0] == "move":
+            ctr, s0 = self._tf_center(), t["sc"]
+            return ("copy" if t.get("copy") else "move"), "%sMove  %+d, %+d px" % (
+                pre, round((ctr.x() - s0.x()) * u), round((ctr.y() - s0.y()) * u))
+        if d[0] == "rotate":
+            st, n = t["start"], t["n"]
+            a0 = math.atan2(st[n].y() - st[0].y(), st[n].x() - st[0].x())
+            a1 = math.atan2(c[1].y() - c[0].y(), c[1].x() - c[0].x())
+            deg = (math.degrees(a1 - a0) + 180.0) % 360.0 - 180.0
+            return "rotate", "%sRotate  %+.1f\u00b0" % (pre, deg)
+        mode = t.get("mode")
+        if mode == "warp":
+            return "resize", "Bend"
+        if mode in ("skew", "distort", "perspective"):
+            return "resize", mode.capitalize()
+        w = math.hypot(c[1].x() - c[0].x(), c[1].y() - c[0].y())
+        h = math.hypot(c[3].x() - c[0].x(), c[3].y() - c[0].y())
+        sx, sy = w / max(t["w"], 1e-6) * 100.0, h / max(t["h"], 1e-6) * 100.0
+        pct = "  (%d%%)" % round(sx) if abs(sx - sy) < 1.0 else ""
+        return "resize", "%sResize  %d \u00d7 %d px%s" % (pre, round(w * u), round(h * u), pct)
+
+    def _paint_hud(self, p):
+        info = self._hud_info() if self._hover is not None else None
+        self._hud_on = info is not None
+        if info is None:
+            self.fx.hud_off()
+            return
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        self.fx.hud(p, self._hover, info[0], info[1], QRectF(self.rect()))
+
+    def _pulse_tf(self, kind):
+        t = self._tf
+        if t is None or not t.get("start"):
+            return
+        moved = any(abs(a.x() - b.x()) + abs(a.y() - b.y()) > 0.5 for a, b in zip(t["pts"], t["start"]))
+        if moved:
+            self.fx.pulse({"move": "move", "rotate": "rotate"}.get(kind, "resize"), self._tf_bbox(), "pulse", 0.5)
+
+    def _tf_cursor(self, pos):
+        C = Qt.CursorShape
+        if self._tf is None:
+            return C.SizeAllCursor
+        if self._tf_drag is not None:
+            hit = self._tf_drag[1]
+        elif pos is not None and self._img is not None:
+            hit = self._tf_hit(pos)
+        else:
+            return C.SizeAllCursor
+        if hit in ("rotate", "rot"):
+            return self._rot_cursor
+        if hit == "outside":
+            return C.ArrowCursor
+        if hit == "move":
+            alt = bool(QApplication.keyboardModifiers() & Qt.KeyboardModifier.AltModifier)
+            return C.DragCopyCursor if (alt or self._tf.get("copy")) else C.SizeAllCursor
+        return {"c0": C.SizeFDiagCursor, "c2": C.SizeFDiagCursor, "c1": C.SizeBDiagCursor, "c3": C.SizeBDiagCursor,
+                "e0": C.SizeVerCursor, "e2": C.SizeVerCursor, "e1": C.SizeHorCursor,
+                "e3": C.SizeHorCursor}.get(hit, C.PointingHandCursor)
 
     def _paint_float(self, p):
         img, x, y = self._float
         dx, dy = self._float_d
-        tl = self.to_wid(QPointF(x + dx, y + dy))
+        copy = bool(self._float_start and self._float_start[1])
+        col = QColor("#a78bfa") if copy else QColor("#60a5fa")
+        w, h = img.width() * self.zoom, img.height() * self.zoom
+        tl, o = self.to_wid(QPointF(x + dx, y + dy)), self.to_wid(QPointF(x, y))
+        dest, orig = QRectF(tl.x(), tl.y(), w, h), QRectF(o.x(), o.y(), w, h)
         p.save()
-        p.setOpacity(0.9)
-        p.drawImage(QRectF(tl.x(), tl.y(), img.width() * self.zoom, img.height() * self.zoom), img)
-        p.restore()
-        p.setPen(QPen(QColor(255, 255, 255), 1.2, Qt.PenStyle.DashLine))
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        # where it comes from: a ghost outline (a move leaves a hole there, a copy leaves the original)
+        p.setPen(QPen(QColor(col.red(), col.green(), col.blue(), 210), 1.4, Qt.PenStyle.DashLine))
+        p.setBrush(QColor(col.red(), col.green(), col.blue(), 30))
+        p.drawRect(orig)
+        if dx or dy:                                                  # a thread from the old place to the new one
+            p.setPen(QPen(QColor(col.red(), col.green(), col.blue(), 170), 1.4, Qt.PenStyle.DotLine))
+            p.drawLine(orig.center(), dest.center())
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(col)
+            p.drawEllipse(orig.center(), 3.2, 3.2)
+        # the lifted piece floats: soft shadow underneath
+        p.setPen(Qt.PenStyle.NoPen)
+        for i in range(1, 6):
+            p.setBrush(QColor(0, 0, 0, 30 - i * 5))
+            p.drawRoundedRect(dest.adjusted(-i, -i + 4, i, i + 4), 2 + i, 2 + i)
+        p.setOpacity(0.92)
+        p.drawImage(dest, img)
+        p.setOpacity(1.0)
         p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawRect(QRectF(tl.x(), tl.y(), img.width() * self.zoom, img.height() * self.zoom))
+        p.setPen(QPen(col, 2.2))
+        p.drawRect(dest)
+        p.setPen(QPen(QColor(255, 255, 255), 1.1, Qt.PenStyle.DashLine))
+        p.drawRect(dest)
+        if copy:                                                      # '+' badge: this is a copy
+            c = QPointF(dest.right(), dest.top())
+            p.setPen(QPen(QColor("#151a26"), 2.0))
+            p.setBrush(col)
+            p.drawEllipse(c, 10, 10)
+            p.setPen(QPen(QColor("white"), 2.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            p.drawLine(QPointF(c.x() - 4.5, c.y()), QPointF(c.x() + 4.5, c.y()))
+            p.drawLine(QPointF(c.x(), c.y() - 4.5), QPointF(c.x(), c.y() + 4.5))
+        p.restore()
 
     def _paint_ring(self, p):
         cx, cy, R = self._ring
@@ -1273,6 +1430,11 @@ class ImageCanvas(QWidget):
             self.update()
         elif self.mode in (self.CROP, self.PERSP):
             self._update_cursor(pos)
+        elif self.mode in (self.MOVESEL, self.TRANSFORM):
+            self._update_cursor(pos)
+            if self._hud_on or (QApplication.keyboardModifiers() & (
+                    Qt.KeyboardModifier.ShiftModifier | Qt.KeyboardModifier.AltModifier)):
+                self.update()
 
     def mouseReleaseEvent(self, e):
         if self._selmove is not None and e.button() == Qt.MouseButton.LeftButton:
@@ -1290,9 +1452,11 @@ class ImageCanvas(QWidget):
             if moved < 5:                                    # a click, not a drag of the picture
                 self.viewClicked.emit(ip.x(), ip.y())
         if self._tf_drag is not None:
+            drag_kind = self._tf_drag[0]
             self._tf_drag = None
             self._pan_last = None
             self._update_cursor(e.position())
+            self._pulse_tf(drag_kind)
             if self._tf is not None and self._tf.get("layer"):
                 self.tfCommitted.emit()
             return
@@ -1353,8 +1517,12 @@ class ImageCanvas(QWidget):
             self.setCursor(self._move_sel_cursor)                  # inside the selection: 'move the outline'
         elif self.mode in (self.ERASE, self.SELECT, self.PAINT):
             self.setCursor(C.CrossCursor)
-        elif self.mode in (self.MOVESEL, self.TRANSFORM):
-            self.setCursor(C.SizeAllCursor)
+        elif self.mode == self.MOVESEL:
+            copy = self.copy_mode or bool(QApplication.keyboardModifiers() & Qt.KeyboardModifier.AltModifier) \
+                or (self._float_start is not None and bool(self._float_start[1]))
+            self.setCursor(C.DragCopyCursor if copy else C.SizeAllCursor)        # arrow with a '+': this will be a copy
+        elif self.mode == self.TRANSFORM:
+            self.setCursor(self._tf_cursor(pos))
         elif self.mode == self.CROP:
             hit = self._crop_hit(pos) if pos is not None and self._img is not None else None
             shape = {"tl": C.SizeFDiagCursor, "br": C.SizeFDiagCursor, "tr": C.SizeBDiagCursor,
@@ -1397,6 +1565,9 @@ class ImageCanvas(QWidget):
             e.ignore()
 
     def keyReleaseEvent(self, e):
+        if e.key() in (Qt.Key.Key_Shift, Qt.Key.Key_Alt, Qt.Key.Key_Control):
+            self._update_cursor(self._hover)
+            self.update()
         if e.key() == Qt.Key.Key_Space and not e.isAutoRepeat():
             self._space = False
             self._update_cursor()
@@ -1404,6 +1575,9 @@ class ImageCanvas(QWidget):
         super().keyReleaseEvent(e)
 
     def keyPressEvent(self, e):
+        if e.key() in (Qt.Key.Key_Shift, Qt.Key.Key_Alt, Qt.Key.Key_Control):   # the chip at the mouse shows what the key does
+            self._update_cursor(self._hover)
+            self.update()
         if e.key() == Qt.Key.Key_Space:
             if not e.isAutoRepeat():
                 self._space = True

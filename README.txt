@@ -1,5 +1,6 @@
 IMAGE FIXER  (Windows)
 ======================
+Made by Imranul Hoque Sabbir.
 Clean many text pictures (WhatsApp photos, scans) and print them. One big card per picture - slide to the next.
  Top bar (dropdown menus):  Select v | Move v | Eyedropper | Color Brush | Erase v | Crop v      Right side tabs: Adjust | Color | Shadow | Text | Picture;  Save v is at the top right, next to Settings
  - Select v:    Quick select, Brush, Box, Ellipse, Freehand, Color range (click a color). Options bar: New / Add / Subtract /
@@ -117,6 +118,20 @@ NEW (round 5)
   full resolution (up to 4800 px) and are upscaled with a good filter when shown larger.
 - Warp (Transform) has a 5 x 5 net: corners, middle of every side and the middle of the picture.
 - Undo during a Transform steps back inside it and finally cancels it (untransform).
+
+NEW (round 6): you SEE that everything works
+- Toast at the bottom of the picture for every action: a ring turns while the work runs, then it closes and a green tick pops up
+  (Copied, Moved, Erased, Deleted, Cropped, Rotated, Selected, Saved ...), with the details (how many px, which direction).
+- Changed area flashes: a wave around what was moved / copied / selected / painted, a light sweep over what was erased or deleted,
+  a soft flash over the whole picture for crop, rotate, undo and redo.
+- While dragging a chip follows the mouse: Move +120, +40 px / Copy / Resize 340 x 120 px (120%) / Rotate +15 deg / crop size /
+  selection size. Holding Shift or Alt shows what the key does (Add, Take out, Copy, Dead straight).
+- Move: the old place stays as a dashed ghost with a thread to the new place; Alt = copy shows a '+' badge and the copy cursor.
+- Transform: the mouse cursor changes on every handle (resize arrows, rotate arrow, move, copy).
+- Shortcuts show their keys on top of the picture (Ctrl + Z  Undo ...); Undo / Redo say WHAT they undo and how many steps are left.
+- Choosing a tool shows its name, a short help line and its letter key. Zoom shows a % badge. Every button gives a soft wave when pressed.
+- Dragging files over the window dims it and shows a 'Drop to add' zone.
+- Settings > About shows who made the program.
 
 AUTO UPDATE  (Settings > Auto update)
  - ON (default): a few seconds after start, and every 6 hours while the program is open, it looks on GitHub for a newer build.

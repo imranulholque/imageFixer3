@@ -4,6 +4,7 @@ from PySide6.QtGui import (QBrush, QColor, QCursor, QIcon, QLinearGradient, QPai
                            QPixmap, QPolygonF)
 
 ACCENT = "#6366f1"
+AUTHOR = "Imranul Hoque Sabbir"          # who made Image Fixer: shown in the header, About, the empty screen and the tray
 
 
 def logo_pixmap(size):

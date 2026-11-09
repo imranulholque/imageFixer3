@@ -9,7 +9,7 @@ import uuid
 
 import numpy as np
 from PIL import Image, ImageChops, ImageFilter, ImageOps
-from PySide6.QtCore import QMimeData, QObject, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QMimeData, QObject, QPointF, QRectF, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QDrag, QImage, QPixmap
 from PySide6.QtWidgets import (QSplitter, QApplication, QButtonGroup, QCheckBox, QColorDialog, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QMenu,
                                QPushButton, QScrollArea, QSizePolicy, QSlider, QStackedWidget, QToolButton,
@@ -81,6 +81,60 @@ LOOK_TITLES = {"bright": "Brightness", "contrast": "Contrast", "sat": "Saturatio
                "sharp": "Text sharpness", "objs": "Line & shape sharpness", "detail": "Faint strokes",
                "dark": "Text darkness", "clear": "Clean specks"}
 SHAPES = {"erase_brush": "brush", "erase_rect": "rect", "erase_ellipse": "ellipse", "erase_lasso": "lasso"}
+
+# what the toast says for each kind of work (label given to _edit_base -> icon, text when finished)
+ACTIONS = {
+    "Copying": ("copy", "Copied"), "Moving": ("move", "Moved"), "Erasing": ("erase", "Erased"),
+    "Deleting": ("delete", "Deleted"), "Filling": ("fill", "Filled"), "Painting": ("paint", "Painted"),
+    "Cropping": ("crop", "Cropped"), "Cropping to the shape": ("crop", "Cropped"),
+    "Rotating": ("rotate", "Rotated"), "Transforming": ("resize", "Transformed"),
+    "Removing shadows": ("shadow", "Shadows removed"),
+}
+TOOL_TITLE = {"view": "Hand", "pick": "Eyedropper", "paint": "Color Brush", "move": "Move", "copy": "Copy",
+              "transform": "Transform"}
+TOOL_KEYS = {"move": "V", "rect": "M", "lasso": "L", "color": "W", "brush": "B", "erase_brush": "E", "crop": "C",
+             "pick": "I", "paint": "P", "view": "H", "transform": "Ctrl+T"}
+
+
+def action_for(label):
+    if label in ACTIONS:
+        return ACTIONS[label]
+    if label.startswith("Applying"):
+        return "adjust", "Applied"
+    if label.startswith("Resetting"):
+        return "undo", "Reset to the original"
+    return "info", label
+
+
+def tool_kind(key):
+    if key in SELECT_KEYS:
+        return "select"
+    if key in ERASE_KEYS:
+        return "erase"
+    if key in CROP_KEYS:
+        return "crop"
+    return {"move": "move", "copy": "copy", "transform": "resize", "pick": "pick", "paint": "paint",
+            "view": "view"}.get(key, "tool")
+
+
+def tool_title(key):
+    if key in TOOL_TITLE:
+        return TOOL_TITLE[key]
+    name = NAMES.get(key, key)
+    if key in SELECT_KEYS:
+        return "Select: " + name
+    if key in ERASE_KEYS:
+        return "Erase: " + name
+    return name
+
+
+def dir_words(dx, dy):
+    parts = []
+    if dx:
+        parts.append("%d px %s" % (abs(dx), "right" if dx > 0 else "left"))
+    if dy:
+        parts.append("%d px %s" % (abs(dy), "down" if dy > 0 else "up"))
+    return ", ".join(parts)
 
 
 class NoWheelSlider(QSlider):
@@ -1729,7 +1783,7 @@ class Card(QWidget):
             self.btnCompare.setChecked(True)
             self.btnCmpMode.setText("Slider")
             self.btnCmpMode.setVisible(True)
-            self.message.emit("Drag the line to compare. Wheel = zoom, drag = move. Click Compare again to switch it off.")
+            self._notify("compare", "Compare is on", "drag the line; wheel = zoom, drag = move; click Compare again to switch it off")
         if self._orig_q is not None:
             show(self._orig_q)
             return
@@ -1891,6 +1945,7 @@ class Card(QWidget):
     def _adopt_view(self, v, refit=True):
         self._view_gen += 1
         self.prev, self.scale = v["prev"], v["scale"]
+        self.canvas.unit = 1.0 / max(self.scale, 1e-6)          # the drag HUD shows real picture pixels
         self._lab = v["lab"]
         self._cache = v["cache"]
         if self.sel is not None and self.sel.shape != self.prev.shape[:2]:
@@ -2085,18 +2140,23 @@ class Card(QWidget):
             self.undo.pop(0)
         self._update_buttons()
 
-    def _checkpoint(self):
+    def _checkpoint(self, label=None):
         """Call BEFORE changing anything that must be one undo step (a selection, an erase, a crop ...)."""
         if self._gest:
             self._gest_timer.stop()
             self._gest = False
-        self._push_undo(self._snap())
+        st = self._snap()
+        if label:
+            st["label"] = label                      # the toast of Undo / Redo says what is undone
+        self._push_undo(st)
 
     def _begin_change(self):
         """Slider / colour row moved: the first move of a drag stores the 'before' state, the rest is one step."""
         if not self._gest:
             self._gest = True
-            self._push_undo(self._cur_snap if self._cur_snap is not None else self._snap())
+            st = dict(self._cur_snap if self._cur_snap is not None else self._snap())
+            st["label"] = "Adjustment"
+            self._push_undo(st)
         self._gest_timer.start(700)
 
     def _end_gesture(self):
@@ -2167,10 +2227,18 @@ class Card(QWidget):
         if self._gest:
             self._gest_timer.stop()
             self._end_gesture()
+        fx = self.canvas.fx
         if not self.undo:
+            fx.info("undo", "Nothing to undo", "this is how it was opened")
             return
-        self.redo.append(self._snap())
-        self._goto(self.undo.pop())
+        st = self.undo.pop()
+        lab = st.get("label") or "last change"
+        snap = self._snap()
+        snap["label"] = lab
+        self.redo.append(snap)
+        self._goto(st)
+        fx.info("undo", "Undo", lab + (", %d more to undo" % len(self.undo) if self.undo else ", back to the start"))
+        fx.pulse("undo")
 
     def redo_step(self):
         if not self._loaded:
@@ -2178,15 +2246,29 @@ class Card(QWidget):
         if self._gest:
             self._gest_timer.stop()
             self._end_gesture()
+        fx = self.canvas.fx
         if not self.redo:
+            fx.info("redo", "Nothing to redo")
             return
-        self.undo.append(self._snap())
-        self._goto(self.redo.pop())
+        st = self.redo.pop()
+        lab = st.get("label") or "change"
+        snap = self._snap()
+        snap["label"] = lab
+        self.undo.append(snap)
+        self._goto(st)
+        fx.info("redo", "Redo", lab + (", %d more to redo" % len(self.redo) if self.redo else ""))
+        fx.pulse("redo")
 
     def _edit_base(self, label, make, keep_sel=True, refit=False, after=None, msg=None, shadow_src=None, merge=False,
                    checkpoint=True, fail=None, alpha_make=None):
         """Change the picture itself (erase, crop, rotate, move ...) in a worker thread, then show it.
         make(progress) -> new PIL image, or (new image, new selection)."""
+        hint, self._fx_hint = (getattr(self, "_fx_hint", None) or {}), None
+        fx = self.canvas.fx
+        kind, title = action_for(label)
+        quiet = merge                                  # a live slider drag: no toast for every little step
+        if not quiet:
+            fx.busy(kind, label + "\u2026")
         adjs = copy.deepcopy(self.adjs)
         look, sel_in = dict(self.look), self.sel
         ctx_in, alpha_in, layers_in, hide_in = self.ctx, self.alpha, self.layers, self._hide_layer
@@ -2223,9 +2305,22 @@ class Card(QWidget):
             self._touch()
             if after is not None:
                 after()
+            if checkpoint and self.undo:
+                self.undo[-1].setdefault("label", hint.get("title") or title)
+            if not quiet:
+                detail = hint.get("detail")
+                if callable(detail):
+                    detail = detail()
+                fx.done(kind, hint.get("title") or title, detail or "")
+                fx.pulse(kind, hint.get("rect"), hint.get("effect", "pulse"))
             if msg:
                 self.message.emit(msg)
-        self._job(label, work, done, fail)
+
+        def on_fail(m):
+            fx.fail("Could not finish", (m or "").splitlines()[0] if m else "")
+            if fail is not None:
+                fail(m)
+        self._job(label, work, done, on_fail)
 
     # ------------------------------------------------ picture layers (signature, stamp ...)
     BG_DEFAULT = {"strength": 50, "soft": 30, "uneven": False, "tint": "orig", "opacity": 100, "remove": True,
@@ -2297,6 +2392,7 @@ class Card(QWidget):
             self.place_layer_tool(layer["id"])
             self.message.emit("Picture added. Drag it, corner handles resize, the round handle rotates. "
                               "Click outside it when done; click it again any time to change it.")
+            self.canvas.fx.done("layer", "Picture added", "drag to move, corners resize, round handle rotates")
         self._job("Adding picture", work, done)
 
     def select_layer(self, lid):
@@ -2321,6 +2417,7 @@ class Card(QWidget):
         self._touch()
         self._timer.start()
         self._refresh_layers_ui()
+        self.canvas.fx.done("delete", "Picture removed", "Ctrl+Z brings it back")
 
     def move_layer_order(self, lid, d):
         i = next((k for k, l in enumerate(self.layers) if l["id"] == lid), None)
@@ -2482,7 +2579,7 @@ class Card(QWidget):
             if then:
                 then()
             else:
-                self.message.emit("Editing this picture alone. All tools work on it only. Click 'Back to the page' when done.")
+                self._notify("layer", "Editing this picture alone", "all tools work on it only; click 'Back to the page' when done")
         self._job("Opening picture", work, done)
 
     def leave_layer(self, then=None):
@@ -2778,12 +2875,14 @@ class Card(QWidget):
         x, y = min(max(x, 0), W - 1), min(max(y, 0), H - 1)
         patch = self.prev[max(0, y - 1):y + 2, max(0, x - 1):x + 2].reshape(-1, 3).mean(0)
         rgb = tuple(int(round(float(v))) for v in patch)
+        self.canvas.fx.ring("pick", x, y)
         if getattr(self, "_fill_drop", False):               # the eyedropper of the fill color
             self._fill_drop = False
             self._set_fill(rgb)
             self._go_move()
-            self.message.emit("Fill color: #%02X%02X%02X" % rgb)
+            self._notify("pick", "Fill color  #%02X%02X%02X" % rgb, "the Color Brush and Fill use it now")
             return
+        self.canvas.fx.info("pick", "Picked  #%02X%02X%02X" % rgb, "its slider is in the Color tab")
         prev, lab0 = self.prev, self._lab
 
         def work(progress):                          # the colour analysis of a big picture takes a moment: not in the window thread
@@ -2873,9 +2972,11 @@ class Card(QWidget):
         moved = core.shift_mask(self.sel, int(dx), int(dy))
         if float(moved.max()) <= 0.01:                    # pushed completely out of the picture: nothing is selected
             moved = None
-        self._checkpoint()
+        self._checkpoint("Selection move")
         self.sel = moved
         self._sel_changed()
+        self.canvas.fx.info("move", "Outline moved", dir_words(int(round(dx / self.scale)), int(round(dy / self.scale))))
+        self.canvas.fx.pulse("move", self._sel_bbox())
 
     def _sel_changed(self):
         self._sel_ver += 1
@@ -2897,9 +2998,10 @@ class Card(QWidget):
             if after is not None:
                 after(base)
             return
-        self._checkpoint()
+        self._checkpoint("Selection")
         self.sel = new
         self._sel_changed()
+        self._sel_feedback(mode or self.sel_mode, base)
         if after is not None:
             after(base)
 
@@ -2908,21 +3010,63 @@ class Card(QWidget):
             return
         if self._bake(self.select_all):
             return
-        self._checkpoint()
+        self._checkpoint("Select all")
         self.sel = np.ones(self.prev.shape[:2], np.float32)
         self._sel_changed()
+        self.canvas.fx.info("select", "Selected everything", "Ctrl+D removes the selection")
+        self.canvas.fx.pulse("select")
 
     def deselect(self):
         if not self._loaded or self.sel is None:
             return
         if self._bake(self.deselect):
             return
-        self._checkpoint()
+        self._checkpoint("Deselect")
         self.sel = None
         self._sel_changed()
+        self.canvas.fx.info("select", "Selection removed", "everything can be changed again")
+
+    def _notify(self, kind, title, detail=""):
+        """Status bar text + a toast on the picture."""
+        self.message.emit(title + (". " + detail if detail else ""))
+        self.canvas.fx.info(kind, title, detail)
+
+    @staticmethod
+    def _bbox_rect(points, pad=0.0):
+        xs, ys = [q[0] for q in points], [q[1] for q in points]
+        return QRectF(QPointF(min(xs) - pad, min(ys) - pad), QPointF(max(xs) + pad, max(ys) + pad))
+
+    def _sel_bbox(self):
+        """The selection's bounding box in preview pixels (QRectF), or None."""
+        m = self.sel
+        if m is None:
+            return None
+        cols = np.nonzero(m.max(axis=0) > 0.5)[0]
+        rows = np.nonzero(m.max(axis=1) > 0.5)[0]
+        if cols.size == 0 or rows.size == 0:
+            return None
+        return QRectF(float(cols[0]), float(rows[0]), float(cols[-1] - cols[0] + 1), float(rows[-1] - rows[0] + 1))
+
+    def _sel_feedback(self, mode, base):
+        fx = self.canvas.fx
+        if self.sel is None:
+            fx.info("select", "Selection cleared")
+            return
+        r = self._sel_bbox()
+        if r is None:
+            return
+        eff = mode if base is not None else "new"
+        title = {"add": "Added to the selection", "sub": "Taken out of the selection",
+                 "int": "Selection narrowed"}.get(eff, "Selected")
+        u = 1.0 / max(self.scale, 1e-6)
+        share = float(np.mean(self.sel > 0.5)) * 100.0
+        fx.info("select", title, "%d \u00d7 %d px, %d%% of the picture" % (round(r.width() * u), round(r.height() * u), round(share)))
+        fx.pulse("select", r)
 
     def _warn(self, text):
         """Short message right where the user looks (the hint line), also in the status bar."""
+        head, _, rest = text.partition(". ")
+        self.canvas.fx.warn(head.rstrip("."), rest)
         self.message.emit(text)
         self.lblHint.setText("\u26a0  " + text)
         QTimer.singleShot(5000, lambda: self.lblHint.setText(HINTS.get(self._tool, "")))
@@ -2957,22 +3101,26 @@ class Card(QWidget):
         if self._bake(self.invert_selection):
             return
         new = core.sel_invert(self.sel, self.prev.shape[:2])
-        self._checkpoint()
+        self._checkpoint("Invert selection")
         self.sel = new
         self._sel_changed()
+        self.canvas.fx.info("select", "Selection inverted", "now the other part is selected")
+        self.canvas.fx.pulse("select", self._sel_bbox())
 
     def grow_selection(self, px):
         if not self._loaded:
             return
         if self.sel is None:
-            self.message.emit("Select something first.")
+            self._warn("Select something first.")
             return
         if self._bake(lambda: self.grow_selection(px)):
             return
         new = core.sel_grow(self.sel, px)
-        self._checkpoint()
+        self._checkpoint("Selection size")
         self.sel = new
         self._sel_changed()
+        self.canvas.fx.info("select", "Selection %s" % ("grown" if px > 0 else "shrunk"), "%d px" % abs(px))
+        self.canvas.fx.pulse("select", self._sel_bbox())
 
     @staticmethod
     def _mask_img(sel, size):
@@ -2994,6 +3142,8 @@ class Card(QWidget):
         if kind == "brush":
             self._set_selection(core.shape_mask((W, H), "brush", data, size_prev), mode)
             return
+        if kind == "color":
+            self.canvas.fx.ring("select", data[0], data[1])
         tol = float(self._tolv)
         prev = self.prev
         fuzz = self._fuzz
@@ -3065,11 +3215,14 @@ class Card(QWidget):
             self._warn("Not inside a picture. Use 'Move / resize' on the picture in the Picture tab to place it.")
             return
         if not self._loaded or self.sel is None:
-            self.message.emit("Make a selection first.")
+            self._warn("Make a selection first.")
             return
         s = self.scale
         sel, base = self.sel, self.base
         mdx, mdy = int(round(dx / s)), int(round(dy / s))
+        bb = self._sel_bbox()
+        words = dir_words(mdx, mdy) + ("; the original stays" if copy_flag else "")
+        self._fx_hint = {"rect": bb.translated(dx, dy) if bb is not None else None, "detail": words}
 
         def make(progress):
             mask = self._mask_img(sel, base.size)
@@ -3090,6 +3243,8 @@ class Card(QWidget):
             self._warn("Nothing is selected. Select something first (Select menu), or pick a color and press 'Select this color'.")
             return
         sel, base, ink = self.sel, self.base, self.keep_ink
+        bb = self._sel_bbox()
+        self._fx_hint = {"rect": bb, "effect": "sweep", "detail": "filled from the paper around it" if self.ctx is None else ""}
         if self.ctx is not None:                     # inside a picture layer: deleted = transparent
             alpha = self.alpha
             self._edit_base("Deleting", lambda progress: base, msg="Deleted. Ctrl+Z brings it back.",
@@ -3111,6 +3266,7 @@ class Card(QWidget):
             self._warn("Nothing is selected. Select something first.")
             return
         sel, base, rgb = self.sel, self.base, self.fill_rgb
+        self._fx_hint = {"rect": self._sel_bbox(), "detail": "#%02X%02X%02X" % tuple(rgb)}
 
         def make(progress):
             return core.fill_region(base, self._mask_img(sel, base.size), rgb)
@@ -3151,6 +3307,7 @@ class Card(QWidget):
             self._hide_layer = None
             self._timer.start()
         mode, shape = TOOL_MODE[key]
+        old_tool = self._tool
         self._tool = key
         self.canvas.copy_mode = key == "copy"
         self.canvas.set_mode(mode, shape)
@@ -3181,6 +3338,10 @@ class Card(QWidget):
         self._sync_brush()
         self._sync_paint()
         self.lblHint.setText(HINTS[key])
+        if key != old_tool and self._loaded and self.canvas.has_image():
+            first = HINTS[key].split("  ")[0]
+            kb = TOOL_KEYS.get(key)
+            self.canvas.fx.info(tool_kind(key), tool_title(key), first + ("   Key: " + kb if kb else ""))
 
     def set_tf_mode(self, k):
         if self._tool == "transform":
@@ -3224,6 +3385,7 @@ class Card(QWidget):
         elif self._tool in CROP_KEYS or self._tool == "transform":
             back = self._auto_back
             self._go_move()
+            self.canvas.fx.info("undo", "Cancelled", "nothing was changed")
             if back and self.ctx is not None:                  # the picture was opened only for this crop
                 self._auto_back = False
                 self.leave_layer()
@@ -3250,6 +3412,8 @@ class Card(QWidget):
         base, sel, alpha = self.base, self.sel, self.alpha
         if self.ctx is None:
             alpha = None
+        self._fx_hint = {"rect": self._bbox_rect(pts, size * s / 2.0 + 2), "effect": "pulse",
+                         "detail": "%d%% opacity, #%02X%02X%02X" % (round(opacity * 100), rgb[0], rgb[1], rgb[2])}
         self._edit_base("Painting", lambda progress: core.paint_brush(base, payload, size, rgb, opacity, soft, sel, alpha),
                         msg="Painted. Ctrl+Z undoes the stroke.")
 
@@ -3258,7 +3422,8 @@ class Card(QWidget):
         self.clone_off = None
         self.canvas.set_clone(self.clone_src, None)
         self.btnClone.show()
-        self.message.emit("Copy spot chosen. Now paint where the copy should go. Esc clears the spot.")
+        self.canvas.fx.ring("copy", x, y)
+        self._notify("copy", "Copy spot chosen", "now paint where the copy should go; Esc clears the spot")
 
     def _clear_clone(self):
         self.clone_src = None
@@ -3285,6 +3450,12 @@ class Card(QWidget):
             offset = self.clone_off
         size = self.sizeSlider.value()
         base, sel, ink = self.base, self.sel, self.keep_ink
+        if kind in ("brush", "lasso"):
+            er_rect = self._bbox_rect(data, size * s / 2.0 + 2 if kind == "brush" else 0.0)
+        else:
+            er_rect = self._bbox_rect([(data[0], data[1]), (data[2], data[3])])
+        self._fx_hint = {"rect": er_rect, "effect": "sweep",
+                         "detail": "%d \u00d7 %d px, filled from around" % (round(er_rect.width() / s), round(er_rect.height() / s))}
 
         def get_mask():
             mask = core.make_mask(base.size, kind, payload, brush=size)
@@ -3356,6 +3527,8 @@ class Card(QWidget):
             if back:                                          # a picture was opened only for this crop
                 self._auto_back = False
                 self.leave_layer()
+        self._fx_hint = {"title": "Straightened" if self._tool == "persp" else "Cropped",
+                         "detail": lambda: "%d \u00d7 %d px" % self.base.size}
         self._edit_base("Cropping", make, keep_sel=False, refit=True, after=after, alpha_make=alpha_make)
 
     def crop_to_selection(self):
@@ -3388,13 +3561,14 @@ class Card(QWidget):
             if "v" not in cache:
                 cache["v"] = core.crop_to_shape(base, alpha if inlayer else None, box, None, mask=mask)
             return cache["v"]
+        self._fx_hint = {"detail": lambda: "%d \u00d7 %d px" % self.base.size}
         self._edit_base("Cropping to the shape", lambda progress: shaped()[0], keep_sel=False, refit=True,
                         alpha_make=(lambda progress: shaped()[1]) if inlayer else None,
                         msg="Cropped to the selected shape.")
 
     def _on_tf_copy(self, on):
         if on:
-            self.message.emit("Copy mode: the original stays where it is. Press Enter to place the copy.")
+            self._notify("copy", "Copy mode", "the original stays where it is; Enter places the copy")
 
     def _apply_transform(self):
         p = self.canvas.transform_params()
@@ -3412,6 +3586,9 @@ class Card(QWidget):
             new, nm = core.warp_region(base, mask, grid, n, copy=copy_flag)
             nsel = core.resize_mask(np.asarray(nm, dtype=np.float32) / 255.0, (W, H))
             return new, (nsel if float(nsel.max()) > 0.02 else None)
+        self._fx_hint = {"rect": self._bbox_rect([(x, y) for x, y in pts]),
+                         "title": "Copy placed" if copy_flag else "Transformed",
+                         "detail": "the original stays" if copy_flag else ""}
         self._edit_base("Copying" if copy_flag else "Transforming", make, after=self._go_move)
 
     def rotate(self, deg_ccw):
@@ -3441,6 +3618,7 @@ class Card(QWidget):
                     ls.append(dict(l, grid=g))
                 self.layers = ls
                 self._timer.start()
+        self._fx_hint = {"detail": "%g\u00b0 %s" % (abs(deg_ccw), "to the left" if deg_ccw > 0 else "to the right")}
         self._edit_base("Rotating", lambda progress: core.rotate_image(base, deg_ccw), keep_sel=False, refit=True,
                         alpha_make=am, after=after)
 
