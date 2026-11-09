@@ -1451,8 +1451,13 @@ def _unmix_stamp(reg, F, hard):
 
 def _ink_like(reg, F):
     """Pixels that clearly differ from the paper estimate F (dark / coloured: writing, lines, stamps)."""
-    d = np.abs(reg.astype(np.float32) - F.astype(np.float32)).sum(2)
-    return d > 22.0
+    diff = reg.astype(np.float32) - F.astype(np.float32)
+    d = np.abs(diff).sum(2)
+    # adaptive: grainy / ash paper has more noise than clean white paper, so the limit follows the picture's own noise,
+    # but a faint (light blue, pencil) stroke must still count as ink - else it leaks into the fill as a bluish smear
+    thr = float(np.clip(3.2 * float(np.median(d)) + 4.0, 12.0, 22.0))
+    dark = (F.astype(np.float32).mean(2) - reg.astype(np.float32).mean(2)) > thr * 0.33    # ink always darkens paper
+    return (d > thr) | (dark & (d > thr * 0.6))
 
 
 def _grow_over_ink(reg, hole):
@@ -1473,8 +1478,28 @@ def _paper_like(reg, valid):
     """1 where a valid pixel looks like plain paper (not ink, not the dim halo around ink)."""
     F = fill_background(reg, valid)
     ink = _ink_like(reg, F)
-    ink = np.asarray(Image.fromarray((ink * 255).astype(np.uint8)).filter(ImageFilter.MaxFilter(5))) > 127
+    ink = np.asarray(Image.fromarray((ink * 255).astype(np.uint8)).filter(ImageFilter.MaxFilter(7))) > 127
     return (~ink).astype(np.float32)
+
+
+def _refine_valid(reg, valid, F):
+    """Second pass for the fill: with a first paper estimate F, drop the valid pixels that are still slightly darker or
+    tinted than F (the faint edge of pen strokes next to the hole), so they cannot tint / darken the fill.
+    Only used when enough clean paper is left; otherwise the old valid mask is returned."""
+    diff = reg.astype(np.float32) - F
+    L = diff.mean(2)
+    tint = np.abs(diff - L[..., None]).sum(2)                # colour shift away from the paper tone
+    ok = valid > 0.5
+    if int(ok.sum()) < 200:
+        return valid
+    sl = 1.4826 * float(np.median(np.abs(L[ok] - np.median(L[ok]))))
+    st = 1.4826 * float(np.median(np.abs(tint[ok] - np.median(tint[ok]))))
+    bad = ok & ((L < -max(3.0, 2.5 * sl)) | (tint > max(6.0, np.median(tint[ok]) + 3.0 * st)))
+    if not bad.any():
+        return valid
+    bad = np.asarray(Image.fromarray((bad * 255).astype(np.uint8)).filter(ImageFilter.MaxFilter(5))) > 127
+    v2 = valid * (~bad)
+    return v2.astype(np.float32) if float((v2 > 0.5).sum()) > 0.25 * float(ok.sum()) else valid
 
 
 def erase_region(img, mask, offset=None, feather=1.5, keep_ink=False):
@@ -1499,6 +1524,9 @@ def erase_region(img, mask, offset=None, feather=1.5, keep_ink=False):
     if offset is None:                                       # only real paper counts for the fill, never ink / halo
         valid = valid * _paper_like(reg, valid)
     F = fill_background(reg, valid).astype(np.float32)
+    if offset is None:
+        valid = _refine_valid(reg, valid, F)                 # 2nd look with the better paper estimate: faint ink halos out
+        F = fill_background(reg, valid).astype(np.float32)
 
     # soft edge: grow a little, then blur, so nothing of the old picture is left at the border
     f = max(0.8, float(feather))

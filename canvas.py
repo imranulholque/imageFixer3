@@ -1065,37 +1065,51 @@ class ImageCanvas(QWidget):
 
     def _paint_erase(self, p):
         z = self.zoom
-        red = QColor(239, 68, 68, 120)
+        red = QColor(239, 68, 68, 140)
         er = self._erase
-        # what is being drawn
+        # what is being drawn.  Every outline is drawn twice (dark below, white on top) so it is visible on white paper too,
+        # and the area that will be erased is tinted red, so you can see exactly how much is selected.
         if er is not None:
             pts = [self.to_wid(q) for q in er["pts"]]
             kind = er["kind"]
+            rnd = (Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
             if kind == "brush":
-                pen = QPen(red, max(1.0, self.brush_prev * z), Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
-                           Qt.PenJoinStyle.RoundJoin)
-                p.setPen(pen)
-                p.setBrush(Qt.BrushStyle.NoBrush)
+                w = max(1.0, self.brush_prev * z)
                 if len(pts) > 1:
+                    p.setBrush(Qt.BrushStyle.NoBrush)
+                    p.setPen(QPen(red, w, Qt.PenStyle.SolidLine, *rnd))
                     p.drawPolyline(QPolygonF(pts))
                 else:
                     p.setPen(Qt.PenStyle.NoPen)
                     p.setBrush(QBrush(red))
-                    r = max(1.0, self.brush_prev * z / 2)
-                    p.drawEllipse(pts[0], r, r)
+                    p.drawEllipse(pts[0], w / 2.0, w / 2.0)
             else:
-                p.setPen(QPen(QColor(255, 255, 255), 1.6, Qt.PenStyle.DashLine))
-                p.setBrush(QBrush(red))
+                shape = QPainterPath()
                 if kind == "lasso":
-                    p.setBrush(Qt.BrushStyle.NoBrush)
                     if len(pts) > 1:
-                        p.drawPolyline(QPolygonF(pts))
+                        shape.addPolygon(QPolygonF(pts))
+                        shape.closeSubpath()                   # it closes by itself when you let go: show that area
                 else:
                     rect = QRectF(pts[0], pts[-1]).normalized()
                     if kind == "rect":
-                        p.drawRect(rect)
+                        shape.addRect(rect)
                     else:
-                        p.drawEllipse(rect)
+                        shape.addEllipse(rect)
+                if not shape.isEmpty():
+                    p.setPen(Qt.PenStyle.NoPen)
+                    p.setBrush(QBrush(red))
+                    p.drawPath(shape)                          # red area = what will be erased
+                    p.setBrush(Qt.BrushStyle.NoBrush)
+                    p.setPen(QPen(QColor(0, 0, 0, 230), 3.4, Qt.PenStyle.SolidLine, *rnd))
+                    p.drawPath(shape)
+                    p.setPen(QPen(QColor(255, 255, 255), 1.6, Qt.PenStyle.DashLine, *rnd))
+                    p.drawPath(shape)
+                if kind == "lasso" and len(pts) > 1:           # the free line itself, dark + white, always visible
+                    p.setBrush(Qt.BrushStyle.NoBrush)
+                    p.setPen(QPen(QColor(0, 0, 0, 230), 3.4, Qt.PenStyle.SolidLine, *rnd))
+                    p.drawPolyline(QPolygonF(pts))
+                    p.setPen(QPen(QColor(255, 255, 255), 1.6, Qt.PenStyle.SolidLine, *rnd))
+                    p.drawPolyline(QPolygonF(pts))
         # where the clone comes from
         if self.clone_src is not None:
             pos = self.clone_src

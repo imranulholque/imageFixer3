@@ -3547,7 +3547,8 @@ class Card(QWidget):
                 self.canvas.set_clone(self.clone_src, (self.clone_off[0] * s, self.clone_off[1] * s))
             offset = self.clone_off
         size = self.sizeSlider.value()
-        base, sel, ink = self.base, self.sel, self.keep_ink
+        base, sel = self.base, self.sel
+        ink = False        # the eraser removes EVERYTHING it covers (handwriting too); 'keep writing under a stamp' is only for stamp removal
         if kind in ("brush", "lasso"):
             er_rect = self._bbox_rect(data, size * s / 2.0 + 2 if kind == "brush" else 0.0)
         else:
