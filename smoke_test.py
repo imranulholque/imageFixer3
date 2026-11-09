@@ -94,6 +94,7 @@ step("subtract/intersect/invert/grow", t_sel_ops)
 # 5 delete selection
 def t_delete():
     c._on_select("rect", (80, 80, 320, 240), "new") if False else None
+    c.look = core.new_look(); c.adjs = []; c.colors.rebuild(c.adjs); c._sync_sliders()   # leftover hue must not be baked in
     c.sel = None; c._on_select("rect", (80, 80, 320, 240), "new")
     assert tuple(c.base.getpixel((150, 150))) == (220, 30, 30)
     c.delete_selection()
@@ -235,6 +236,7 @@ def _window_with(n):
     w.add_files(paths)
     _pump(lambda: not w._adding and len(w.carousel.cards) == n)
     assert len(w.carousel.cards) == n and w.strip.count() == n, "pictures were not added"
+    w.runner.wait_idle()                           # removing / overlays are refused while a job runs
     return w
 
 def t_multi_remove():
@@ -441,7 +443,7 @@ def t_incoming_routing():
     w.carousel.go_to(0, animate=False); _pump(lambda: c._loaded)
     q = d + "/ov.png"; Image.new("RGB", (60, 40), (20, 20, 120)).save(q)
     c.tabGroup.button(0).click()                                   # Adjust tab: a new picture arrives -> a new main picture
-    n0 = len(w.carousel.cards); w._incoming([q], "phone"); _pump(lambda: not w._adding and len(w.carousel.cards) == n0 + 1)
+    n0 = len(w.carousel.cards); w._incoming([q], "phone"); _pump(lambda: not w._adding and len(w.carousel.cards) == n0 + 1); w.runner.wait_idle()
     assert len(w.carousel.cards) == n0 + 1 and w.carousel.cards[-1].origin == "phone" and not w.carousel.cards[-1].can_replace()
     c.tabGroup.button(c.TAB_PICTURE).click()                      # Picture tab: it becomes an overlay on this page
     w._incoming([q], "file"); _pump(lambda: len(c.layers) == 1 and not w.runner.busy)
@@ -452,6 +454,7 @@ def t_pdf_pages():
     from PIL import Image
     pages = [Image.new("RGB", (400, 560), c) for c in ((255, 255, 255), (240, 230, 200), (200, 220, 255))]
     pdf = d + "/doc.pdf"; pages[0].save(pdf, save_all=True, append_images=pages[1:])
+    w = _window_with(1)
     n0 = len(w.carousel.cards)
     w.carousel.cards[0].tabGroup.button(w.carousel.cards[0].TAB_ADJUST).click()
     w.add_files([pdf]); _pump(lambda: not w._adding and not w.runner.busy and len(w.carousel.cards) == n0 + 3, 30)
