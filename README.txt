@@ -61,6 +61,8 @@ KEYS
  Ctrl+Z undo (step by step) ... Ctrl+Y / Ctrl+Shift+Z redo     Del delete selection      Ctrl+T transform
  Ctrl+A all, Ctrl+D none, Ctrl+Shift+I inverse                 Enter / Esc apply / cancel crop or transform
  V move, M box, L freehand, W quick select, B brush select, E erase, C crop, I eyedropper, P color brush, H hand (Space + drag = pan)
+ T new text box.  Text boxes / placed pictures: with Hand (H) or Move (V) just click one and drag it (Alt + drag = copy, double click = edit the text,
+   handles = resize / rotate). In any other tool hold Ctrl and click it. Click an empty place = done; it stays editable any time.
  Ctrl + wheel zoom, Ctrl +/- zoom, Ctrl+0 fit, Ctrl+1 100%     Left / Right previous / next picture
  WHEEL goes to what is under the pointer: over the picture = up / down, Shift + wheel = left / right, Ctrl + wheel = zoom;
  over the thumbnails (bottom) = previous / next picture, one by one; over the side panel = scrolls the panel.

@@ -49,6 +49,7 @@ class ImageCanvas(QWidget):
     layerOutside = Signal(float, float)         # click outside the box of the selected picture layer
     layerEditRequested = Signal()               # double click on the selected picture layer
     layerCopyRequested = Signal()               # Alt + drag on the selected picture layer: a copy stays where it is
+    layerPressed = Signal(int, float, float, bool)   # press on a picture / text box with the Hand or Move tool (Ctrl + click in other tools): id, x, y, Alt held
     paintFinished = Signal(object)              # colour brush stroke: list of (x, y) in preview pixels
 
     VIEW, PICK, CROP, PERSP, ERASE, SELECT, MOVESEL, TRANSFORM, PAINT = 0, 1, 2, 3, 4, 5, 6, 7, 8
@@ -73,6 +74,7 @@ class ImageCanvas(QWidget):
         self._drag = None
         self._pan_last = None
         self._view_press = None
+        self.layer_probe = None                  # card gives a function (x, y, ctrl) -> id of the picture / text box there, or None
         self._hover = None
         self._erase = None                    # stroke / shape being drawn
         self.erase_shape = "brush"
@@ -395,6 +397,15 @@ class ImageCanvas(QWidget):
             self._tf["img"] = img
             self._tf["w"], self._tf["h"] = float(img.width()), float(img.height())
             self.update()
+
+    def begin_layer_drag(self, x, y, alt=False):
+        """The mouse is still down on a picture layer that was just selected: carry on as a drag (Alt = a copy stays)."""
+        if self.mode != self.TRANSFORM or self._tf is None or not self._tf.get("layer"):
+            return
+        self._tf_push()
+        if alt:
+            self.layerCopyRequested.emit()
+        self._tf_drag = self._tf_start("move", QPointF(x, y))
 
     def mouseDoubleClickEvent(self, e):
         if self.mode == self.TRANSFORM and self._tf is not None and self._tf.get("layer") \
@@ -1282,6 +1293,14 @@ class ImageCanvas(QWidget):
             return
         pos = e.position()
         btn = e.button()
+        if btn == Qt.MouseButton.LeftButton and not self._space and self.layer_probe is not None \
+                and self.mode != self.TRANSFORM:
+            ipp = self.to_img(pos)
+            mods = e.modifiers()
+            lid = self.layer_probe(ipp.x(), ipp.y(), bool(mods & Qt.KeyboardModifier.ControlModifier))
+            if lid is not None:                  # a picture / text box is under the pointer: select it and drag it at once
+                self.layerPressed.emit(int(lid), ipp.x(), ipp.y(), bool(mods & Qt.KeyboardModifier.AltModifier))
+                return
         if btn in (Qt.MouseButton.MiddleButton, Qt.MouseButton.RightButton) or \
                 (btn == Qt.MouseButton.LeftButton and (self.mode == self.VIEW or self._space)):
             self._pan_last = pos

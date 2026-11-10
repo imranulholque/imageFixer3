@@ -685,6 +685,8 @@ class Card(QWidget):
         self._rendering = False
         self._again = False
         self.saved_path = None
+        self._lcache = {}                          # per-layer warped patches: moving / typing in one layer re-makes only that layer
+        self._base_cache = None                    # (key, refs, picture before the layers): layer work never redoes the page maths
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.setInterval(25)
@@ -914,24 +916,24 @@ class Card(QWidget):
         self.btnPaint.setToolTip("Paint with a color (P). Inside the selection only - or anywhere if nothing is selected.")
         T = self.choose_tool
         self.menuSelect = self._menu_button("Select", [
-            ("Brush select      B", lambda: T("brush")),
-            ("Box      M", lambda: T("rect")), ("Ellipse", lambda: T("ellipse")),
-            ("Freehand (draw around)      L", lambda: T("lasso")), ("Color range  (click a color)      W", lambda: T("color")),
-            ("Deselect brush  (take parts out, accurate)      Shift+D", lambda: T("deselect")),
-            None, ("Select all      Ctrl+A", self.select_all), ("Deselect      Ctrl+D", self.deselect),
-            ("Inverse      Ctrl+Shift+I", self.invert_selection)], "Ways to select a part of the picture")
+            ("Brush select\tB", lambda: T("brush")),
+            ("Box\tM", lambda: T("rect")), ("Ellipse", lambda: T("ellipse")),
+            ("Freehand\tL", lambda: T("lasso")), ("Color range\tW", lambda: T("color")),
+            ("Deselect brush\tShift+D", lambda: T("deselect")),
+            None, ("Select all\tCtrl+A", self.select_all), ("Deselect\tCtrl+D", self.deselect),
+            ("Inverse\tCtrl+Shift+I", self.invert_selection)], "Ways to select a part of the picture")
         self.menuMove = self._menu_button("Move", [
-            ("Move      V   (Alt + drag = copy)", lambda: T("move")), ("Copy", lambda: T("copy")),
-            ("Transform (resize / rotate)      Ctrl+T", self.start_transform)], "Move, copy or resize the selection")
+            ("Move\tV", lambda: T("move")), ("Copy", lambda: T("copy")),
+            ("Transform\tCtrl+T", self.start_transform)], "Move, copy or resize the selection")
         self.menuErase = self._menu_button("Erase", [
-            ("Brush      E", lambda: T("erase_brush")), ("Box", lambda: T("erase_rect")),
+            ("Brush\tE", lambda: T("erase_brush")), ("Box", lambda: T("erase_rect")),
             ("Ellipse", lambda: T("erase_ellipse")), ("Freehand", lambda: T("erase_lasso")), None,
-            ("Delete selection      Del", self.delete_selection),
-            ("Fill selection with color", self.fill_selection)], "Remove things; the place is filled from around it")
+            ("Delete selection\tDel", self.delete_selection),
+            ("Fill with color", self.fill_selection)], "Remove things; the place is filled from around it")
         self.menuCrop = self._menu_button("Crop", [
-            ("Crop      C", lambda: T("crop")), ("Straighten (4 corners)", lambda: T("persp")), None,
-            ("Crop to circle", lambda: T("crop_circle")), ("Crop to oval", lambda: T("crop_oval")),
-            ("Crop to rounded box", lambda: T("crop_round")), ("Crop to the selection shape", self.crop_to_selection), None,
+            ("Crop\tC", lambda: T("crop")), ("Straighten", lambda: T("persp")), None,
+            ("To circle", lambda: T("crop_circle")), ("To oval", lambda: T("crop_oval")),
+            ("To rounded box", lambda: T("crop_round")), ("To selection shape", self.crop_to_selection), None,
             ("Rotate left", lambda: self.rotate(90.0)), ("Rotate right", lambda: self.rotate(-90.0))],
             "Crop (also a picture you placed: signature, stamp ...) to a box, circle, oval, rounded box or any selected shape; "
             "straighten a photographed page; rotate")
@@ -955,7 +957,7 @@ class Card(QWidget):
         for w in (self.menuSelect, self.menuMove, self.btnPick, self.btnPaint, self.menuErase, self.menuCrop):
             r2.addWidget(w)
         self.btnText = QPushButton("T  Text box")
-        self.btnText.setToolTip("Write Bangla or English text on the page. The text box moves, resizes, rotates and copies like a picture.")
+        self.btnText.setToolTip("Text box (T): write Bangla / English on the page. Click it any time to move, resize, rotate, Alt + drag = copy, double click = edit.")
         r2.addWidget(self.btnText)
         r2.addSpacing(10)
         r2.addWidget(self.btnLayerDone)
@@ -1005,8 +1007,8 @@ class Card(QWidget):
             self.tfBtns[key] = b
             tfl.addWidget(b)
         self.tfBtns["free"].setChecked(True)
-        for text, tip, fn in (("⟲ 90°", "Rotate 90° left   (Ctrl+Alt+Left)", lambda: self.tf_rotate(-90)),
-                              ("⟳ 90°", "Rotate 90° right   (Ctrl+Alt+Right)", lambda: self.tf_rotate(90)),
+        for text, tip, fn in (("⟲ 90°", "Rotate 90° left (Ctrl+Alt+Left)", lambda: self.tf_rotate(-90)),
+                              ("⟳ 90°", "Rotate 90° right (Ctrl+Alt+Right)", lambda: self.tf_rotate(90)),
                               ("⇋ Flip", "Mirror left-right", lambda: self.canvas.tf_flip(True)),
                               ("⇵ Flip", "Mirror top-bottom", lambda: self.canvas.tf_flip(False))):
             b = QPushButton(text)
@@ -1193,6 +1195,8 @@ class Card(QWidget):
         self.canvas.layerOutside.connect(self._on_layer_outside)
         self.canvas.layerEditRequested.connect(self._layer_double)
         self.canvas.layerCopyRequested.connect(self._copy_layer_drag)
+        self.canvas.layer_probe = self._layer_probe
+        self.canvas.layerPressed.connect(self._on_layer_pressed)
         self.btnApply.clicked.connect(self.apply_pending)
         self.btnCancel.clicked.connect(self.cancel_pending)
         self.btnUndo.clicked.connect(self.undo_step)
@@ -1386,7 +1390,7 @@ class Card(QWidget):
                                "still visible) instead of leaving a white gap.  Switch it off to remove everything.")
         self.chkInk.toggled.connect(lambda on: setattr(self, "keep_ink", bool(on)))
         gls.addWidget(self.chkInk)
-        self.btnRemoveStamp = QPushButton("Remove the selected stamp / mark   (Del)")
+        self.btnRemoveStamp = QPushButton("Remove selected stamp (Del)")
         gls.addWidget(self.btnRemoveStamp)
         lay.addWidget(gs)
 
@@ -2047,15 +2051,31 @@ class Card(QWidget):
         return {"prev": prev, "scale": scale, "lab": lab, "cache": cache, "out": out, "qimg": np_to_qimage(out)}
 
     @staticmethod
-    def _deco_from(ctx, alpha, layers, hide=None):
+    def _deco_from(ctx, alpha, layers, hide=None, cache=None):
         if ctx is not None and alpha is not None:
             return lambda out: core.show_alpha(out, alpha)
         if layers:
-            return lambda out: np.asarray(core.composite_layers(Image.fromarray(out), layers, hide))
+            return lambda out: np.asarray(core.composite_layers_fast(Image.fromarray(out), layers, hide, cache))
         return None
 
     def _deco(self):
-        return self._deco_from(self.ctx, self.alpha, self.layers, self._hide_layer)
+        return self._deco_from(self.ctx, self.alpha, self.layers, self._hide_layer, self._lcache)
+
+    @staticmethod
+    def _fp(v):
+        """A hashable fingerprint of settings (numbers, text, lists, dicts; anything else by identity)."""
+        if v is None or isinstance(v, (int, float, str, bool)):
+            return v
+        if isinstance(v, (list, tuple)):
+            return tuple(Card._fp(x) for x in v)
+        if isinstance(v, dict):
+            return tuple(sorted((str(k), Card._fp(x)) for k, x in v.items()))
+        return ("id", id(v))
+
+    def _base_key(self):
+        """Everything that makes the picture BEFORE the layers.  Same key = no need to redo the colour maths."""
+        return (self._view_gen, id(self.prev), id(self.base), id(self.sel), self._sel_ver, self.ctx,
+                self._fp(self.look), self._fp([a for a in self.adjs if core.adj_active(a)]))
 
     def _adopt_view(self, v, refit=True):
         self._view_gen += 1
@@ -2134,23 +2154,30 @@ class Card(QWidget):
         look, sel = dict(self.look), self.sel
         focus = copy.deepcopy(self._focus_adj())
         deco = self._deco()
+        bkey = None if focus is not None else self._base_key()
+        bc = self._base_cache
+        cached = bc[2] if (bkey is not None and bc is not None and bc[0] == bkey) else None
 
         def work(progress):
             lab = lab0
-            if lab is None and (core.active_adjs(adjs) or focus is not None):
-                lab = core.rgb_to_lab(prev)
-            out = core.render(prev, adjs, look, lab=lab, cache=cache, sel=sel)
-            if deco is not None:
-                out = deco(out)
+            if cached is not None:                       # only the layers changed: the page itself is already made
+                out0 = cached
+            else:
+                if lab is None and (core.active_adjs(adjs) or focus is not None):
+                    lab = core.rgb_to_lab(prev)
+                out0 = core.render(prev, adjs, look, lab=lab, cache=cache, sel=sel)
+            out = deco(out0) if deco is not None else out0
             hl = None if focus is None else core.get_mask(prev, focus, lab, cache)
-            return np_to_qimage(out), hl, lab
+            return np_to_qimage(out), hl, lab, out0
 
         def done(res):
             self._rendering = False
             if self._dead:
                 return
             if gen == self._view_gen:
-                out, hl, lab = res
+                out, hl, lab, out0 = res
+                if bkey is not None:
+                    self._base_cache = (bkey, (prev, sel, self.base), out0)
                 if self._lab is None and lab is not None:
                     self._lab = lab
                 self.canvas.set_display(out)
@@ -2482,7 +2509,7 @@ class Card(QWidget):
         self.show_tab(self.TAB_TEXTBOX)
         self.place_layer_tool(layer["id"])
         self._inline_start(layer["id"])
-        self._notify("layer", "Text box added", "type right on the page; click outside when done.  Drag = move, handles = resize, Alt + drag = copy")
+        self._notify("layer", "Text box added", "type on the page, click outside when done.  Click it again any time: drag = move, Alt + drag = copy, double click = edit")
 
     def _put_text_layer(self, nl):
         lid = nl["id"]
@@ -2846,6 +2873,29 @@ class Card(QWidget):
         if lid is not None:
             self.place_layer_tool(lid)
             self._show_text_tab_if_text(lid)
+
+    def _layer_probe(self, x, y, ctrl=False):
+        """Canvas asks on every press: is there a picture / text box here that should be picked up?
+        Hand and Move tools: always.  Every other tool: only with Ctrl held (so selecting / erasing still works)."""
+        if self.ctx is not None or not self.layers or not self._loaded or self._tool == "transform":
+            return None
+        if not (ctrl or self._tool in ("view", "move", "copy")):
+            return None
+        lid = self._layer_at(x, y)
+        if lid is None:
+            return None
+        if self._tool in ("move", "copy") and not ctrl and self.sel is not None:      # moving selected page pixels wins there
+            H, W = self.sel.shape[:2]
+            PH, PW = self.prev.shape[:2]
+            ix, iy = int(x * W / max(PW, 1)), int(y * H / max(PH, 1))
+            if 0 <= ix < W and 0 <= iy < H and self.sel[iy, ix] > 0.5:
+                return None
+        return lid
+
+    def _on_layer_pressed(self, lid, x, y, alt):
+        self.place_layer_tool(lid)
+        self._show_text_tab_if_text(lid)
+        self.canvas.begin_layer_drag(x, y, alt)                 # drag starts right away: click = select, drag = move, Alt + drag = copy
 
     def _on_layer_outside(self, x, y):
         lid = self._layer_at(x, y, skip=self._place_id)

@@ -1,6 +1,7 @@
 """Image Fixer - all picture maths (no GUI code here, so it can be tested on its own)."""
 import colorsys
 import math
+import threading
 import os
 import uuid
 
@@ -2298,6 +2299,54 @@ def composite_layers(base, layers, hide=None):
             up = int(tw * 1.5)
             patch = patch.resize((up, max(1, int(round(up * patch.height / patch.width)))), Image.Resampling.LANCZOS)
         out = Image.alpha_composite(out, warp_layer_hq(patch, (W, H), grid, n))
+    return out.convert("RGB")
+
+
+_LCACHE_LOCK = threading.Lock()
+
+
+def composite_layers_fast(base, layers, hide=None, cache=None):
+    """Same picture as composite_layers, but each layer's warped patch is kept in 'cache' (a dict) and only its own
+    bounding box is blended.  Moving / typing in ONE layer then re-makes only that layer, not the whole page."""
+    if not layers:
+        return base
+    if cache is None:
+        return composite_layers(base, layers, hide)
+    W, H = base.size
+    out = base.convert("RGBA")
+    alive = set()
+    for l in layers:
+        if not l.get("visible", True) or l["id"] == hide:
+            continue
+        lid = l["id"]
+        alive.add(lid)
+        refs = (l["rgb"], l["a"], l.get("pend"))
+        sig = ((W, H), tuple(l["grid"]), l["n"], l.get("opacity", 100), id(refs[0]), id(refs[1]), id(refs[2]))
+        with _LCACHE_LOCK:
+            hit = cache.get(lid)
+        if hit is not None and hit[0] == sig:
+            box, patch = hit[2], hit[3]
+        else:
+            n = l["n"]
+            grid = [(x * W, y * H) for x, y in l["grid"]]
+            patch = layer_rgba(l)
+            tw = max(math.dist(grid[0], grid[n]), math.dist(grid[n * (n + 1)], grid[-1]))
+            want = int(tw * 3)
+            if 8 <= want < patch.width:
+                patch = patch.resize((want, max(1, int(round(want * patch.height / patch.width)))), Image.Resampling.LANCZOS)
+            elif patch.width < tw * 1.05 and tw < 9000:
+                up = int(tw * 1.5)
+                patch = patch.resize((up, max(1, int(round(up * patch.height / patch.width)))), Image.Resampling.LANCZOS)
+            full = warp_layer_hq(patch, (W, H), grid, n)
+            box = full.getchannel("A").getbbox()
+            patch = full.crop(box) if box is not None else None
+            with _LCACHE_LOCK:
+                cache[lid] = (sig, refs, box, patch)          # refs keep the objects alive, so their ids stay unique
+        if box is not None and patch is not None:
+            out.alpha_composite(patch, dest=(box[0], box[1]))
+    with _LCACHE_LOCK:
+        for k in [k for k in cache if k not in alive and not any(x["id"] == k for x in layers)]:
+            del cache[k]                                     # a removed layer frees its memory
     return out.convert("RGB")
 
 

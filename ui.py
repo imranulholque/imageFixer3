@@ -142,12 +142,12 @@ class Strip(QListWidget):
         n = len(u)
         what = "this picture" if n == 1 else "%d pictures" % n
         m = QMenu(self)
-        a_rm = m.addAction("Remove %s from the list      Del" % what)
-        a_cp = m.addAction("Copy %s      Ctrl+C" % what)
+        a_rm = m.addAction("Remove %s\tDel" % what)
+        a_cp = m.addAction("Copy %s\tCtrl+C" % what)
         a_rm.setEnabled(n > 0)
         a_cp.setEnabled(n > 0)
         m.addSeparator()
-        a_all = m.addAction("Select all      Ctrl+A")
+        a_all = m.addAction("Select all\tCtrl+A")
         act = m.exec(self.viewport().mapToGlobal(pos))
         if act is a_rm:
             self.removeRequested.emit(u)
@@ -554,12 +554,12 @@ class MainWindow(QMainWindow):
             a.triggered.connect(lambda _=False: fn())
             m.addAction(a)
             return a
-        self.actSaveAs = act("Save as...  (JPG, PNG, PDF)", lambda: self._with_loaded(self.save_card_as))
+        self.actSaveAs = act("Save as...", lambda: self._with_loaded(self.save_card_as))
         self.actSaveAll = act("Save all edited...", self.save_all)
         self.actPdfAll = act("All pages as one PDF", self.save_all_pdf)
-        self.actPrint = act("Print...   Ctrl+P", lambda: self._with_loaded(lambda c: self.print_cards([c])))
+        self.actPrint = act("Print...\tCtrl+P", lambda: self._with_loaded(lambda c: self.print_cards([c])))
         m.addSeparator()
-        self.actCopy = act("Copy picture   Ctrl+C", lambda: self._with_loaded(lambda c: c.copy_image()))
+        self.actCopy = act("Copy picture\tCtrl+C", lambda: self._with_loaded(lambda c: c.copy_image()))
         self.btnSaveMore.setMenu(m)
         bl.addWidget(self.btnSave)
         bl.addWidget(self.btnSaveMore)
@@ -868,6 +868,7 @@ class MainWindow(QMainWindow):
         for key, tool in (("V", "move"), ("M", "rect"), ("L", "lasso"), ("W", "color"), ("B", "brush"),
                           ("E", "erase_brush"), ("C", "crop"), ("I", "pick"), ("P", "paint"), ("H", "view")):
             sc(key, cur(lambda c, t=tool: c.choose_tool(t)))
+        sc("T", cur(lambda c: c.add_text_layer()), "Text box")
         # zoom
         sc("Ctrl+0", cur(lambda c: c.canvas.fit()), "Fit to window")
         sc("Ctrl+1", cur(lambda c: c.canvas.zoom_to(1.0 / max(c.scale, 1e-6))), "Actual size")

@@ -152,10 +152,10 @@ QListWidget#strip { background: #0a0c10; border: none; outline: 0; }
 QListWidget#strip::item { color: #8d95a8; border: 1px solid transparent; border-radius: 10px; padding: 3px; }
 QListWidget#strip::item:hover { background: #171c28; }
 QListWidget#strip::item:selected { background: #1f2640; border: 1px solid #6366f1; color: white; }
-QMenu { background: #171b24; border: 1px solid #30374a; padding: 6px; border-radius: 10px; }
-QMenu::item { padding: 8px 24px 8px 14px; border-radius: 7px; }
+QMenu { background: #171b24; border: 1px solid #30374a; padding: 3px; border-radius: 8px; }
+QMenu::item { padding: 4px 14px 4px 10px; border-radius: 6px; }
 QMenu::item:selected { background: #2b3246; }
-QMenu::separator { height: 1px; background: #2a3042; margin: 5px 8px; }
+QMenu::separator { height: 1px; background: #2a3042; margin: 3px 6px; }
 QCheckBox { spacing: 8px; background: transparent; }
 QCheckBox::indicator { width: 16px; height: 16px; border-radius: 5px; border: 1px solid #4a5268; background: #1a1f2b; }
 QCheckBox::indicator:hover { border-color: #818cf8; }
@@ -172,7 +172,7 @@ def scaled_qss(factor, compact=False):
     if compact:
         q = (q.replace("padding: 4px 10px;", "padding: 2px 6px;")
               .replace("padding: 5px 8px;", "padding: 3px 6px;")
-              .replace("QMenu::item { padding: 8px 24px 8px 14px;", "QMenu::item { padding: 6px 20px 6px 12px;")
+              .replace("QMenu::item { padding: 4px 14px 4px 10px;", "QMenu::item { padding: 3px 12px 3px 8px;")
               .replace("QPushButton#nav { font-size: 20px; padding: 2px 12px; }", "QPushButton#nav { font-size: 20px; padding: 2px 8px; }"))
         factor = factor * 0.94
     if abs(factor - 1.0) < 0.01:
