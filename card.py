@@ -26,6 +26,34 @@ from flow import ElidedLabel, FlowLayout
 from jobs import _log, run_background
 
 EXPORT_DIR = os.path.join(tempfile.gettempdir(), "imagefixer_export")
+CLIP_FILES = set()      # files the clipboard points to right now: never deleted while another program may still paste them
+EXPORT_LOCK = __import__("threading").Lock()
+
+
+def export_path(stem, ext):
+    """A new free file name in the export folder. The name is reserved at once (empty file), so two background jobs
+    (hover-prepare and Copy) can never pick the same name and write into the same file."""
+    ext = ".png" if ext.lower() in (".jpg", ".jpeg", ".webp") else ext      # drag / copy files are lossless: no quality lost, any program opens them
+    os.makedirs(EXPORT_DIR, exist_ok=True)
+    with EXPORT_LOCK:
+        p = core.unique_path(EXPORT_DIR, stem, ext)
+        try:
+            open(p, "ab").close()
+        except OSError:
+            pass
+        return p
+
+
+def _drop_export(path):
+    """Deletes one temporary export file, unless the clipboard still needs it."""
+    try:
+        ap = os.path.abspath(path)
+        if ap in CLIP_FILES:
+            return
+        if os.path.dirname(ap) == os.path.abspath(EXPORT_DIR):
+            os.remove(ap)
+    except OSError:
+        pass
 
 # tool key -> (canvas mode, shape)
 TOOL_MODE = {
@@ -2196,6 +2224,8 @@ class Card(QWidget):
             paths.append(self.orig_path)
         for p in paths:
             try:
+                if os.path.abspath(p) in CLIP_FILES:
+                    continue                          # copied to the clipboard: still pasteable after this picture is removed
                 if os.path.dirname(os.path.abspath(p)) in (os.path.abspath(EXPORT_DIR), os.path.abspath(core.ORIG_DIR)):
                     os.remove(p)
             except OSError:
@@ -4542,16 +4572,20 @@ class Card(QWidget):
         src_path = self.path
 
         def work(progress):
-            os.makedirs(EXPORT_DIR, exist_ok=True)
-            path = core.unique_path(EXPORT_DIR, stem, ext)
+            path = export_path(stem, ext)
             core.save_image(core.render_full(*args), path, src=src_path)
             return path
 
         def done(path):
             self._exporting = False
             if self._dead:
+                _drop_export(path)
                 return
-            self.set_export(ver, path)
+            if self._export is not None and self._export[0] == ver and os.path.exists(self._export[1]) \
+                    and self._export[1] != path:
+                _drop_export(path)                    # Copy made this version's file meanwhile: keep that one (the clipboard may use it)
+            else:
+                self.set_export(ver, path)
             self.exportReady.emit()
 
         def fail(msg):
@@ -4567,11 +4601,7 @@ class Card(QWidget):
         old = self._export
         self._export = (ver, path)
         if old is not None and old[1] != path:
-            try:
-                if os.path.dirname(os.path.abspath(old[1])) == os.path.abspath(EXPORT_DIR):
-                    os.remove(old[1])
-            except OSError:
-                pass
+            _drop_export(old[1])
 
     def export_file(self):
         """The picture with all edits as a file (made now if it is not ready)."""
@@ -4579,9 +4609,8 @@ class Card(QWidget):
         ready = self.export_ready()
         if ready is not None:
             return ready
-        os.makedirs(EXPORT_DIR, exist_ok=True)
         stem, ext = self.out_name()
-        path = core.unique_path(EXPORT_DIR, stem, ext)
+        path = export_path(stem, ext)
         core.save_image(self.result_image(), path, src=self.path)
         self.set_export(self._ver, path)
         return path
