@@ -68,6 +68,11 @@ KEYS
  over the thumbnails (bottom) = previous / next picture, one by one; over the side panel = scrolls the panel.
  Ctrl+S save, Ctrl+Shift+S save all edited, Ctrl+C copy picture
 
+LAYERS (Picture tab / Aa tab): the list shows the TOP layer first, the main picture is always at the bottom.
+ Each layer has  Up / Down (one step), Front (very top), Back (very bottom).  Keys: Ctrl+Alt+Up / Down, Ctrl+Alt+Shift+Up / Down.
+ Text boxes are named "Text box 1, 2 ..." (not by their words). Changing color / size / font / shadow in the Aa tab shows on the page at once.
+ Every shortcut is listed in Settings > Keyboard shortcuts...
+
 SETTINGS (top right): start with Windows, Send to entry, save folder, Auto update.
 Closing the window keeps the program in the tray; use the tray icon -> Exit to quit.
 Problems are written to  %APPDATA%\ImageFixer\error.log

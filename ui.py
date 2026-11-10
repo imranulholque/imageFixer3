@@ -11,7 +11,7 @@ from PySide6.QtGui import (QAction, QActionGroup, QColor, QCursor, QDesktopServi
                            QKeySequence, QPainter, QPixmap, QShortcut, QTransform)
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QDialog, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel,
                                QListView, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QProgressBar,
-                               QPushButton, QSizePolicy, QStackedLayout, QSystemTrayIcon, QVBoxLayout, QWidget)
+                               QPushButton, QSizePolicy, QStackedLayout, QSystemTrayIcon, QTextBrowser, QVBoxLayout, QWidget)
 
 import core
 import updater
@@ -610,6 +610,9 @@ class MainWindow(QMainWindow):
         a = QAction("Choose save folder...", self)
         a.triggered.connect(self.choose_dir)
         m.addAction(a)
+        ks = QAction("Keyboard shortcuts...", self)
+        ks.triggered.connect(self.show_shortcuts)
+        m.addAction(ks)
         m.addSeparator()
         self._radio_menu(m, "Picture detail (sharpness on screen)", "quality", self._apply_quality,
                          (("auto", "Automatic (best for this screen)"), ("fast", "Fast  (slow computers)"),
@@ -622,6 +625,20 @@ class MainWindow(QMainWindow):
         q.triggered.connect(self.quit_app)
         m.addAction(q)
         return m
+
+    def show_shortcuts(self):
+        """Settings > Keyboard shortcuts: every key of the program in one list."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Keyboard shortcuts")
+        dlg.resize(620, 640)
+        lay = QVBoxLayout(dlg)
+        view = QTextBrowser()
+        view.setHtml("<h3 style='margin:12px 0 4px'>Files and saving</h3><table cellspacing='0' cellpadding='3'><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl+O</b></td><td>Choose files</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl+V</b></td><td>Paste pictures (or a PDF) from the clipboard</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl+C</b></td><td>Copy the picture</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl+S</b></td><td>Save (replaces the original; asked once)</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl+Shift+S</b></td><td>Save all edited pictures</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl+P</b></td><td>Print</td></tr></table>\n<h3 style='margin:12px 0 4px'>Undo / Redo</h3><table cellspacing='0' cellpadding='3'><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl+Z</b></td><td>Undo, step by step</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl+Y  or  Ctrl+Shift+Z</b></td><td>Redo</td></tr></table>\n<h3 style='margin:12px 0 4px'>Tools (press the letter)</h3><table cellspacing='0' cellpadding='3'><tr><td style='white-space:nowrap; padding-right:18px'><b>V</b></td><td>Move</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>M</b></td><td>Box select</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>L</b></td><td>Freehand select (lasso)</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>W</b></td><td>Color range select</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>B</b></td><td>Brush select</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>E</b></td><td>Erase brush</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>C</b></td><td>Crop</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>I</b></td><td>Eyedropper</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>P</b></td><td>Color brush</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>H</b></td><td>Hand (Space + drag also pans)</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>T</b></td><td>New text box</td></tr></table>\n<h3 style='margin:12px 0 4px'>Selection</h3><table cellspacing='0' cellpadding='3'><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl+A</b></td><td>Select all</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl+D</b></td><td>Deselect</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl+Shift+I</b></td><td>Inverse selection</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Shift + select</b></td><td>Add to selection</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Alt + select</b></td><td>Subtract from selection</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Delete / Backspace</b></td><td>Delete the selection (filled from the paper around it)</td></tr></table>\n<h3 style='margin:12px 0 4px'>Transform / placing a picture or text box</h3><table cellspacing='0' cellpadding='3'><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl+T</b></td><td>Transform the selection</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Enter</b></td><td>Apply</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Esc</b></td><td>Cancel</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Arrow keys</b></td><td>Nudge 1 px  (Shift = 10 px)</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>[  and  ]</b></td><td>Rotate 1 degree</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl+[  and  Ctrl+]</b></td><td>Rotate 15 degrees</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl+Alt+Left / Right</b></td><td>Rotate 90 degrees</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>R  /  Shift+R</b></td><td>Turn 90 degrees right / left (picture or text box selected, else the page)</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Shift + drag</b></td><td>Dead straight (sideways, up / down or diagonal)</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Alt + drag</b></td><td>Copy instead of move</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Double click</b></td><td>Edit the text of a text box</td></tr></table>\n<h3 style='margin:12px 0 4px'>Layers (overlay pictures and text boxes)</h3><table cellspacing='0' cellpadding='3'><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl+Alt+Up</b></td><td>Move the selected layer UP one step</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl+Alt+Down</b></td><td>Move the selected layer DOWN one step</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl+Alt+Shift+Up</b></td><td>Bring the selected layer to the very TOP</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl+Alt+Shift+Down</b></td><td>Send the selected layer to the very BOTTOM</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Delete</b></td><td>Remove the selected layer</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl + click</b></td><td>Select a layer while another tool is active</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Click empty place</b></td><td>Done / deselect the layer</td></tr></table>\n<h3 style='margin:12px 0 4px'>View</h3><table cellspacing='0' cellpadding='3'><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl + wheel</b></td><td>Zoom</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl +  /  Ctrl -</b></td><td>Zoom in / out</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl+0</b></td><td>Fit to window</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl+1</b></td><td>Actual size (100%)</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Wheel</b></td><td>Up / down (Shift + wheel = left / right)</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Left / Right</b></td><td>Previous / next picture</td></tr></table>\n<h3 style='margin:12px 0 4px'>Thumbnails (bottom)</h3><table cellspacing='0' cellpadding='3'><tr><td style='white-space:nowrap; padding-right:18px'><b>Click, Ctrl+click, Shift+click</b></td><td>Select one / many</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl+A</b></td><td>Select all</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Del</b></td><td>Remove selected from the list (files stay)</td></tr></table>")
+        lay.addWidget(view)
+        close = QPushButton("Close")
+        close.clicked.connect(dlg.accept)
+        lay.addWidget(close, 0, Qt.AlignmentFlag.AlignRight)
+        dlg.exec()
 
     def about(self):
         box = QMessageBox(self)
@@ -869,6 +886,11 @@ class MainWindow(QMainWindow):
                           ("E", "erase_brush"), ("C", "crop"), ("I", "pick"), ("P", "paint"), ("H", "view")):
             sc(key, cur(lambda c, t=tool: c.choose_tool(t)))
         sc("T", cur(lambda c: c.add_text_layer()), "Text box")
+        # layer order (which overlay / text box is above which)
+        sc("Ctrl+Alt+Up", cur(lambda c: c.order_selected(1)), "Layer up")
+        sc("Ctrl+Alt+Down", cur(lambda c: c.order_selected(-1)), "Layer down")
+        sc("Ctrl+Alt+Shift+Up", cur(lambda c: c.order_selected(1, True)), "Layer to front")
+        sc("Ctrl+Alt+Shift+Down", cur(lambda c: c.order_selected(-1, True)), "Layer to back")
         # zoom
         sc("Ctrl+0", cur(lambda c: c.canvas.fit()), "Fit to window")
         sc("Ctrl+1", cur(lambda c: c.canvas.zoom_to(1.0 / max(c.scale, 1e-6))), "Actual size")

@@ -2500,7 +2500,10 @@ class Card(QWidget):
             self.leave_layer(self.add_text_layer)
             return
         self._layer_seq += 1
-        layer = textbox.new_layer(self._layer_seq, textbox.new_style(), self.base.size)
+        nums = [int(l["name"][9:]) for l in self.layers
+                if l.get("text") is not None and l["name"].startswith("Text box ") and l["name"][9:].isdigit()]
+        layer = textbox.new_layer(self._layer_seq, textbox.new_style(), self.base.size,
+                                  name="Text box %d" % (max(nums, default=0) + 1))
         self._checkpoint("Text box")
         self.layers = self.layers + [layer]
         self.ops += 1
@@ -2534,6 +2537,12 @@ class Card(QWidget):
         if l is None:
             return
         fw = QApplication.focusWidget()
+        if "text" not in patch and self._inline_lid == l["id"]:
+            # A style (color, size, font, shadow ...) was changed in the side panel while the editor on the page is open:
+            # the editor can only show plain text, so close it and show the real picture of the text at once.
+            self._inline_end()
+            if fw is not None:
+                fw.setFocus()
         if not (self._tool == "transform" and self._place_id == l["id"]):
             self.place_layer_tool(l["id"])                           # show the box again (it was put down)
             if fw is not None:
@@ -2780,6 +2789,30 @@ class Card(QWidget):
         self._touch()
         self._timer.start()
         self._refresh_layers_ui()
+
+    def move_layer_to(self, lid, front):
+        """Bring a layer to the very top (front=True) or send it to the bottom, just above the main picture."""
+        i = next((k for k, l in enumerate(self.layers) if l["id"] == lid), None)
+        if i is None or (front and i == len(self.layers) - 1) or (not front and i == 0):
+            return
+        self._checkpoint()
+        ls = list(self.layers)
+        l = ls.pop(i)
+        ls = ls + [l] if front else [l] + ls
+        self.layers = ls
+        self._touch()
+        self._timer.start()
+        self._refresh_layers_ui()
+
+    def order_selected(self, d, extreme=False):
+        """Keyboard: move the selected layer up (d > 0) / down (d < 0); extreme = all the way."""
+        lid = self.sel_layer
+        if lid is None or self._layer(lid) is None or self.ctx is not None:
+            return
+        if extreme:
+            self.move_layer_to(lid, d > 0)
+        else:
+            self.move_layer_order(lid, 1 if d > 0 else -1)
 
     def toggle_layer(self, lid, visible):
         self._checkpoint()
@@ -3067,7 +3100,14 @@ class Card(QWidget):
             it = self.layerBox.takeAt(0)
             if it.widget() is not None:
                 it.widget().deleteLater()
-        for l in reversed(self.layers):                  # top layer first
+        n_all = len(self.layers)
+        if n_all:
+            top = QLabel("\u25b2  TOP  (drawn over everything below)")
+            top.setObjectName("muted")
+            self.layerBox.addWidget(top)
+        for pos, l in enumerate(reversed(self.layers)):  # top layer first
+            idx = n_all - 1 - pos                        # 0 = lowest overlay (just above the main picture)
+            is_text = l.get("text") is not None
             row = QFrame()
             row.setObjectName("layerRow")
             v = QVBoxLayout(row)
@@ -3077,38 +3117,56 @@ class Card(QWidget):
             h1.setSpacing(6)
             eye = QCheckBox()
             eye.setChecked(l.get("visible", True))
-            eye.setToolTip("Show / hide this picture")
+            eye.setToolTip("Show / hide this layer")
             eye.toggled.connect(lambda on, i=l["id"]: self.toggle_layer(i, on))
-            nm = ("T  " if l.get("text") is not None else "") + (l["name"] if len(l["name"]) <= 24 else l["name"][:21] + "...")
+            nm = l["name"] if len(l["name"]) <= 24 else l["name"][:21] + "..."
             name = QPushButton(nm)
             name.setCheckable(True)
             name.setChecked(self.sel_layer == l["id"])
-            name.setToolTip(l["name"] + "\nClick = select this picture (a click on it on the page works too)")
+            name.setToolTip(l["name"] + "\nClick = select this layer (a click on it on the page works too)")
             name.setMinimumWidth(0)
             name.clicked.connect(lambda _=False, i=l["id"]: self.place_layer_tool(i))
             h1.addWidget(eye)
             h1.addWidget(name, 1)
             h2 = QHBoxLayout()
             h2.setSpacing(4)
-            is_text = l.get("text") is not None
             ed = QPushButton("Aa  Text" if is_text else "Edit")
             ed.setToolTip("Change the text, font, size, color ...  (double click on it works too)" if is_text else
                           "Work on this picture alone: Adjust, Shadow, Text, Select, Erase, Crop  (double click on it works too)")
             ed.setProperty("accent", self.ctx == l["id"])
             ed.clicked.connect(lambda _=False, i=l["id"]: self.edit_layer(i))
             h2.addWidget(ed, 1)
-            for text, tip, fn in (("⧉", "Duplicate (copy)  -  Alt + drag on the page copies too", lambda i=l["id"]: self.duplicate_layer(i)),
-                                  ("↑", "Bring forward", lambda i=l["id"]: self.move_layer_order(i, 1)),
-                                  ("↓", "Send backward", lambda i=l["id"]: self.move_layer_order(i, -1)),
-                                  ("✕", "Remove this picture  (Delete key)", lambda i=l["id"]: self.delete_layer(i))):
+            for text, tip, fn in (("\u29c9", "Duplicate (copy)  -  Alt + drag on the page copies too", lambda i=l["id"]: self.duplicate_layer(i)),
+                                  ("\u2715", "Remove this layer  (Delete key)", lambda i=l["id"]: self.delete_layer(i))):
                 b_ = QPushButton(text)
                 b_.setFixedWidth(30)
                 b_.setToolTip(tip)
                 b_.clicked.connect(lambda _=False, f=fn: f())
                 h2.addWidget(b_)
+            h3 = QHBoxLayout()                           # order: plain words, no guessing what the arrows mean
+            h3.setSpacing(4)
+            for text, tip, fn, off in (("\u25b2 Up", "Move this layer one step UP (over the layer above it)   Ctrl+Alt+Up",
+                                        lambda i=l["id"]: self.move_layer_order(i, 1), idx >= n_all - 1),
+                                       ("\u25bc Down", "Move this layer one step DOWN (under the layer below it)   Ctrl+Alt+Down",
+                                        lambda i=l["id"]: self.move_layer_order(i, -1), idx <= 0),
+                                       ("\u2912 Front", "Bring to the very TOP   Ctrl+Alt+Shift+Up",
+                                        lambda i=l["id"]: self.move_layer_to(i, True), idx >= n_all - 1),
+                                       ("\u2913 Back", "Send to the very BOTTOM (just above the main picture)   Ctrl+Alt+Shift+Down",
+                                        lambda i=l["id"]: self.move_layer_to(i, False), idx <= 0)):
+                b_ = QPushButton(text)
+                b_.setToolTip(tip)
+                b_.setEnabled(not off)
+                b_.setMinimumWidth(0)
+                b_.clicked.connect(lambda _=False, f=fn: f())
+                h3.addWidget(b_, 1)
             v.addLayout(h1)
             v.addLayout(h2)
+            v.addLayout(h3)
             self.layerBox.addWidget(row)
+        if n_all:
+            base_lbl = QLabel("\u25bc  Main picture  (always at the bottom)")
+            base_lbl.setObjectName("muted")
+            self.layerBox.addWidget(base_lbl)
         if not self.layers:
             self.lblLayerHint.setText("No pictures yet. Add a signature or a stamp: its background is removed and you can "
                                       "place it anywhere on the page.")

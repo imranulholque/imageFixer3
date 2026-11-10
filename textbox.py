@@ -367,7 +367,7 @@ def _grid_from(tl, w, h, ang, W, H):
     return [(p[0] / W, p[1] / H) for p in (tl, tr, bl, br)]
 
 
-def new_layer(lid, t, page_size, center=(0.5, 0.5)):
+def new_layer(lid, t, page_size, center=(0.5, 0.5), name="Text box"):
     """A new text box layer, centered on the page."""
     W, H = page_size
     rgb, a, lw, lh, u = render(t, W, H)
@@ -379,7 +379,7 @@ def new_layer(lid, t, page_size, center=(0.5, 0.5)):
         rgb, a, lw, lh, u = render(t, W, H)
         wn, hn = u * lw / W, u * lh / H
     x0, y0 = center[0] - wn / 2, center[1] - hn / 2
-    return {"id": lid, "name": _name(t), "rgb": rgb, "a": a, "src": None, "sa": None, "bg": {},
+    return {"id": lid, "name": name, "rgb": rgb, "a": a, "src": None, "sa": None, "bg": {},
             "grid": [(x0, y0), (x0 + wn, y0), (x0, y0 + hn), (x0 + wn, y0 + hn)], "n": 1, "opacity": 100,
             "visible": True, "text": dict(t), "tl": (lw, lh)}
 
@@ -406,7 +406,7 @@ def restyle(l, patch, page_size):
     anchor = (x0 + ax * (x1 - x0), y0 + ax * (y1 - y0))
     nw, nh = u * lw, u * lh
     tl = (anchor[0] - math.cos(ang) * ax * nw, anchor[1] - math.sin(ang) * ax * nw)
-    return dict(l, name=_name(t), rgb=rgb, a=a, text=t, tl=(lw, lh), n=1, grid=_grid_from(tl, nw, nh, ang, W, H))
+    return dict(l, rgb=rgb, a=a, text=t, tl=(lw, lh), n=1, grid=_grid_from(tl, nw, nh, ang, W, H))
 
 
 def refit(l, page_size):
