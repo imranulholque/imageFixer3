@@ -27,6 +27,9 @@ jobs:
       - name: Updater test
         continue-on-error: true
         run: python test_updater.py
+      - name: Undo-on-disk test
+        continue-on-error: true
+        run: python test_spill.py
       # Opens the real window invisibly and clicks through the main features.
       # If something is wrong the log shows exactly where; the exe is still built.
       - name: Self test
