@@ -151,6 +151,10 @@ QFrame#dropzone { border: 2px dashed #3a4363; border-radius: 26px; background: #
 QListWidget#strip { background: #0a0c10; border: none; outline: 0; }
 QListWidget#strip::item { color: #8d95a8; border: 1px solid transparent; border-radius: 10px; padding: 3px; }
 QListWidget#strip::item:hover { background: #171c28; }
+QListWidget#layers { background: #12151c; border: 1px solid #30374a; border-radius: 8px; outline: 0; padding: 4px; }
+QListWidget#layers::item { color: #d5d9e5; border: 1px solid transparent; border-radius: 8px; padding: 4px; }
+QListWidget#layers::item:hover { background: #171c28; }
+QListWidget#layers::item:selected { background: #1f2640; border: 1px solid #6366f1; color: white; }
 QListWidget#strip::item:selected { background: #1f2640; border: 1px solid #6366f1; color: white; }
 QMenu { background: #171b24; border: 1px solid #30374a; padding: 3px; border-radius: 8px; }
 QMenu::item { padding: 4px 14px 4px 10px; border-radius: 6px; }

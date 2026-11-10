@@ -68,8 +68,11 @@ KEYS
  over the thumbnails (bottom) = previous / next picture, one by one; over the side panel = scrolls the panel.
  Ctrl+S save, Ctrl+Shift+S save all edited, Ctrl+C copy picture
 
-LAYERS (Picture tab / Aa tab): the list shows the TOP layer first, the main picture is always at the bottom.
- Each layer has  Up / Down (one step), Front (very top), Back (very bottom).  Keys: Ctrl+Alt+Up / Down, Ctrl+Alt+Shift+Up / Down.
+LAYERS (own tab: "Layers", right side after Aa): one list with every overlay picture and text box, with a small picture of each.
+ DRAG a row up or down to change which one is in front (top of the list = front; the main picture is always at the bottom).
+ The tick box shows / hides a layer. Click = select it, double click = edit. Buttons below: Edit, Copy, Remove.
+ Keys: Ctrl+Alt+Up / Down (one step), Ctrl+Alt+Shift+Up / Down (to the very top / bottom).
+ Picture tab = only add a picture + its background settings. Aa tab = text settings.
  Text boxes are named "Text box 1, 2 ..." (not by their words). Changing color / size / font / shadow in the Aa tab shows on the page at once.
  Every shortcut is listed in Settings > Keyboard shortcuts...
 

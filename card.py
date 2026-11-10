@@ -9,10 +9,10 @@ import uuid
 
 import numpy as np
 from PIL import Image, ImageChops, ImageFilter, ImageOps
-from PySide6.QtCore import QMimeData, QObject, QPointF, QRectF, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QDrag, QImage, QPixmap
-from PySide6.QtWidgets import (QSplitter, QApplication, QButtonGroup, QCheckBox, QColorDialog, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QMenu,
-                               QPushButton, QScrollArea, QSizePolicy, QSlider, QStackedWidget, QToolButton,
+from PySide6.QtCore import QMimeData, QObject, QPointF, QRectF, QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QColor, QDrag, QIcon, QImage, QPixmap
+from PySide6.QtWidgets import (QSplitter, QApplication, QButtonGroup, QCheckBox, QColorDialog, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu,
+                               QAbstractItemView, QPushButton, QScrollArea, QSizePolicy, QSlider, QStackedWidget, QToolButton,
                                QVBoxLayout, QWidget)
 
 import core
@@ -599,8 +599,25 @@ def side_sync():
     return _SIDE_SYNC
 
 
+class LayerList(QListWidget):
+    """The layers list: drag a row up or down to change which layer is in front (top of the list = front)."""
+    reordered = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.setSpacing(2)
+
+    def dropEvent(self, e):
+        super().dropEvent(e)
+        self.reordered.emit()
+
+
 class Card(QWidget):
-    TAB_ADJUST, TAB_COLOR, TAB_SHADOW, TAB_TEXT, TAB_PICTURE, TAB_TEXTBOX = range(6)   # order of the side tabs
+    TAB_ADJUST, TAB_COLOR, TAB_SHADOW, TAB_TEXT, TAB_PICTURE, TAB_TEXTBOX, TAB_LAYERS = range(7)   # order of the side tabs
     SIDE_W = 350                                                                     # width of the side panel (shared, drag to change)
     NARROW_W = 720                                                                   # a narrower picture card: the panel goes UNDER the picture
     SHORT_H = 520                                                                    # a lower card: the hint line is hidden (warnings still show)
@@ -1336,7 +1353,7 @@ class Card(QWidget):
         self.tabGroup = QButtonGroup(self)
         self.tabGroup.setExclusive(True)
         self.stackPages = QStackedWidget()
-        names = ("Adjust", "Color", "Shadow", "Text", "Picture", "Aa")
+        names = ("Adjust", "Color", "Shadow", "Text", "Picture", "Aa", "Layers")
         for i, n in enumerate(names):
             b = QPushButton(n)
             b.setCheckable(True)
@@ -1345,6 +1362,8 @@ class Card(QWidget):
                 b.setToolTip("Remove a stamp or mark, Color range & fill, Picked colors")
             elif n == "Aa":
                 b.setToolTip("Text box: write Bangla / English text on the page (font, size, color, bold ...)")
+            elif n == "Layers":
+                b.setToolTip("All pictures and text boxes on the page: drag up / down to change which one is in front")
             self.tabGroup.addButton(b, i)
             tabs.addWidget(b, 1)
         self.tabGroup.button(0).setChecked(True)
@@ -1596,9 +1615,6 @@ class Card(QWidget):
         self.btnAddPic.setToolTip("Put another picture on this page. Its background is removed.\n"
                                   "Every picture is its own layer: select it, then use Adjust / Shadow / Text / Select / Erase / Crop on it alone.")
         gl.addWidget(self.btnAddPic)
-        self.layerBox = QVBoxLayout()
-        self.layerBox.setSpacing(4)
-        gl.addLayout(self.layerBox)
         self.lblLayerHint = QLabel("")
         self.lblLayerHint.setObjectName("hint")
         self.lblLayerHint.setWordWrap(True)
@@ -1656,6 +1672,43 @@ class Card(QWidget):
         pg, lay = self._page()
         self.textPanel = textbox.TextPanel(SliderRow, self._group_box)
         lay.addWidget(self.textPanel)
+        lay.addStretch(1)
+        self.stackPages.addWidget(pg)
+
+        # ---------------- Layers: every picture and text box on the page, drag to change the order
+        pg, lay = self._page()
+        g, gl = self._group_box("Layers", collapsible=False)
+        hint = QLabel("Drag a layer up or down.  The top of the list is the front.  The tick shows / hides it.")
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        gl.addWidget(hint)
+        self.layerList = LayerList()
+        self.layerList.setObjectName("layers")
+        self.layerList.setIconSize(QSize(40, 40))
+        self.layerList.setMinimumHeight(240)
+        gl.addWidget(self.layerList)
+        self.lblMainPic = QLabel("\u25bc  Main picture  (always at the bottom)")
+        self.lblMainPic.setObjectName("muted")
+        gl.addWidget(self.lblMainPic)
+        lrow = QHBoxLayout()
+        lrow.setSpacing(4)
+        self.btnLayerEdit = QPushButton("Edit")
+        self.btnLayerCopy = QPushButton("\u29c9  Copy")
+        self.btnLayerDel = QPushButton("\u2715  Remove")
+        self.btnLayerCopy.setToolTip("Duplicate the selected layer  (Alt + drag on the page copies too)")
+        self.btnLayerDel.setToolTip("Remove the selected layer  (Delete key)")
+        for b_ in (self.btnLayerEdit, self.btnLayerCopy, self.btnLayerDel):
+            b_.setMinimumWidth(0)
+            lrow.addWidget(b_, 1)
+        gl.addLayout(lrow)
+        self.btnLayerEdit.clicked.connect(lambda: self.sel_layer is not None and self.edit_layer(self.sel_layer))
+        self.btnLayerCopy.clicked.connect(lambda: self.sel_layer is not None and self.duplicate_layer(self.sel_layer))
+        self.btnLayerDel.clicked.connect(lambda: self.sel_layer is not None and self.delete_layer(self.sel_layer))
+        self.layerList.itemClicked.connect(self._layer_list_clicked)
+        self.layerList.itemDoubleClicked.connect(lambda it: QTimer.singleShot(0, lambda: self.edit_layer(it.data(Qt.ItemDataRole.UserRole))))
+        self.layerList.itemChanged.connect(self._layer_list_checked)
+        self.layerList.reordered.connect(self._layer_list_reordered)
+        lay.addWidget(g)
         lay.addStretch(1)
         self.stackPages.addWidget(pg)
 
@@ -3093,80 +3146,88 @@ class Card(QWidget):
             self.message.emit("Background problem: " + msg.splitlines()[0])
         run_background(work, done, fail)
 
-    def _refresh_layers_ui(self):
-        if not hasattr(self, "layerBox"):
+    # ---- the Layers tab
+    _skip_click = False
+    _icon_cache = None
+
+    def _layer_icon(self, l):
+        """A small picture of the layer for the list (kept until the layer changes)."""
+        if self._icon_cache is None:
+            self._icon_cache = {}
+        key = (l["id"], id(l["rgb"]), id(l["a"]), l.get("opacity", 100))
+        hit = self._icon_cache.get(key)
+        if hit is not None:
+            return hit[2]
+        rgba = core.layer_rgba(l, pend=False)
+        rgba.thumbnail((80, 80))
+        bg = Image.new("RGBA", rgba.size, (205, 209, 219, 255))
+        bg.alpha_composite(rgba.convert("RGBA"))
+        arr = np.ascontiguousarray(np.asarray(bg))
+        qi = QImage(arr.data, arr.shape[1], arr.shape[0], arr.shape[1] * 4, QImage.Format.Format_RGBA8888).copy()
+        icon = QIcon(QPixmap.fromImage(qi))
+        self._icon_cache[key] = (l["rgb"], l["a"], icon)
+        return icon
+
+    def _fill_layer_list(self):
+        lw = self.layerList
+        lw.blockSignals(True)
+        lw.clear()
+        keep = {}
+        flags = (Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsDragEnabled
+                 | Qt.ItemFlag.ItemIsUserCheckable)
+        for l in reversed(self.layers):                          # top layer first
+            icon = self._layer_icon(l)
+            keep[(l["id"], id(l["rgb"]), id(l["a"]), l.get("opacity", 100))] = self._icon_cache[
+                (l["id"], id(l["rgb"]), id(l["a"]), l.get("opacity", 100))]
+            it = QListWidgetItem(icon, l["name"])
+            it.setData(Qt.ItemDataRole.UserRole, l["id"])
+            it.setFlags(flags)
+            it.setCheckState(Qt.CheckState.Checked if l.get("visible", True) else Qt.CheckState.Unchecked)
+            it.setToolTip(l["name"] + "\nClick = select.  Drag = change the order.  Double click = edit.")
+            lw.addItem(it)
+            if l["id"] == self.sel_layer:
+                lw.setCurrentItem(it)
+        self._icon_cache = keep
+        if self.sel_layer is None or self._layer(self.sel_layer) is None:
+            lw.clearSelection()
+        lw.setEnabled(self.ctx is None)
+        lw.blockSignals(False)
+        l = None if self.sel_layer is None else self._layer(self.sel_layer)
+        on = l is not None and self.ctx is None
+        is_text = l is not None and l.get("text") is not None
+        self.btnLayerEdit.setText("Aa  Edit text" if is_text else "Edit picture")
+        for b_ in (self.btnLayerEdit, self.btnLayerCopy, self.btnLayerDel):
+            b_.setEnabled(on)
+
+    def _layer_list_clicked(self, it):
+        if self._skip_click:                                      # it was a click on the tick box: only show / hide
+            self._skip_click = False
             return
-        while self.layerBox.count():
-            it = self.layerBox.takeAt(0)
-            if it.widget() is not None:
-                it.widget().deleteLater()
-        n_all = len(self.layers)
-        if n_all:
-            top = QLabel("\u25b2  TOP  (drawn over everything below)")
-            top.setObjectName("muted")
-            self.layerBox.addWidget(top)
-        for pos, l in enumerate(reversed(self.layers)):  # top layer first
-            idx = n_all - 1 - pos                        # 0 = lowest overlay (just above the main picture)
-            is_text = l.get("text") is not None
-            row = QFrame()
-            row.setObjectName("layerRow")
-            v = QVBoxLayout(row)
-            v.setContentsMargins(0, 0, 0, 2)
-            v.setSpacing(3)
-            h1 = QHBoxLayout()
-            h1.setSpacing(6)
-            eye = QCheckBox()
-            eye.setChecked(l.get("visible", True))
-            eye.setToolTip("Show / hide this layer")
-            eye.toggled.connect(lambda on, i=l["id"]: self.toggle_layer(i, on))
-            nm = l["name"] if len(l["name"]) <= 24 else l["name"][:21] + "..."
-            name = QPushButton(nm)
-            name.setCheckable(True)
-            name.setChecked(self.sel_layer == l["id"])
-            name.setToolTip(l["name"] + "\nClick = select this layer (a click on it on the page works too)")
-            name.setMinimumWidth(0)
-            name.clicked.connect(lambda _=False, i=l["id"]: self.place_layer_tool(i))
-            h1.addWidget(eye)
-            h1.addWidget(name, 1)
-            h2 = QHBoxLayout()
-            h2.setSpacing(4)
-            ed = QPushButton("Aa  Text" if is_text else "Edit")
-            ed.setToolTip("Change the text, font, size, color ...  (double click on it works too)" if is_text else
-                          "Work on this picture alone: Adjust, Shadow, Text, Select, Erase, Crop  (double click on it works too)")
-            ed.setProperty("accent", self.ctx == l["id"])
-            ed.clicked.connect(lambda _=False, i=l["id"]: self.edit_layer(i))
-            h2.addWidget(ed, 1)
-            for text, tip, fn in (("\u29c9", "Duplicate (copy)  -  Alt + drag on the page copies too", lambda i=l["id"]: self.duplicate_layer(i)),
-                                  ("\u2715", "Remove this layer  (Delete key)", lambda i=l["id"]: self.delete_layer(i))):
-                b_ = QPushButton(text)
-                b_.setFixedWidth(30)
-                b_.setToolTip(tip)
-                b_.clicked.connect(lambda _=False, f=fn: f())
-                h2.addWidget(b_)
-            h3 = QHBoxLayout()                           # order: plain words, no guessing what the arrows mean
-            h3.setSpacing(4)
-            for text, tip, fn, off in (("\u25b2 Up", "Move this layer one step UP (over the layer above it)   Ctrl+Alt+Up",
-                                        lambda i=l["id"]: self.move_layer_order(i, 1), idx >= n_all - 1),
-                                       ("\u25bc Down", "Move this layer one step DOWN (under the layer below it)   Ctrl+Alt+Down",
-                                        lambda i=l["id"]: self.move_layer_order(i, -1), idx <= 0),
-                                       ("\u2912 Front", "Bring to the very TOP   Ctrl+Alt+Shift+Up",
-                                        lambda i=l["id"]: self.move_layer_to(i, True), idx >= n_all - 1),
-                                       ("\u2913 Back", "Send to the very BOTTOM (just above the main picture)   Ctrl+Alt+Shift+Down",
-                                        lambda i=l["id"]: self.move_layer_to(i, False), idx <= 0)):
-                b_ = QPushButton(text)
-                b_.setToolTip(tip)
-                b_.setEnabled(not off)
-                b_.setMinimumWidth(0)
-                b_.clicked.connect(lambda _=False, f=fn: f())
-                h3.addWidget(b_, 1)
-            v.addLayout(h1)
-            v.addLayout(h2)
-            v.addLayout(h3)
-            self.layerBox.addWidget(row)
-        if n_all:
-            base_lbl = QLabel("\u25bc  Main picture  (always at the bottom)")
-            base_lbl.setObjectName("muted")
-            self.layerBox.addWidget(base_lbl)
+        lid = it.data(Qt.ItemDataRole.UserRole)
+        QTimer.singleShot(0, lambda: self._layer(lid) is not None and self.place_layer_tool(lid))
+
+    def _layer_list_checked(self, it):
+        self._skip_click = True
+        self.toggle_layer(it.data(Qt.ItemDataRole.UserRole), it.checkState() == Qt.CheckState.Checked)
+
+    def _layer_list_reordered(self):
+        lw = self.layerList
+        ids = [lw.item(i).data(Qt.ItemDataRole.UserRole) for i in range(lw.count())]       # top first
+        by = {l["id"]: l for l in self.layers}
+        new = [by[i] for i in reversed(ids) if i in by]
+        if len(new) == len(self.layers) and [l["id"] for l in new] != [l["id"] for l in self.layers]:
+            self._checkpoint()
+            self.layers = new
+            self.ops += 1
+            self._touch()
+            self._timer.start()
+        QTimer.singleShot(0, self._refresh_layers_ui)
+
+    def _refresh_layers_ui(self):
+        if not hasattr(self, "layerList"):
+            return
+        self._skip_click = False
+        self._fill_layer_list()
         if not self.layers:
             self.lblLayerHint.setText("No pictures yet. Add a signature or a stamp: its background is removed and you can "
                                       "place it anywhere on the page.")
@@ -3174,8 +3235,8 @@ class Card(QWidget):
             self.lblLayerHint.setText("Editing one picture alone. Everything you do now changes only this picture.")
         else:
             self.lblLayerHint.setText("Click a picture on the page to select it: drag = move, handles = resize / rotate / bend, "
-                                      "R = turn 90°, Delete = remove, click outside = done.  Edit = work on it alone "
-                                      "(Adjust, Shadow, Text, Select, Erase, Crop).")
+                                      "R = turn 90°, Delete = remove, click outside = done.  To change which one is in front "
+                                      "use the Layers tab.")
         self.btnLayerDone.setVisible(self.ctx is not None)
         l = None if self.sel_layer is None else self._layer(self.sel_layer)
         self.bgGroup.setEnabled(self.ctx is None and l is not None and l.get("text") is None)
