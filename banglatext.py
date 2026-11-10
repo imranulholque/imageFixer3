@@ -242,3 +242,76 @@ def is_bijoy_font(family):
 
 def has_bangla(text):
     return any("\u0980" <= c <= "\u09ff" for c in text)
+
+
+# ============================================================================================ Bangla / English runs
+# Like MS Word: Bangla letters use the Bangla font, English letters use an English font, automatically.  A Bijoy (ANSI)
+# font draws every English letter as a Bangla glyph, so English text must never be drawn with it.
+def _is_bn(c):
+    return "\u0980" <= c <= "\u09ff" or c in "\u0964\u0965"          # Bangla block + danda / double danda
+
+
+def _is_neutral(c):
+    """Spaces, zero-width joiners and punctuation take the script of the text next to them."""
+    if c in "\u200c\u200d":
+        return True
+    if c.isspace():
+        return True
+    return (not c.isalnum()) and ord(c) < 0x2c00 and not _is_bn(c)
+
+
+def split_scripts(text):
+    """text -> [("bn" | "lat", piece), ...] (pieces in order; joined they give the text again).
+    Bangla letters are "bn"; everything else is "lat" (English, digits, ...); spaces and punctuation go with the
+    text before them (or after, at the very start)."""
+    kinds = []
+    for c in text:
+        kinds.append("n" if _is_neutral(c) else ("bn" if _is_bn(c) else "lat"))
+    prev = None
+    for i, k in enumerate(kinds):                    # neutral takes the script before it
+        if k == "n":
+            kinds[i] = prev
+        else:
+            prev = k
+    nxt = None
+    for i in range(len(kinds) - 1, -1, -1):          # ... or after it, at the start of the text
+        if kinds[i] is None:
+            kinds[i] = nxt
+        else:
+            nxt = kinds[i]
+    out = []
+    for c, k in zip(text, kinds):
+        k = k or "lat"
+        if out and out[-1][0] == k:
+            out[-1][1].append(c)
+        else:
+            out.append([k, [c]])
+    return [(k, "".join(p)) for k, p in out]
+
+
+def utf16_len(s):
+    """Length in UTF-16 units (the unit Qt uses for text positions)."""
+    return len(s) + sum(1 for c in s if ord(c) > 0xFFFF)
+
+
+def layout_runs(text, ansi, bangla_family, latin_family):
+    """Text of a text box -> (text to draw, [(start, end, family), ...]) with Qt (UTF-16) positions.
+
+    Bangla letters get bangla_family, everything else latin_family.  With ansi (Bijoy font) only the Bangla pieces are
+    converted to Bijoy code, English pieces stay English.  Text without any Bangla letter is left alone when ansi is
+    on: it may be typed with a Bijoy keyboard (Avwg = আমি), which the Bijoy font shows as Bangla - runs = [] then."""
+    if ansi and not has_bangla(text):
+        return text, []
+    out, runs, pos = [], [], 0
+    for kind, piece in split_scripts(text):
+        if kind == "bn":
+            if ansi:
+                piece = unicode_to_bijoy(piece)
+            fam = bangla_family
+        else:
+            fam = latin_family
+        n = utf16_len(piece)
+        out.append(piece)
+        runs.append((pos, pos + n, fam))
+        pos += n
+    return "".join(out), runs

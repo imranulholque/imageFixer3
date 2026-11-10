@@ -705,6 +705,10 @@ class Card(QWidget):
         self._shadow_timer.setSingleShot(True)
         self._shadow_timer.setInterval(450)
         self._shadow_timer.timeout.connect(lambda: self._auto_shadow(live=True))
+        self._type_timer = QTimer(self)            # typing in a text box: make the picture of the text a moment after the last key
+        self._type_timer.setSingleShot(True)
+        self._type_timer.setInterval(180)
+        self._type_timer.timeout.connect(self._inline_flush)
         self._vertical = None                      # panel under (True) / beside (False) the picture; None = not placed yet
         self._panel_shown = None
         self._short = False
@@ -1958,7 +1962,7 @@ class Card(QWidget):
         self._drop_temp_files()
         if self._cmp is not None:
             self._compare_off()
-        for t in ("_timer", "_focus_timer", "_gest_timer", "_bg_timer", "_shadow_timer"):
+        for t in ("_timer", "_focus_timer", "_gest_timer", "_bg_timer", "_shadow_timer", "_type_timer"):
             tm = getattr(self, t, None)
             if tm is not None:
                 tm.stop()
@@ -2189,6 +2193,7 @@ class Card(QWidget):
 
     def render_args(self):
         """A snapshot of everything needed to produce the final picture (safe to use in a worker thread)."""
+        self._inline_flush()                                   # text typed a moment ago is in the picture
         self.ensure_loaded()
         layers = self._layers_now()
         if self.ctx is not None and self._stash is not None:          # a layer is open: the result is still the whole page
@@ -2496,6 +2501,8 @@ class Card(QWidget):
         self._refresh_layers_ui()
 
     def _text_changed(self, patch):
+        if self._text_pending and "text" not in patch:
+            self._inline_flush()                                     # typing that is still waiting: make it first
         l = self._text_layer()
         if l is None:
             return
@@ -2616,8 +2623,23 @@ class Card(QWidget):
         ed.look(l["text"], w / lw)
         ed.setGeometry(int(cx - w / 2), int(cy - h / 2), max(24, int(w) + 2), max(24, int(h) + 2))
 
+    _text_pending = False
+
     def _inline_typed(self):
-        l = self._layer(self._inline_lid) if self._inline_lid is not None else None
+        """A key was typed on the page.  The picture of the text is heavy to make (font shaping, 2x bitmap, effects), so it
+        is made once, a moment after the last key - not for every key (that made the program hang while typing)."""
+        if self._inline_lid is None or self._inline is None:
+            return
+        self._text_pending = True
+        self._type_timer.start()
+
+    def _inline_flush(self):
+        """Make the picture of the typed text now, if some typing is waiting for it."""
+        self._type_timer.stop()
+        if not self._text_pending:
+            return
+        self._text_pending = False
+        l = self._layer(self._inline_lid) if self._inline_lid is not None and self._inline is not None else None
         if l is not None:
             self._text_changed({"text": self._inline.toPlainText()})
 
@@ -2625,6 +2647,7 @@ class Card(QWidget):
         lid, ed = self._inline_lid, self._inline
         if lid is None:
             return
+        self._inline_flush()                                              # the last keys are not lost
         self._inline_lid = None
         if ed is not None:
             ed.hide()

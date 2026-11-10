@@ -16,9 +16,9 @@ import os
 import sys
 
 from PIL import Image, ImageFilter
-from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QRectF, QSettings, Qt, Signal
-from PySide6.QtGui import (QBrush, QColor, QFont, QFontDatabase, QImage, QPainter, QPen, QTextBlockFormat,
-                           QTextCharFormat, QTextCursor, QTextDocument)
+from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QRectF, QSettings, Qt, QTimer, Signal
+from PySide6.QtGui import (QBrush, QColor, QFont, QFontDatabase, QImage, QPainter, QPen, QSyntaxHighlighter,
+                           QTextBlockFormat, QTextCharFormat, QTextCursor, QTextDocument)
 from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QColorDialog, QComboBox, QDoubleSpinBox, QFileDialog,
                                QHBoxLayout, QLabel, QPlainTextEdit, QPushButton, QVBoxLayout, QWidget)
 
@@ -31,6 +31,7 @@ MAX_BITMAP = 3600          # biggest side of the picture made from the text (px)
 DEFAULT_STYLE = {
     "family": "", "size": 28.0, "color": "#111111", "bold": False, "italic": False, "underline": False,
     "strike": False, "case": "normal", "align": "left", "spacing": 0, "line": 125, "wrap": 0.0, "ansi": False,
+    "latin": "",                    # font for English letters when the main font is a Bijoy font ("" = automatic)
     "outline": False, "outline_color": "#ffffff", "outline_w": 6,
     "shadow": False, "shadow_color": "#000000", "shadow_blur": 8, "shadow_dist": 8, "shadow_op": 60,
     "hl": False, "hl_color": "#fff2a8",
@@ -52,6 +53,16 @@ ENGLISH_STYLISH = ["Impact", "Comic Sans MS", "Brush Script MT", "Segoe Script",
 
 _user_loaded = False
 _user_fams = []
+_fam_cache = None
+
+
+def _families():
+    """Set of installed font families (asked once; QFontDatabase.families() is slow with many fonts)."""
+    global _fam_cache
+    load_user_fonts()
+    if _fam_cache is None:
+        _fam_cache = set(QFontDatabase.families())
+    return _fam_cache
 
 
 def _settings():
@@ -66,6 +77,8 @@ def user_font_dirs():
 
 
 def _add_file(path):
+    global _fam_cache
+    _fam_cache = None
     fid = QFontDatabase.addApplicationFont(path)
     if fid < 0:
         return []
@@ -115,8 +128,7 @@ def add_font_file(path):
 
 def font_groups():
     """[(title, [family, ...]), ...] for the font list: Bangla and English fonts that this computer really has."""
-    load_user_fonts()
-    fams = set(QFontDatabase.families())
+    fams = _families()
     used = set()
 
     def pick(names):
@@ -135,11 +147,37 @@ def font_groups():
 
 
 def default_family():
-    fams = set(QFontDatabase.families())
+    fams = _families()
     for n in ("Nirmala UI", "Shonar Bangla", "Vrinda", "Kalpurush", "Noto Sans Bengali", "Segoe UI", "Arial"):
         if n in fams:
             return n
     return QFont().family()
+
+
+def latin_family(t):
+    """The font used for English letters when the main font is a Bijoy font (Bijoy fonts draw English as Bangla)."""
+    fams = _families()
+    want = (t.get("latin") or "").strip()
+    if want and want in fams and not banglatext.is_bijoy_font(want):
+        return want
+    for n in ("Arial", "Segoe UI", "Calibri", "Tahoma", "Verdana", "Noto Sans", "DejaVu Sans"):
+        if n in fams:
+            return n
+    return QFont().family()
+
+
+def plan(t):
+    """Text settings -> (text to draw, [(start, end, family), ...]).
+    Like MS Word, Bangla letters and English letters can have different fonts, automatically: when the font is a Bijoy
+    font (or Bijoy mode is on) English letters are drawn with an English font, never with the Bijoy font (which would
+    show them as Bangla).  Bijoy mode converts only the Bangla pieces.  Other fonts: no runs, Qt does it all."""
+    text = t["text"] if t["text"].strip() else " "
+    fam = t.get("family") or default_family()
+    ansi = bool(t.get("ansi"))
+    if not (ansi or banglatext.is_bijoy_font(fam)):
+        return text, []
+    bn = fam if ansi else default_family()           # Bijoy off: Bangla is shown with a normal Unicode Bangla font
+    return banglatext.layout_runs(text, ansi, bn, latin_family(t))
 
 
 # ---------------------------------------------------------------------------------------------- remembered style
@@ -153,6 +191,7 @@ def new_style():
                 t[k] = saved[k]
     except Exception:
         pass
+    t["ansi"] = False                       # Bijoy mode is always OFF for a new text box; only the user turns it on
     t["wrap"] = 0.0                         # a new box starts as wide as its text
     t["text"] = "Text"
     return t
@@ -160,7 +199,7 @@ def new_style():
 
 def remember_style(t):
     try:
-        _settings().setValue("text_style", json.dumps({k: t[k] for k in STYLE_KEYS if k in t}))
+        _settings().setValue("text_style", json.dumps({k: t[k] for k in STYLE_KEYS if k in t and k != "ansi"}))
     except Exception:
         pass
 
@@ -188,7 +227,7 @@ def _font(t):
     return f
 
 
-def _doc(t, text, margin, color, width=None, outline=None):
+def _doc(t, text, margin, color, width=None, outline=None, runs=None):
     doc = QTextDocument()
     doc.setDocumentMargin(float(margin))
     doc.setUseDesignMetrics(True)
@@ -202,6 +241,14 @@ def _doc(t, text, margin, color, width=None, outline=None):
         cf.setTextOutline(QPen(QColor(outline[0]), float(outline[1]), Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
                                Qt.PenJoinStyle.RoundJoin))
     cur.mergeCharFormat(cf)
+    for a, b, fam in runs or ():                        # Bangla pieces / English pieces each with their own font
+        c2 = QTextCursor(doc)
+        c2.setPosition(a)
+        c2.setPosition(b, QTextCursor.MoveMode.KeepAnchor)
+        f2 = QTextCharFormat()
+        f2.setFontFamilies([fam])
+        f2.setFontFamily(fam)
+        c2.mergeCharFormat(f2)
     bf = QTextBlockFormat()
     bf.setAlignment(_ALIGN.get(t["align"], Qt.AlignmentFlag.AlignLeft))
     bf.setLineHeight(float(t["line"]), 1)               # 1 = proportional height (percent of the normal line)
@@ -212,6 +259,14 @@ def _doc(t, text, margin, color, width=None, outline=None):
 
 
 def _to_pil(img):
+    try:                                                # fast: raw pixels (no PNG encode / decode for every keystroke)
+        im = img.convertToFormat(QImage.Format.Format_RGBA8888)
+        w, h, bpl = im.width(), im.height(), im.bytesPerLine()
+        data = bytes(im.constBits())
+        if len(data) >= bpl * h:
+            return Image.frombuffer("RGBA", (w, h), data, "raw", "RGBA", bpl, 1).convert("RGBA")
+    except Exception:
+        pass
     ba = QByteArray()
     buf = QBuffer(ba)
     buf.open(QIODevice.OpenModeFlag.WriteOnly)
@@ -245,15 +300,13 @@ def size_from_u(u, page_w, page_h):
 def render(t, page_w, page_h, u=None):
     """Text settings -> (rgb PIL, alpha PIL 'L', layout width, layout height, page px per layout unit).
     The picture is sharp: it is made about twice as big as it is shown (never smaller than the layout)."""
-    text = t["text"] if t["text"].strip() else " "
-    if t.get("ansi"):
-        text = banglatext.unicode_to_bijoy(text)
+    text, runs = plan(t)
     if u is None:
         u = u_from_size(t, page_w, page_h)
     ow = float(t["outline_w"]) if t["outline"] else 0.0
     margin = margin_of(t)
     wrap = float(t.get("wrap") or 0.0)
-    probe = _doc(t, text, margin, t["color"])
+    probe = _doc(t, text, margin, t["color"], runs=runs)
     if wrap > 0:
         width = max(wrap * page_w / u + 2.0 * margin, 8.0 * LOGICAL / 10.0)
     else:
@@ -266,8 +319,8 @@ def render(t, page_w, page_h, u=None):
 
     def draw_text(p):
         if ow > 0:
-            _doc(t, text, margin, t["outline_color"], width, (t["outline_color"], 2.0 * ow)).drawContents(p)
-        _doc(t, text, margin, t["color"], width).drawContents(p)
+            _doc(t, text, margin, t["outline_color"], width, (t["outline_color"], 2.0 * ow), runs).drawContents(p)
+        _doc(t, text, margin, t["color"], width, runs=runs).drawContents(p)
     txt = _paint(W, H, s, draw_text)
     out = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     if t["hl"]:
@@ -421,6 +474,56 @@ def margin_of(t):
     return 4.0 + ow + reach + (14.0 if t["hl"] else 0.0)
 
 
+class ScriptHighlighter(QSyntaxHighlighter):
+    """Typing boxes: Bangla letters and English letters get their own font while you type (like MS Word), so English
+    typed after switching the keyboard is never drawn with a Bijoy font.  Does nothing for a normal font."""
+
+    def __init__(self, doc):
+        super().__init__(doc)
+        self._key = None
+        self._on = False
+        self._ansi = False
+        self._has_bn = False
+        self._bn = ""
+        self._lat = ""
+        doc.contentsChanged.connect(self._content_changed)
+
+    def configure(self, t):
+        ansi = bool(t.get("ansi"))
+        on = ansi or banglatext.is_bijoy_font(t.get("family"))
+        key = (on, ansi, default_family() if on else "", latin_family(t) if on else "")
+        if key == self._key:
+            return
+        self._key = key
+        self._on, self._ansi = on, ansi
+        self._bn, self._lat = key[2], key[3]            # the box shows Unicode text: Bangla with a Unicode Bangla font
+        self._has_bn = banglatext.has_bangla(self.document().toPlainText())
+        self.rehighlight()
+
+    def _content_changed(self):
+        if not self._on:
+            return
+        hb = banglatext.has_bangla(self.document().toPlainText())
+        if hb != self._has_bn:                           # Bijoy-code text <-> Unicode Bangla text: look at all lines again
+            self._has_bn = hb
+            QTimer.singleShot(0, self.rehighlight)
+
+    def highlightBlock(self, text):
+        if not self._on or not text:
+            return
+        if self._ansi and not self._has_bn:             # text typed with a Bijoy keyboard: the Bijoy font shows it as it is
+            return
+        pos = 0
+        for kind, piece in banglatext.split_scripts(text):
+            n = banglatext.utf16_len(piece)
+            fam = self._bn if kind == "bn" else self._lat
+            f = QTextCharFormat()
+            f.setFontFamilies([fam])
+            f.setFontFamily(fam)
+            self.setFormat(pos, n, f)
+            pos += n
+
+
 class InlineEdit(QPlainTextEdit):
     """The editor that sits right on the page over the text box (like a Word text box): you type on the picture itself.
     It only shows the text while it is being edited; the finished picture of the text replaces it afterwards."""
@@ -430,6 +533,7 @@ class InlineEdit(QPlainTextEdit):
         super().__init__(parent)
         self._css = ""
         self._doc_key = None
+        self._hl = ScriptHighlighter(self.document())
         self.setFrameStyle(0)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -456,6 +560,7 @@ class InlineEdit(QPlainTextEdit):
         if css != self._css:
             self._css = css
             self.setStyleSheet(css)
+        self._hl.configure(t)
         key = (round(margin_of(t) * scale, 2), t["align"])
         if key != self._doc_key:
             self._doc_key = key
@@ -504,6 +609,8 @@ class TextPanel(QWidget):
         self.edit.setMaximumHeight(170)
         self.edit.setPlaceholderText("Type here ...  বাংলা / English")
         self.edit.setTabChangesFocus(True)
+        self._hl = ScriptHighlighter(self.edit.document())
+        self._cur_latin = ""
         self._edit_font("")
         bl.addWidget(self.edit)
         hint = QLabel("Tip: double-click the text box on the page and type right there, like in Word.  "
@@ -525,8 +632,8 @@ class TextPanel(QWidget):
         self.btnAddFont.setToolTip("Choose any .ttf / .otf font (Bangla Unicode, Bijoy, English ...). It is remembered.\n"
                                    "Or copy fonts into the 'fonts' folder next to ImageFixer.exe: they load at every start.")
         self.chkAnsi = QCheckBox("Bijoy (ANSI) font")
-        self.chkAnsi.setToolTip("Tick when the chosen font is an old Bijoy font (SutonnyMJ ...). Found by name; tick it by hand\n"
-                                "for a Bijoy font with another name.")
+        self.chkAnsi.setToolTip("Always OFF until you tick it.  Tick it when you want the Bangla text drawn with an old Bijoy font\n"
+                                "(SutonnyMJ ...).  English letters always keep a normal English font, like in MS Word.")
         r.addWidget(self.btnAddFont, 1)
         r.addWidget(self.chkAnsi)
         gl.addLayout(r)
@@ -637,7 +744,7 @@ class TextPanel(QWidget):
         e = self._emit
         self.edit.textChanged.connect(lambda: e(text=self.edit.toPlainText()))
         self.cmbFont.currentIndexChanged.connect(self._font_picked)
-        self.chkAnsi.toggled.connect(lambda on: e(ansi=bool(on)))
+        self.chkAnsi.toggled.connect(self._ansi_toggled)
         self.spSize.valueChanged.connect(lambda v: e(size=float(v)))
         self.btnB.toggled.connect(lambda on: e(bold=bool(on)))
         self.btnI.toggled.connect(lambda on: e(italic=bool(on)))
@@ -701,18 +808,26 @@ class TextPanel(QWidget):
         fam = self.cmbFont.itemData(i)
         if not fam or self._loading:
             return
-        ansi = banglatext.is_bijoy_font(fam)
+        ansi = bool(self.chkAnsi.isChecked()) and banglatext.is_bijoy_font(fam)   # picking a font never turns Bijoy ON
         self.chkAnsi.blockSignals(True)
         self.chkAnsi.setChecked(ansi)
         self.chkAnsi.blockSignals(False)
         self._edit_font(fam)
         self.changed.emit({"family": fam, "ansi": ansi})
 
+    def _ansi_toggled(self, on):
+        if not self._loading:
+            self._edit_font(self.cmbFont.currentData() or "")
+        self._emit(ansi=bool(on))
+
     def _edit_font(self, fam):
         """The typing box shows the text in the chosen font (a Bijoy font shows Bijoy code as Bangla)."""
         fam = (fam or "").replace("'", "").replace('"', "")
         self.edit.setStyleSheet("QPlainTextEdit { background: #1a1f2b; border: 1px solid #30374a; border-radius: 8px; "
                                 "padding: 6px; %s font-size: 16px; }" % ("font-family: '%s';" % fam if fam else ""))
+        ck = getattr(self, "chkAnsi", None)
+        self._hl.configure({"family": fam, "ansi": bool(ck.isChecked()) if ck is not None else False,
+                            "latin": self._cur_latin})
 
     def _add_font(self):
         files, _ = QFileDialog.getOpenFileNames(self.window(), "Add a font", "", "Fonts (*.ttf *.otf *.ttc)")
@@ -751,8 +866,9 @@ class TextPanel(QWidget):
             fam = t.get("family") or default_family()
             if self.cmbFont.currentData() != fam:
                 self._select_font(fam)
-            self._edit_font(fam)
+            self._cur_latin = t.get("latin") or ""
             self.chkAnsi.setChecked(bool(t["ansi"]))
+            self._edit_font(fam)
             self.spSize.setValue(float(t["size"]))
             for b, k in ((self.btnB, "bold"), (self.btnI, "italic"), (self.btnU, "underline"), (self.btnS, "strike")):
                 b.setChecked(bool(t[k]))

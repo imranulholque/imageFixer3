@@ -485,6 +485,21 @@ def t_textbox():
     out = c.result_image()
     assert out.size == c.base.size
     c.undo_step()
+    # Bijoy mode is off for every new text box; English never uses a Bijoy font (Bangla / English runs like MS Word)
+    import textbox
+    assert textbox.new_style()["ansi"] is False, "Bijoy mode starts OFF"
+    t = dict(textbox.new_style(), text="Hello \u0986\u09ae\u09bf", family="SutonnyMJ", ansi=False)
+    txt, runs = textbox.plan(t)
+    assert txt == t["text"] and len(runs) == 2 and runs[0][2] != "SutonnyMJ", "English is not drawn with the Bijoy font"
+    assert textbox.render(t, 800, 600)[0].size[0] > 4
+    t["ansi"] = True
+    assert textbox.plan(t)[0].startswith("Hello "), "Bijoy mode converts only the Bangla letters"
+    # typing is not drawn key by key: it waits a moment, and is never lost
+    c._inline_start(lid)
+    c._inline.setPlainText("one"); c._inline.setPlainText("one two")
+    assert c._text_pending, "typing waits for the timer"
+    c._inline_flush()
+    assert c._layer(lid)["text"]["text"] == "one two" and not c._text_pending
 step("text box: add, Bangla text, styles, duplicate, render", t_textbox)
 
 

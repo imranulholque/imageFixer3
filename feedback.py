@@ -15,6 +15,11 @@ from PySide6.QtGui import (QBrush, QColor, QCursor, QFont, QFontMetrics, QLinear
                            QPen, QPixmap, QPolygonF)
 from PySide6.QtWidgets import QPushButton, QToolButton, QWidget
 
+# False = no text messages for every change (toast pill, shortcut chip).  A light animation on the picture shows that
+# the work was done instead.  Warnings and errors are still shown as text.  Set to True for the old behaviour.
+SHOW_MESSAGES = False
+_NO_ANIM = {"tool", "view", "zoom", "info", "warn", "fail", "compare", "undo", "redo"}   # nothing changed on the picture
+
 COLORS = {
     "copy": "#a78bfa", "move": "#60a5fa", "resize": "#818cf8", "rotate": "#e879f9", "erase": "#fb7185",
     "delete": "#f87171", "fill": "#fbbf24", "paint": "#f472b6", "select": "#22d3ee", "crop": "#fbbf24",
@@ -616,16 +621,39 @@ class Effects:
 
     # -- toasts / keys
     def busy(self, kind, title):
-        self.toast.busy(kind, title)
+        if SHOW_MESSAGES:
+            self.toast.busy(kind, title)
 
     def cancel_busy(self):
         self.toast.cancel_busy()
 
     def done(self, kind, title, detail=""):
-        self.toast.done(kind, title, detail)
+        if SHOW_MESSAGES:
+            self.toast.done(kind, title, detail)
+        else:
+            self._soft(kind)
 
     def info(self, kind, title, detail=""):
-        self.toast.info(kind, title, detail)
+        if SHOW_MESSAGES:
+            self.toast.info(kind, title, detail)
+        else:
+            self._soft(kind)
+
+    def _soft(self, kind):
+        """No message: a soft flash over the picture says 'done'.  A specific effect (pulse / sweep on the changed area)
+        that comes a moment before or after takes its place, so nothing flashes twice."""
+        if kind in _NO_ANIM:
+            return
+        t_call = time.monotonic()
+        QTimer.singleShot(60, lambda: self._soft_now(kind, t_call))
+
+    def _soft_now(self, kind, t_call):
+        try:
+            if any(it["t0"] > t_call - 0.35 for it in self._items):
+                return
+            self.pulse(kind, None)
+        except RuntimeError:                       # the picture was closed meanwhile
+            pass
 
     def warn(self, title, detail=""):
         self.toast.info("warn", title, detail, life=3.8)
@@ -634,7 +662,8 @@ class Effects:
         self.toast.fail(title, detail)
 
     def key(self, keys, label):
-        self.keychip.show_keys(keys, label)
+        if SHOW_MESSAGES:
+            self.keychip.show_keys(keys, label)
 
     # -- effects on the picture (coordinates: preview pixels = the same as the selection mask)
     def pulse(self, kind, rect=None, effect="pulse", dur=0.75):

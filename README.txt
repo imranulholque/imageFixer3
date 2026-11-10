@@ -120,6 +120,8 @@ NEW (round 5)
 - Undo during a Transform steps back inside it and finally cancels it (untransform).
 
 NEW (round 6): you SEE that everything works
+- UPDATE: no text message for every change any more (toast / shortcut chip).  A light flash over the changed area shows that the
+  work was done.  Warnings and errors still show text.  To get the old toasts back: feedback.py > SHOW_MESSAGES = True.
 - Toast at the bottom of the picture for every action: a ring turns while the work runs, then it closes and a green tick pops up
   (Copied, Moved, Erased, Deleted, Cropped, Rotated, Selected, Saved ...), with the details (how many px, which direction).
 - Changed area flashes: a wave around what was moved / copied / selected / painted, a light sweep over what was erased or deleted,
@@ -171,6 +173,12 @@ TEXT BOX  (Aa tab, or the "T  Text box" button in the top bar)
 - Bijoy (ANSI) fonts such as SutonnyMJ work: text typed with a Bijoy keyboard (Avwg evsjvq) is shown as it is; Unicode Bangla is
   converted for the font automatically.  "Bijoy code -> Unicode" turns pasted Bijoy text into real Bangla.  Conjuncts that are not in
   the built-in table are written with a visible hasant (&).
+- Bangla + English like MS Word: Bangla letters and English letters get their own font automatically.  With a Bijoy font (SutonnyMJ ...)
+  English letters are drawn with an English font (Arial ...), so switching the keyboard to English never gives Bangla shapes.
+  "Bijoy (ANSI) font" is OFF for every new text box and for every font you pick; only you turn it on (it is not remembered).
+  With it on, only the Bangla letters are converted to Bijoy; English stays English.  Text with no Bangla letter at all is
+  treated as typed with a Bijoy keyboard (Avwg = আমি) and shown as it is.
+- Typing is smooth: the picture of the text is made a moment (0.2 s) after the last key, not for every key.
 - Look: size (pt, as on A4), Bold / Italic / Underline / Strike, UPPERCASE / lowercase / Small caps / Capitalize, Left / Center /
   Right / Justify, text color, opacity, letter spacing, line spacing, box width (wrapping), outline, shadow and a highlight box.
   The last look you used is used for the next new text box.
