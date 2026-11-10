@@ -1173,6 +1173,7 @@ class Card(QWidget):
         self.btnClone.clicked.connect(self._clear_clone)
         self.canvas.pickRequested.connect(self._on_pick)
         self.canvas.zoomChanged.connect(lambda z: self.lblZoom.setText("%d%%" % round(z * self.scale * 100)))
+        self.canvas.zoomChanged.connect(lambda z: self._inline_place())
         self.canvas.applyRequested.connect(self.apply_pending)
         self.canvas.cancelRequested.connect(self.cancel_pending)
         self.canvas.eraseFinished.connect(self._on_erase)
@@ -2323,6 +2324,7 @@ class Card(QWidget):
         self._job("Undo / redo", work, done)
 
     def undo_step(self):
+        self._inline_end()
         if not self._loaded:
             return
         if self._tool == "transform" and self.canvas.in_transform():       # a transform is running: undo goes back inside it
@@ -2351,6 +2353,7 @@ class Card(QWidget):
         fx.pulse("undo")
 
     def redo_step(self):
+        self._inline_end()
         if not self._loaded:
             return
         if self._gest:
@@ -2473,8 +2476,8 @@ class Card(QWidget):
         self._touch()
         self.show_tab(self.TAB_TEXTBOX)
         self.place_layer_tool(layer["id"])
-        self.textPanel.focus_text()
-        self._notify("layer", "Text box added", "type your text in the Aa tab; drag the box, handles resize, Alt + drag copies")
+        self._inline_start(layer["id"])
+        self._notify("layer", "Text box added", "type right on the page; click outside when done.  Drag = move, handles = resize, Alt + drag = copy")
 
     def _put_text_layer(self, nl):
         lid = nl["id"]
@@ -2483,7 +2486,11 @@ class Card(QWidget):
         self._touch()
         if self._tool == "transform" and self._place_id == lid:     # the box on the page follows the typing
             PH, PW = self.prev.shape[:2]
-            self.canvas.update_layer_transform(self._layer_qimage(nl), [(x * PW, y * PH) for x, y in nl["grid"]], nl["n"])
+            img = self._layer_qimage(nl)
+            if self._inline_lid == lid:
+                img.fill(Qt.GlobalColor.transparent)               # the editor on the page shows the text meanwhile
+            self.canvas.update_layer_transform(img, [(x * PW, y * PH) for x, y in nl["grid"]], nl["n"])
+            self._inline_place()
         else:
             self._timer.start()
         self._refresh_layers_ui()
@@ -2500,6 +2507,10 @@ class Card(QWidget):
             l = self._layer(l["id"])
         self._begin_change()                                         # a burst of typing / slider moves = one undo step
         nl = textbox.restyle(l, patch, self.base.size)
+        if self._inline_lid == nl["id"] and self._inline.toPlainText() != nl["text"]["text"]:
+            self._inline.blockSignals(True)                          # text typed in the side box: show it on the page too
+            self._inline.setPlainText(nl["text"]["text"])
+            self._inline.blockSignals(False)
         self._put_text_layer(nl)
         textbox.remember_style(nl["text"])
 
@@ -2560,6 +2571,67 @@ class Card(QWidget):
         lid = self._place_id
         if lid is not None:
             self.edit_layer(lid)
+
+    # typing right on the page (like a Word text box)
+    _inline_lid = None
+    _inline = None
+
+    def _inline_start(self, lid):
+        l = self._layer(lid)
+        if l is None or l.get("text") is None or self.ctx is not None:
+            return
+        if not (self._tool == "transform" and self._place_id == lid):
+            self.place_layer_tool(lid)
+        if self._inline is None:
+            self._inline = textbox.InlineEdit(self.canvas)
+            self._inline.textChanged.connect(self._inline_typed)
+            self._inline.finished.connect(self._end_layer_session)
+        self._inline_lid = lid
+        ed = self._inline
+        ed.blockSignals(True)
+        ed.setPlainText(l["text"]["text"])
+        ed.blockSignals(False)
+        img = self._layer_qimage(l)
+        img.fill(Qt.GlobalColor.transparent)
+        PH, PW = self.prev.shape[:2]
+        self.canvas.update_layer_transform(img, [(x * PW, y * PH) for x, y in l["grid"]], l["n"])
+        self._inline_place()
+        ed.show()
+        ed.raise_()
+        ed.setFocus()
+        ed.selectAll()
+
+    def _inline_place(self):
+        """Put the editor exactly over the text box (same size, font and color as the text on the page)."""
+        lid, ed = self._inline_lid, self._inline
+        l = None if lid is None else self._layer(lid)
+        if l is None or ed is None or self.ctx is not None:
+            return
+        PH, PW = self.prev.shape[:2]
+        p = [self.canvas.to_wid(QPointF(x * PW, y * PH)) for x, y in l["grid"][:4]]    # TL TR BL BR
+        w = math.hypot(p[1].x() - p[0].x(), p[1].y() - p[0].y())
+        h = math.hypot(p[2].x() - p[0].x(), p[2].y() - p[0].y())
+        cx, cy = sum(q.x() for q in p) / 4.0, sum(q.y() for q in p) / 4.0      # (a turned box is edited upright)
+        lw = max(l["tl"][0], 1e-6)
+        ed.look(l["text"], w / lw)
+        ed.setGeometry(int(cx - w / 2), int(cy - h / 2), max(24, int(w) + 2), max(24, int(h) + 2))
+
+    def _inline_typed(self):
+        l = self._layer(self._inline_lid) if self._inline_lid is not None else None
+        if l is not None:
+            self._text_changed({"text": self._inline.toPlainText()})
+
+    def _inline_end(self):
+        lid, ed = self._inline_lid, self._inline
+        if lid is None:
+            return
+        self._inline_lid = None
+        if ed is not None:
+            ed.hide()
+        l = self._layer(lid)
+        if l is not None and self._tool == "transform" and self._place_id == lid:
+            self.canvas.set_tf_image(self._layer_qimage(l))                # the finished picture of the text
+            self.canvas.setFocus()
 
     def add_picture(self, path=None):
         """A picture (signature, stamp ...) becomes a new layer: background removed, then placed on the page."""
@@ -2626,6 +2698,7 @@ class Card(QWidget):
         self._refresh_layers_ui()
 
     def delete_layer(self, lid):
+        self._inline_end()
         if self._layer(lid) is None:
             return
         if self.ctx == lid:
@@ -2716,6 +2789,7 @@ class Card(QWidget):
                 self._refresh_layers_ui()
 
     def _end_layer_session(self):
+        self._inline_end()
         self._commit_layer_pts()
         self._place_id = None
         self._hide_layer = None
@@ -2782,7 +2856,7 @@ class Card(QWidget):
         if l.get("text") is not None:                  # a text box is changed in the Aa tab, not pixel by pixel
             self.place_layer_tool(lid)
             self.show_tab(self.TAB_TEXTBOX)
-            self.textPanel.focus_text()
+            self._inline_start(lid)
             return
         if self.ctx == lid:
             if then:
@@ -3552,6 +3626,7 @@ class Card(QWidget):
     def _set_tool(self, key):
         if not self._loaded and key != "view":
             return
+        self._inline_end()
         if key not in CROP_KEYS:
             self._auto_back = False
         if self.ctx is not None and key in ("transform", "copy"):

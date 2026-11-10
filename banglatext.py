@@ -1,136 +1,16 @@
-"""Bangla text helpers for the text box (pure Python, no Qt).
+"""Bijoy (ANSI) support for the text box (pure Python, no Qt).
 
- 1. phonetic()        English letters -> Bangla while you type (Avro style: "ami" -> আমি, "bangla" -> বাংলা).
- 2. unicode_to_bijoy  Unicode Bangla -> Bijoy (SutonnyMJ) ANSI code, for the old Bijoy fonts.
- 3. bijoy_to_unicode  Bijoy ANSI code -> Unicode Bangla.
- 4. is_bijoy_font     tells if a font family is one of the old Bijoy (ANSI) fonts.
+ unicode_to_bijoy  Unicode Bangla -> Bijoy (SutonnyMJ) ANSI code, so Unicode text can be shown with an old Bijoy font.
+ bijoy_to_unicode  Bijoy ANSI code -> Unicode Bangla.
+ is_bijoy_font     tells if a font family is one of the old Bijoy (ANSI) fonts.
 
-The Bijoy tables cover every letter, vowel sign, reph, ra-phala, ya-phala and the common conjunct glyphs listed in
-BIJOY_CONJ.  A conjunct that is not in the table is written with a visible hasant (&), which every Bijoy font has, so
-nothing is lost - it only looks less joined.
+The tables cover every letter, vowel sign, reph, ra-phala, ya-phala and the common conjunct glyphs in BIJOY_CONJ.  A conjunct
+that is not in the table is written with a visible hasant (&), which every Bijoy font has.
 """
 import re
 
-# ===================================================================================== phonetic typing (Avro style)
-# (roman, kind, value, kar)   kind: C consonant, V vowel, M mark (ং ঃ ঁ ৎ), special handled in code
-_CONS = {
-    "kkh": "ক্ষ", "GG": "জ্ঞ", "chh": "ছ",
-    "kh": "খ", "gh": "ঘ", "Ng": "ঙ", "NG": "ঞ", "ch": "ছ", "jh": "ঝ", "Th": "ঠ", "Dh": "ঢ",
-    "th": "থ", "dh": "ধ", "ph": "ফ", "bh": "ভ", "sh": "শ", "Sh": "ষ", "Rh": "\u09dd",
-    "k": "ক", "g": "গ", "c": "চ", "j": "জ", "T": "ট", "D": "ড", "N": "ণ", "t": "ত", "d": "দ", "n": "ন",
-    "p": "প", "f": "ফ", "b": "ব", "v": "ভ", "m": "ম", "z": "য", "r": "র", "l": "ল", "S": "শ", "s": "স",
-    "h": "হ", "R": "\u09dc", "q": "ক", "x": "ক্স",
-}
-_VOW = {                       # roman -> (independent, sign after a consonant)
-    "rri": ("ঋ", "ৃ"), "oi": ("ঐ", "ৈ"), "OI": ("ঐ", "ৈ"), "ou": ("ঔ", "ৌ"), "OU": ("ঔ", "ৌ"),
-    "ii": ("ঈ", "ী"), "ee": ("ঈ", "ী"), "uu": ("ঊ", "ূ"), "oo": ("ঊ", "ূ"),
-    "aa": ("আ", "া"), "a": ("আ", "া"), "i": ("ই", "ি"), "I": ("ঈ", "ী"), "u": ("উ", "ু"), "U": ("ঊ", "ূ"),
-    "e": ("এ", "ে"), "O": ("ও", "ো"),
-}
-_MARK = {"ng": "ং", "^": "ঁ", ":": "ঃ", "t``": "ৎ"}
-_BN_DIGITS = "০১২৩৪৫৬৭৮৯"
-_KEYS = sorted(set(_CONS) | set(_VOW) | set(_MARK) | {"o", "y", "w", "Z", "`"}, key=lambda k: (-len(k), k))
-_LETTERS = set("".join(_KEYS)) | set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
-
-
-def _next_token(s, i):
-    for k in _KEYS:
-        if s.startswith(k, i):
-            return k
-    return None
-
-
-def phonetic(roman, digits=True):
-    """Roman letters -> Bangla (Avro style).  Capital letters matter: T D N S R O I U Ng NG Th Dh Sh Rh.
-    o = the hidden 'o' sound (no sign: "kolom" -> কলম), O = ো ("kO" -> কো), ` = keep letters apart,
-    ng = ং, Ng = ঙ, ^ = ঁ, : = ঃ, t`` = ৎ, . = ।, y after a consonant = ্য, w after a consonant = ্ব."""
-    out = []
-    prev = None                         # None / "C" (a consonant that can still take a sign or join) / "X" (closed) / "V"
-    i, n = 0, len(roman)
-    while i < n:
-        ch = roman[i]
-        if ch in "0123456789":
-            out.append(_BN_DIGITS[int(ch)] if digits else ch)
-            prev = None
-            i += 1
-            continue
-        if ch == "." and roman[i:i + 2] == "..":
-            out.append(".")
-            prev, i = None, i + 2
-            continue
-        if ch == ".":
-            out.append("।")
-            prev, i = None, i + 1
-            continue
-        if ch == "$":
-            out.append("৳")
-            prev, i = None, i + 1
-            continue
-        tok = _next_token(roman, i)
-        if tok is None and ch.isupper():                # an unknown capital letter: use the small one
-            roman = roman[:i] + ch.lower() + roman[i + 1:]
-            continue
-        if tok is None:
-            out.append(ch)
-            prev, i = None, i + 1
-            continue
-        i += len(tok)
-        if tok == "`":                                  # closes a consonant: the next one will not join
-            prev = "X" if prev == "C" else prev
-            continue
-        if tok in _MARK:
-            out.append(_MARK[tok])
-            prev = "X"
-            continue
-        if tok == "o":
-            if prev == "C":                             # the hidden 'o': no sign, and the cluster is closed
-                prev = "X"
-            else:
-                out.append("ও" if prev == "V" else "অ")
-                prev = "V"
-            continue
-        if tok in _VOW:
-            ind, sign = _VOW[tok]
-            if prev == "C":
-                out.append(sign)
-                prev = "X"
-            else:
-                out.append(ind)
-                prev = "V"
-            continue
-        if tok == "y":
-            if prev == "C":
-                out.append("্য")
-            else:
-                out.append("\u09df")
-                prev = "C"
-            continue
-        if tok == "Z":
-            out.append("্য" if prev == "C" else "য")
-            prev = "C"
-            continue
-        if tok == "w":
-            if prev == "C":
-                out.append("্ব")
-            else:
-                out.append("ও")
-                prev = "V"
-            continue
-        c = _CONS[tok]
-        if prev == "C":
-            out.append("্")
-        out.append(c)
-        prev = "C"
-    return "".join(out)
-
-
-def phonetic_text(s, digits=True):
-    """A whole text: every run of letters is converted, spaces / punctuation / new lines stay."""
-    return "".join(phonetic(p, digits) if p and (p[0].isalnum() or p[0] in "`^:$.") and p.isascii() else p
-                   for p in re.split(r"(\s+)", s))
-
-
 # ============================================================================================== Bijoy <-> Unicode
+_BN_DIGITS = "০১২৩৪৫৬৭৮৯"
 HAS = "\u09cd"                          # hasant
 ZW = "\u200c\u200d"
 

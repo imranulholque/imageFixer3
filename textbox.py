@@ -6,6 +6,7 @@ layer as RGB + alpha.  The layer keeps the text settings in layer["text"], so th
 
   render()      text settings -> picture of the text
   new_layer() / restyle() / refit() / duplicate()   what card.py calls
+  InlineEdit    typing right on the page
   TextPanel     the side tab "Aa": text, typing mode, font, size, bold / italic / underline ..., colors, effects
 """
 import io
@@ -250,8 +251,7 @@ def render(t, page_w, page_h, u=None):
     if u is None:
         u = u_from_size(t, page_w, page_h)
     ow = float(t["outline_w"]) if t["outline"] else 0.0
-    reach = (float(t["shadow_dist"]) + 2.0 * float(t["shadow_blur"])) if t["shadow"] else 0.0
-    margin = 4.0 + ow + reach + (14.0 if t["hl"] else 0.0)
+    margin = margin_of(t)
     wrap = float(t.get("wrap") or 0.0)
     probe = _doc(t, text, margin, t["color"])
     if wrap > 0:
@@ -414,75 +414,56 @@ class _Swatch(QPushButton):
             self.colorChanged.emit(self._c)
 
 
-class TextEdit(QPlainTextEdit):
-    """The text.  In phonetic mode English letters become Bangla while you type (Avro style): the word you are typing
-    is converted again after every key, so "ami" shows আমি, and a space / punctuation closes the word."""
+def margin_of(t):
+    """The empty border (layout units) round the text inside the picture."""
+    ow = float(t["outline_w"]) if t["outline"] else 0.0
+    reach = (float(t["shadow_dist"]) + 2.0 * float(t["shadow_blur"])) if t["shadow"] else 0.0
+    return 4.0 + ow + reach + (14.0 if t["hl"] else 0.0)
+
+
+class InlineEdit(QPlainTextEdit):
+    """The editor that sits right on the page over the text box (like a Word text box): you type on the picture itself.
+    It only shows the text while it is being edited; the finished picture of the text replaces it afterwards."""
+    finished = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.phonetic = False
-        self._buf = ""
-        self._start = -1
-        self._len = 0
-        self._busy = False
-        self.cursorPositionChanged.connect(self._moved)
-
-    def _reset(self):
-        self._buf, self._start, self._len = "", -1, 0
-
-    def _moved(self):
-        if self._busy:
-            return
-        c = self.textCursor()
-        if self._start >= 0 and not c.hasSelection() and c.position() == self._start + self._len:
-            return
-        self._reset()
-
-    def _show(self):
-        self._busy = True
-        try:
-            cur = self.textCursor()
-            if cur.hasSelection():
-                cur.removeSelectedText()
-                self._reset_keep_buf()
-            if self._start < 0:
-                self._start = cur.position()
-            txt = banglatext.phonetic(self._buf)
-            cur.beginEditBlock()
-            cur.setPosition(self._start)
-            cur.setPosition(self._start + self._len, QTextCursor.MoveMode.KeepAnchor)
-            cur.insertText(txt)
-            cur.endEditBlock()
-            self._len = len(txt)
-            self.setTextCursor(cur)
-            if not self._buf:
-                self._reset()
-        finally:
-            self._busy = False
-
-    def _reset_keep_buf(self):
-        self._start, self._len = -1, 0
+        self._css = ""
+        self._doc_key = None
+        self.setFrameStyle(0)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.setTabChangesFocus(True)
+        self.hide()
 
     def keyPressEvent(self, e):
-        if self.phonetic and not (e.modifiers() & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier
-                                                   | Qt.KeyboardModifier.MetaModifier)):
-            t = e.text()
-            if e.key() == Qt.Key.Key_Backspace and self._buf and not self.textCursor().hasSelection():
-                self._buf = self._buf[:-1]
-                self._show()
-                return
-            if len(t) == 1 and t.isascii() and t.isprintable() and (t.isalnum() or t in "`^:.$"):
-                if self.textCursor().hasSelection():
-                    self._reset()
-                self._buf += t
-                self._show()
-                return
-            self._reset()
+        if e.key() == Qt.Key.Key_Escape:
+            self.finished.emit()
+            return
         super().keyPressEvent(e)
 
-    def focusOutEvent(self, e):
-        self._reset()
-        super().focusOutEvent(e)
+    def look(self, t, scale):
+        """Same font, size, color, alignment as the text box; scale = screen pixels per layout unit."""
+        fam = (t.get("family") or default_family()).replace("'", "").replace('"', "")
+        px = max(6, int(round(LOGICAL * scale)))
+        deco = " ".join(w for w, on in (("underline", t["underline"]), ("line-through", t["strike"])) if on) or "none"
+        css = ("QPlainTextEdit { background: transparent; border: none; padding: 0px; color: %s; "
+                           "font-family: '%s'; font-size: %dpx; font-weight: %s; font-style: %s; text-decoration: %s; "
+                           "selection-background-color: #4f46e5; selection-color: white; }"
+                           % (t["color"], fam, px, "bold" if t["bold"] else "normal",
+                              "italic" if t["italic"] else "normal", deco))
+        if css != self._css:
+            self._css = css
+            self.setStyleSheet(css)
+        key = (round(margin_of(t) * scale, 2), t["align"])
+        if key != self._doc_key:
+            self._doc_key = key
+            doc = self.document()
+            doc.setDocumentMargin(key[0])
+            opt = doc.defaultTextOption()
+            opt.setAlignment(_ALIGN.get(t["align"], Qt.AlignmentFlag.AlignLeft))
+            doc.setDefaultTextOption(opt)
 
 
 class TextPanel(QWidget):
@@ -518,31 +499,15 @@ class TextPanel(QWidget):
         bl = QVBoxLayout(self.body)
         bl.setContentsMargins(0, 0, 0, 0)
         bl.setSpacing(6)
-        self.edit = TextEdit()
+        self.edit = QPlainTextEdit()
         self.edit.setMinimumHeight(92)
         self.edit.setMaximumHeight(170)
         self.edit.setPlaceholderText("Type here ...  বাংলা / English")
         self.edit.setTabChangesFocus(True)
         self._edit_font("")
         bl.addWidget(self.edit)
-        self.cmbType = QComboBox()
-        self.cmbType.addItem("Normal  (Unicode keyboard, Avro Keyboard, paste)")
-        self.cmbType.addItem("Phonetic typing  (English letters -> বাংলা)")
-        self.cmbType.setToolTip("Normal: type with your own keyboard (Avro Keyboard, Bijoy Unicode ...) or paste.\n"
-                                "Phonetic: this program turns the English letters into Bangla while you type.")
-        bl.addWidget(self.cmbType)
-        self.lblPhon = QLabel("Phonetic: ami = আমি, bangla = বাংলা, kolom = কলম.   o = no sign, O = ো (tOmake = তোমাকে),  "
-                              "T D N S R = ট ড ণ ষ ড়,  ng = ং,  ^ = ঁ,  ` keeps letters apart,  . = ।")
-        self.lblPhon.setObjectName("hint")
-        self.lblPhon.setWordWrap(True)
-        self.lblPhon.setVisible(False)
-        bl.addWidget(self.lblPhon)
-        self.btnToUni = QPushButton("Bijoy code  ->  Unicode")
-        self.btnToUni.setToolTip("Text that was typed with a Bijoy keyboard (it looks like  Avwg evsjvq ) becomes real Bangla.\n"
-                                 "Only the selected text, or all of it when nothing is selected.")
-        bl.addWidget(self.btnToUni)
-        hint = QLabel("A Bijoy (ANSI) font such as SutonnyMJ shows Bangla from either kind of text: Bijoy code is used as it is, "
-                      "Unicode Bangla is converted for the font automatically.")
+        hint = QLabel("Tip: double-click the text box on the page and type right there, like in Word.  "
+                      "Switch Bangla / English with your own keyboard (Avro Keyboard F10 ...).")
         hint.setObjectName("hint")
         hint.setWordWrap(True)
         bl.addWidget(hint)
@@ -656,7 +621,6 @@ class TextPanel(QWidget):
         root.insertWidget(1, self.lblNone)
         self._groups = [root.itemAt(i).widget() for i in range(2, root.count())]
         self._wire()
-        self.set_phonetic(bool(_settings().value("text_phonetic", False, type=bool)))
         self._enable(False)
 
     @staticmethod
@@ -672,7 +636,6 @@ class TextPanel(QWidget):
     def _wire(self):
         e = self._emit
         self.edit.textChanged.connect(lambda: e(text=self.edit.toPlainText()))
-        self.cmbType.currentIndexChanged.connect(lambda i: self.set_phonetic(i == 1, save=True))
         self.cmbFont.currentIndexChanged.connect(self._font_picked)
         self.chkAnsi.toggled.connect(lambda on: e(ansi=bool(on)))
         self.spSize.valueChanged.connect(lambda v: e(size=float(v)))
@@ -699,23 +662,12 @@ class TextPanel(QWidget):
         self.chkHl.toggled.connect(lambda on: e(hl=bool(on)))
         self.swHl.colorChanged.connect(lambda c: e(hl_color=c, hl=True))
         self.btnAddFont.clicked.connect(self._add_font)
-        self.btnToUni.clicked.connect(self._to_unicode)
         self.btnNew.clicked.connect(self.newRequested.emit)
         self.btnDup.clicked.connect(self.duplicateRequested.emit)
 
     def _emit(self, **patch):
         if not self._loading:
             self.changed.emit(patch)
-
-    def set_phonetic(self, on, save=False):
-        self.edit.phonetic = bool(on)
-        self.cmbType.blockSignals(True)
-        self.cmbType.setCurrentIndex(1 if on else 0)
-        self.cmbType.blockSignals(False)
-        self.lblPhon.setVisible(bool(on))
-        if save:
-            _settings().setValue("text_phonetic", bool(on))
-        self.edit._reset()
 
     def focus_text(self):
         self.edit.setFocus()
@@ -774,13 +726,6 @@ class TextPanel(QWidget):
         self._select_font(added[0])
         self._loading = False
         self._font_picked(self.cmbFont.currentIndex())
-
-    def _to_unicode(self):
-        cur = self.edit.textCursor()
-        if cur.hasSelection():
-            cur.insertText(banglatext.bijoy_to_unicode(cur.selectedText().replace("\u2029", "\n")))
-        else:
-            self.edit.setPlainText(banglatext.bijoy_to_unicode(self.edit.toPlainText()))
 
     # --------------------------------------------------------------------------------------------- loading
     def _enable(self, on):
