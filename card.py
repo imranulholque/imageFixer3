@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (QSplitter, QApplication, QButtonGroup, QCheckBox,
                                QVBoxLayout, QWidget)
 
 import core
+import textbox
 from canvas import ImageCanvas, np_to_qimage
 from compare import CompareOverlay
 from flow import ElidedLabel, FlowLayout
@@ -599,7 +600,7 @@ def side_sync():
 
 
 class Card(QWidget):
-    TAB_ADJUST, TAB_COLOR, TAB_SHADOW, TAB_TEXT, TAB_PICTURE = range(5)   # order of the side tabs
+    TAB_ADJUST, TAB_COLOR, TAB_SHADOW, TAB_TEXT, TAB_PICTURE, TAB_TEXTBOX = range(6)   # order of the side tabs
     SIDE_W = 350                                                                     # width of the side panel (shared, drag to change)
     NARROW_W = 720                                                                   # a narrower picture card: the panel goes UNDER the picture
     SHORT_H = 520                                                                    # a lower card: the hint line is hidden (warnings still show)
@@ -949,6 +950,9 @@ class Card(QWidget):
         r2.addWidget(self._sep())
         for w in (self.menuSelect, self.menuMove, self.btnPick, self.btnPaint, self.menuErase, self.menuCrop):
             r2.addWidget(w)
+        self.btnText = QPushButton("T  Text box")
+        self.btnText.setToolTip("Write Bangla or English text on the page. The text box moves, resizes, rotates and copies like a picture.")
+        r2.addWidget(self.btnText)
         r2.addSpacing(10)
         r2.addWidget(self.btnLayerDone)
         r2.addWidget(self.btnApply)
@@ -1182,7 +1186,8 @@ class Card(QWidget):
         self.canvas.tfCommitted.connect(self._commit_layer_pts)
         self.canvas.tfCopyChanged.connect(self._on_tf_copy)
         self.canvas.layerOutside.connect(self._on_layer_outside)
-        self.canvas.layerEditRequested.connect(lambda: self.edit_layer(self._place_id) if self._place_id is not None else None)
+        self.canvas.layerEditRequested.connect(self._layer_double)
+        self.canvas.layerCopyRequested.connect(self._copy_layer_drag)
         self.btnApply.clicked.connect(self.apply_pending)
         self.btnCancel.clicked.connect(self.cancel_pending)
         self.btnUndo.clicked.connect(self.undo_step)
@@ -1322,13 +1327,15 @@ class Card(QWidget):
         self.tabGroup = QButtonGroup(self)
         self.tabGroup.setExclusive(True)
         self.stackPages = QStackedWidget()
-        names = ("Adjust", "Color", "Shadow", "Text", "Picture")
+        names = ("Adjust", "Color", "Shadow", "Text", "Picture", "Aa")
         for i, n in enumerate(names):
             b = QPushButton(n)
             b.setCheckable(True)
             b.setProperty("tab", True)
             if n == "Color":
                 b.setToolTip("Remove a stamp or mark, Color range & fill, Picked colors")
+            elif n == "Aa":
+                b.setToolTip("Text box: write Bangla / English text on the page (font, size, color, bold ...)")
             self.tabGroup.addButton(b, i)
             tabs.addWidget(b, 1)
         self.tabGroup.button(0).setChecked(True)
@@ -1636,6 +1643,13 @@ class Card(QWidget):
         lay.addStretch(1)
         self.stackPages.addWidget(pg)
 
+        # ---------------- Aa: text boxes (Bangla / English)
+        pg, lay = self._page()
+        self.textPanel = textbox.TextPanel(SliderRow, self._group_box)
+        lay.addWidget(self.textPanel)
+        lay.addStretch(1)
+        self.stackPages.addWidget(pg)
+
         # ---------------- Save / share: no tab any more - the window's top bar (Save v) calls the same actions.
         # These buttons are kept (not shown) so the existing enable / disable and signals keep working.
         self.btnSave = QPushButton("Save")
@@ -1665,6 +1679,11 @@ class Card(QWidget):
         self.btnPdfAll.clicked.connect(self.pdfAllRequested.emit)
         self.btnApplyAll.clicked.connect(lambda: self.applyAllRequested.emit(self))
         self.btnAddPic.clicked.connect(lambda: self.add_picture())
+        self.textPanel.newRequested.connect(self.add_text_layer)
+        self.textPanel.duplicateRequested.connect(lambda: self.duplicate_layer())
+        self.textPanel.changed.connect(self._text_changed)
+        self.textPanel.opacityChanged.connect(self._text_opacity)
+        self.btnText.clicked.connect(self.add_text_layer)
         self.btnLayerDone.clicked.connect(lambda: self.leave_layer())
         self.btnCopy.clicked.connect(self.copy_image)
         return side
@@ -2426,6 +2445,122 @@ class Card(QWidget):
     def _replace_layer(self, lid, **kw):
         self.layers = [dict(l, **kw) if l["id"] == lid else l for l in self.layers]
 
+    # ------------------------------------------------ text boxes (Bangla / English)
+    def _text_layer(self):
+        """The selected text box layer, or None."""
+        l = None if self.sel_layer is None else self._layer(self.sel_layer)
+        return l if (l is not None and l.get("text") is not None and self.ctx is None) else None
+
+    def _show_text_tab_if_text(self, lid):
+        l = self._layer(lid)
+        if l is not None and l.get("text") is not None:
+            self.show_tab(self.TAB_TEXTBOX)
+
+    def add_text_layer(self):
+        """A new text box in the middle of the page: it is a picture layer, so it moves / resizes / rotates like one."""
+        self.ensure_loaded()
+        if not self._loaded:
+            return
+        if self.ctx is not None:
+            self.leave_layer(self.add_text_layer)
+            return
+        self._layer_seq += 1
+        layer = textbox.new_layer(self._layer_seq, textbox.new_style(), self.base.size)
+        self._checkpoint("Text box")
+        self.layers = self.layers + [layer]
+        self.ops += 1
+        self.sel_layer = layer["id"]
+        self._touch()
+        self.show_tab(self.TAB_TEXTBOX)
+        self.place_layer_tool(layer["id"])
+        self.textPanel.focus_text()
+        self._notify("layer", "Text box added", "type your text in the Aa tab; drag the box, handles resize, Alt + drag copies")
+
+    def _put_text_layer(self, nl):
+        lid = nl["id"]
+        self.layers = [nl if x["id"] == lid else x for x in self.layers]
+        self.ops += 1
+        self._touch()
+        if self._tool == "transform" and self._place_id == lid:     # the box on the page follows the typing
+            PH, PW = self.prev.shape[:2]
+            self.canvas.update_layer_transform(self._layer_qimage(nl), [(x * PW, y * PH) for x, y in nl["grid"]], nl["n"])
+        else:
+            self._timer.start()
+        self._refresh_layers_ui()
+
+    def _text_changed(self, patch):
+        l = self._text_layer()
+        if l is None:
+            return
+        fw = QApplication.focusWidget()
+        if not (self._tool == "transform" and self._place_id == l["id"]):
+            self.place_layer_tool(l["id"])                           # show the box again (it was put down)
+            if fw is not None:
+                fw.setFocus()                                        # ... but the typing stays where it was
+            l = self._layer(l["id"])
+        self._begin_change()                                         # a burst of typing / slider moves = one undo step
+        nl = textbox.restyle(l, patch, self.base.size)
+        self._put_text_layer(nl)
+        textbox.remember_style(nl["text"])
+
+    def _text_opacity(self, v):
+        l = self._text_layer()
+        if l is None:
+            return
+        self._begin_change()
+        self._replace_layer(l["id"], opacity=int(v))
+        self.ops += 1
+        self._touch()
+        if self._tool == "transform" and self._place_id == l["id"]:
+            self.canvas.set_tf_image(self._layer_qimage(self._layer(l["id"])))
+        else:
+            self._timer.start()
+
+    def duplicate_layer(self, lid=None, offset=0.03):
+        """A copy of a picture / text box, a little to the side; the copy is selected."""
+        if not self._loaded:
+            return
+        lid = self.sel_layer if lid is None else lid
+        if self.ctx is not None:
+            self.leave_layer(lambda: self.duplicate_layer(lid, offset))
+            return
+        if self._tool == "transform" and self._place_id is not None:
+            self._commit_layer_pts()
+        l = None if lid is None else self._layer(lid)
+        if l is None:
+            return
+        self._layer_seq += 1
+        nl = textbox.duplicate(l, self._layer_seq, offset)
+        self._checkpoint("Copy")
+        i = next(k for k, x in enumerate(self.layers) if x["id"] == lid)
+        self.layers = self.layers[:i + 1] + [nl] + self.layers[i + 1:]
+        self.ops += 1
+        self.sel_layer = nl["id"]
+        self._touch()
+        self.place_layer_tool(nl["id"])
+        self._notify("copy", "Copy made", "drag it where you want it")
+
+    def _copy_layer_drag(self):
+        """Alt + drag on a picture / text box: a copy stays where it is, the original is dragged away."""
+        lid = self._place_id
+        l = None if lid is None else self._layer(lid)
+        if l is None or self.ctx is not None:
+            return
+        self._layer_seq += 1
+        nl = textbox.duplicate(l, self._layer_seq, 0.0)
+        self._checkpoint("Copy")
+        i = next(k for k, x in enumerate(self.layers) if x["id"] == lid)
+        self.layers = self.layers[:i] + [nl] + self.layers[i:]
+        self.ops += 1
+        self._touch()
+        self._timer.start()
+        self._refresh_layers_ui()
+
+    def _layer_double(self):
+        lid = self._place_id
+        if lid is not None:
+            self.edit_layer(lid)
+
     def add_picture(self, path=None):
         """A picture (signature, stamp ...) becomes a new layer: background removed, then placed on the page."""
         self.ensure_loaded()
@@ -2571,6 +2706,14 @@ class Card(QWidget):
         self._replace_layer(lid, grid=grid, n=n)
         self.ops += 1
         self._touch()
+        l2 = self._layer(lid)
+        if l2.get("text") is not None and self.ctx is None:          # a text box: the font size follows the new size
+            l3 = textbox.refit(l2, self.base.size)
+            if l3 is not l2:
+                self.layers = [l3 if x["id"] == lid else x for x in self.layers]
+                self.canvas.set_tf_image(self._layer_qimage(l3))
+                textbox.remember_style(l3["text"])
+                self._refresh_layers_ui()
 
     def _end_layer_session(self):
         self._commit_layer_pts()
@@ -2605,11 +2748,13 @@ class Card(QWidget):
         lid = self._layer_at(x, y)
         if lid is not None:
             self.place_layer_tool(lid)
+            self._show_text_tab_if_text(lid)
 
     def _on_layer_outside(self, x, y):
         lid = self._layer_at(x, y, skip=self._place_id)
         if lid is not None:
             self.place_layer_tool(lid)                 # another picture: select that one
+            self._show_text_tab_if_text(lid)
         else:
             self._end_layer_session()                  # empty place: the picture is deselected
 
@@ -2633,6 +2778,11 @@ class Card(QWidget):
         """Work on ONE picture alone: Adjust / Shadow / Text / Select / Erase / Crop then change only this picture."""
         l = self._layer(lid)
         if l is None or not self._loaded:
+            return
+        if l.get("text") is not None:                  # a text box is changed in the Aa tab, not pixel by pixel
+            self.place_layer_tool(lid)
+            self.show_tab(self.TAB_TEXTBOX)
+            self.textPanel.focus_text()
             return
         if self.ctx == lid:
             if then:
@@ -2713,7 +2863,7 @@ class Card(QWidget):
     def _bg_changed(self, key=None):
         lid = self.sel_layer
         l = None if lid is None else self._layer(lid)
-        if l is None or self.ctx is not None:
+        if l is None or self.ctx is not None or l.get("text") is not None:
             return
         self._begin_change()
         if key == "opacity":                       # no new cut needed
@@ -2734,7 +2884,7 @@ class Card(QWidget):
     def _bg_apply(self):
         lid = self.sel_layer
         l = None if lid is None else self._layer(lid)
-        if l is None or self.ctx is not None:
+        if l is None or self.ctx is not None or l.get("text") is not None:
             return
         if self._bg_busy:
             self._bg_again = True
@@ -2782,7 +2932,7 @@ class Card(QWidget):
             eye.setChecked(l.get("visible", True))
             eye.setToolTip("Show / hide this picture")
             eye.toggled.connect(lambda on, i=l["id"]: self.toggle_layer(i, on))
-            nm = l["name"] if len(l["name"]) <= 24 else l["name"][:21] + "..."
+            nm = ("T  " if l.get("text") is not None else "") + (l["name"] if len(l["name"]) <= 24 else l["name"][:21] + "...")
             name = QPushButton(nm)
             name.setCheckable(True)
             name.setChecked(self.sel_layer == l["id"])
@@ -2793,12 +2943,15 @@ class Card(QWidget):
             h1.addWidget(name, 1)
             h2 = QHBoxLayout()
             h2.setSpacing(4)
-            ed = QPushButton("Edit")
-            ed.setToolTip("Work on this picture alone: Adjust, Shadow, Text, Select, Erase, Crop  (double click on it works too)")
+            is_text = l.get("text") is not None
+            ed = QPushButton("Aa  Text" if is_text else "Edit")
+            ed.setToolTip("Change the text, font, size, color ...  (double click on it works too)" if is_text else
+                          "Work on this picture alone: Adjust, Shadow, Text, Select, Erase, Crop  (double click on it works too)")
             ed.setProperty("accent", self.ctx == l["id"])
             ed.clicked.connect(lambda _=False, i=l["id"]: self.edit_layer(i))
             h2.addWidget(ed, 1)
-            for text, tip, fn in (("↑", "Bring forward", lambda i=l["id"]: self.move_layer_order(i, 1)),
+            for text, tip, fn in (("⧉", "Duplicate (copy)  -  Alt + drag on the page copies too", lambda i=l["id"]: self.duplicate_layer(i)),
+                                  ("↑", "Bring forward", lambda i=l["id"]: self.move_layer_order(i, 1)),
                                   ("↓", "Send backward", lambda i=l["id"]: self.move_layer_order(i, -1)),
                                   ("✕", "Remove this picture  (Delete key)", lambda i=l["id"]: self.delete_layer(i))):
                 b_ = QPushButton(text)
@@ -2819,9 +2972,13 @@ class Card(QWidget):
                                       "R = turn 90°, Delete = remove, click outside = done.  Edit = work on it alone "
                                       "(Adjust, Shadow, Text, Select, Erase, Crop).")
         self.btnLayerDone.setVisible(self.ctx is not None)
-        self.bgGroup.setEnabled(self.ctx is None and self.sel_layer is not None and self._layer(self.sel_layer) is not None)
         l = None if self.sel_layer is None else self._layer(self.sel_layer)
-        if l is not None and self.ctx is None:
+        self.bgGroup.setEnabled(self.ctx is None and l is not None and l.get("text") is None)
+        tp = getattr(self, "textPanel", None)
+        if tp is not None:
+            tp.load(l["text"] if (l is not None and self.ctx is None and l.get("text") is not None) else None,
+                    0 if l is None else l.get("opacity", 100))
+        if l is not None and self.ctx is None and l.get("text") is None:
             bg = l.get("bg", self.BG_DEFAULT)
             for k, dflt in (("strength", 50), ("soft", 30), ("fine", 70), ("specks", 50)):
                 self.bgRows[k].sl.blockSignals(True)

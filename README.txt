@@ -2,7 +2,7 @@ IMAGE FIXER  (Windows)
 ======================
 Made by Imranul Hoque Sabbir.
 Clean many text pictures (WhatsApp photos, scans) and print them. One big card per picture - slide to the next.
- Top bar (dropdown menus):  Select v | Move v | Eyedropper | Color Brush | Erase v | Crop v      Right side tabs: Adjust | Color | Shadow | Text | Picture;  Save v is at the top right, next to Settings
+ Top bar (dropdown menus):  Select v | Move v | Eyedropper | Color Brush | Erase v | Crop v      Right side tabs: Adjust | Color | Shadow | Text | Picture | Aa;  Save v is at the top right, next to Settings
  - Select v:    Quick select, Brush, Box, Ellipse, Freehand, Color range (click a color). Options bar: New / Add / Subtract /
                 Intersect, All / None / Inverse, Grow / Shrink. Shift = add, Alt = subtract.
  - EVERYTHING acts only inside the selection (brightness, contrast, saturation, hue, warmth, color change, shadow removal,
@@ -144,3 +144,33 @@ AUTO UPDATE  (Settings > Auto update)
    (C:\Tools\ImageFixer is fine, C:\Program Files is not). Details of a failed update: %APPDATA%\ImageFixer\update.log
  - Repository Settings > Actions > General > Workflow permissions must allow "Read and write permissions" (the build publishes the Release).
  - Test the update logic: python test_updater.py
+
+TEXT BOX  (Aa tab, or the "T  Text box" button in the top bar)
+- Writes Bangla and English text on the page.  A text box is a picture layer: drag = move, corner handles = resize (the font
+  size follows), round handle = rotate, Alt + drag or the "Duplicate" button = copy, Delete = remove, double click = edit text,
+  and it has opacity, order (up / down), undo, save, print like any placed picture.  The text stays editable.
+- Typing: "Normal" uses your own keyboard (Avro Keyboard, Bijoy Unicode, paste ...).  "Phonetic typing" turns English letters into
+  Bangla while you type (ami = আমি, bangla = বাংলা, kolom = কলম; o = no sign, O = ো, T D N S R = ট ড ণ ষ ড়, ng = ং, ^ = ঁ, ` = keep apart).
+- Fonts: Bangla and English, basic and stylish, whatever this computer has (list is grouped).  "Add a font file..." adds any .ttf /
+  .otf / .ttc and remembers it; fonts copied into the "fonts" folder next to ImageFixer.exe (or %APPDATA%\\ImageFixer\\fonts) load at every start.
+- Bijoy (ANSI) fonts such as SutonnyMJ work: text typed with a Bijoy keyboard (Avwg evsjvq) is shown as it is; Unicode Bangla is converted
+  for the font automatically.  "Bijoy code -> Unicode" turns pasted Bijoy text into real Bangla.  Conjuncts that are not in the built-in
+  table are written with a visible hasant (&).
+- Look: size (pt, as on A4), Bold / Italic / Underline / Strike, UPPERCASE / lowercase / Small caps / Capitalize, Left / Center / Right /
+  Justify, text color, opacity, letter spacing, line spacing, box width (wrapping), outline, shadow and a highlight box.  The last look
+  you used is used for the next new text box.
+
+TEXT BOX  (Aa tab, or the "T  Text box" button in the top bar)
+- Writes Bangla and English text on the page.  A text box is a picture layer: drag = move, corner handles = resize (the font
+  size follows), round handle = rotate, Alt + drag or the "Duplicate" button = copy, Delete = remove, double click = edit text,
+  and it has opacity, order (up / down), undo, save, print like any placed picture.  The text stays editable.
+- Typing: "Normal" uses your own keyboard (Avro Keyboard, Bijoy Unicode, paste ...).  "Phonetic typing" turns English letters into
+  Bangla while you type (ami = আমি, bangla = বাংলা, kolom = কলম; o = no sign, O = ো, T D N S R = ট ড ণ ষ ড়, ng = ং, ^ = ঁ, ` = keep apart).
+- Fonts: Bangla and English, basic and stylish, whatever this computer has (list is grouped).  "Add a font file..." adds any .ttf /
+  .otf / .ttc and remembers it; fonts copied into the "fonts" folder next to ImageFixer.exe load at every start.
+- Bijoy (ANSI) fonts such as SutonnyMJ work: text typed with a Bijoy keyboard (Avwg evsjvq) is shown as it is; Unicode Bangla is
+  converted for the font automatically.  "Bijoy code -> Unicode" turns pasted Bijoy text into real Bangla.  Conjuncts that are not in
+  the built-in table are written with a visible hasant (&).
+- Look: size (pt, as on A4), Bold / Italic / Underline / Strike, UPPERCASE / lowercase / Small caps / Capitalize, Left / Center /
+  Right / Justify, text color, opacity, letter spacing, line spacing, box width (wrapping), outline, shadow and a highlight box.
+  The last look you used is used for the next new text box.

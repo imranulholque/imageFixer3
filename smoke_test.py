@@ -469,6 +469,24 @@ def t_pdf_pages():
     assert all(not c.can_replace() for c in w.carousel.cards[-3:]), "PDF pages never replace the PDF"
 step("PDF: every page opens as its own picture", t_pdf_pages)
 
+def t_textbox():
+    w = _window_with(1)
+    c = w.carousel.cards[0]
+    w.carousel.go_to(0, animate=False); _pump(lambda: c._loaded)
+    c.add_text_layer()
+    assert len(c.layers) == 1 and c.layers[0].get("text") is not None, "a text box layer"
+    lid = c.layers[0]["id"]
+    for txt in ("Hello", "\u0986\u09ae\u09bf \u09ac\u09be\u0982\u09b2\u09be\u09af\u09bc \u0997\u09be\u09a8 \u0997\u09be\u0987"):
+        c._text_changed({"text": txt})
+        assert c._layer(lid)["text"]["text"] == txt
+    c._text_changed({"bold": True, "italic": True, "size": 40.0, "color": "#aa0000", "case": "upper", "outline": True, "shadow": True, "hl": True})
+    c.duplicate_layer(lid)
+    assert len(c.layers) == 2, "duplicate"
+    out = c.result_image()
+    assert out.size == c.base.size
+    c.undo_step()
+step("text box: add, Bangla text, styles, duplicate, render", t_textbox)
+
 
 
 

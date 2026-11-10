@@ -48,6 +48,7 @@ class ImageCanvas(QWidget):
     tfCommitted = Signal()                      # a picture layer was moved / resized / rotated (mouse released)
     layerOutside = Signal(float, float)         # click outside the box of the selected picture layer
     layerEditRequested = Signal()               # double click on the selected picture layer
+    layerCopyRequested = Signal()               # Alt + drag on the selected picture layer: a copy stays where it is
     paintFinished = Signal(object)              # colour brush stroke: list of (x, y) in preview pixels
 
     VIEW, PICK, CROP, PERSP, ERASE, SELECT, MOVESEL, TRANSFORM, PAINT = 0, 1, 2, 3, 4, 5, 6, 7, 8
@@ -377,6 +378,15 @@ class ImageCanvas(QWidget):
         self.mode = self.TRANSFORM
         self._update_cursor()
         self.setFocus()
+        self.update()
+
+    def update_layer_transform(self, img, pts, n):
+        """The open layer box got a new picture and new corners (a text box was edited): it stays open, no focus change."""
+        if self._tf is None or not self._tf.get("layer"):
+            return
+        self._tf.update({"img": img, "w": float(img.width()), "h": float(img.height()), "n": n,
+                         "mode": "warp" if n > 1 else "free", "pts": [QPointF(x, y) for x, y in pts]})
+        self._tf_drag = None
         self.update()
 
     def set_tf_image(self, img):
@@ -1288,6 +1298,8 @@ class ImageCanvas(QWidget):
                 self.layerOutside.emit(ip.x(), ip.y())
                 return
             self._tf_push()
+            if self._tf.get("layer") and hit == "move" and (e.modifiers() & Qt.KeyboardModifier.AltModifier):
+                self.layerCopyRequested.emit()             # the copy is made first, then the original is dragged away
             if not self._tf.get("layer") and (e.modifiers() & Qt.KeyboardModifier.AltModifier):
                 if not self._tf.get("copy"):                  # Alt + drag: the original stays, a copy is placed
                     self._tf["copy"] = True
