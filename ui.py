@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QDial
 import core
 import updater
 import winutil
-from card import CROP_KEYS, EXPORT_DIR, TOOL_KEYS, Card
+from card import CLIP_FILES, CROP_KEYS, EXPORT_DIR, TOOL_KEYS, Card, export_path
 from feedback import DropOverlay, install_ripples
 from flow import ElidedLabel
 from savedlg import SaveAllDialog
@@ -1588,12 +1588,11 @@ class MainWindow(QMainWindow):
                 entries.append((c, None, c.render_source(), stem, ext, c._ver))
 
         def work(progress):
-            os.makedirs(EXPORT_DIR, exist_ok=True)
             out = []
             for i, (c, p, src, stem, ext, ver) in enumerate(entries):
                 progress(i / len(entries), "%d / %d" % (i + 1, len(entries)))
                 if p is None:
-                    p = core.unique_path(EXPORT_DIR, stem, ext)
+                    p = export_path(stem, ext)
                     core.save_image(src(), p, src=c.path)
                 out.append(p)
             qimg = QImage(out[0]) if len(out) == 1 else None
@@ -1610,6 +1609,8 @@ class MainWindow(QMainWindow):
             md.setUrls([QUrl.fromLocalFile(p) for p in paths])
             if qimg is not None and not qimg.isNull():
                 md.setImageData(qimg)
+            CLIP_FILES.clear()
+            CLIP_FILES.update(os.path.abspath(p) for p in paths)      # these files stay until the program is closed
             QApplication.clipboard().setMimeData(md)
             for (c, p, src, stem, ext, ver), path in zip(entries, paths):
                 if p is None and not c._dead:
