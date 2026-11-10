@@ -6,6 +6,7 @@ from PIL import Image, ImageDraw, ImageFilter
 
 import core
 
+_DEBUG = None                # self-test hook: a list collects every candidate with its score
 LABEL_SIDE = 280            # long side of the picture used to find the paper
 
 
@@ -126,6 +127,86 @@ def _refine_quad(quad, outline):
     return out
 
 
+
+def _box_mean(a, k):
+    """Mean over a k x k window (integral image, edges replicated)."""
+    r = k // 2
+    pa = np.pad(a.astype(np.float64), r + 1, mode="edge")
+    c = pa.cumsum(0).cumsum(1)
+    h, w = a.shape
+    s = c[k:k + h, k:k + w] - c[:h, k:k + w] - c[k:k + h, :w] + c[:h, :w]
+    return (s / float(k * k)).astype(np.float32)
+
+
+def _morph(mask, grow, shrink=None):
+    """Binary close (grow then shrink) / open with PIL's rank filters. Sizes are odd window widths."""
+    im = Image.fromarray((mask * 255).astype(np.uint8))
+    if grow:
+        im = im.filter(ImageFilter.MaxFilter(grow))
+    if shrink:
+        im = im.filter(ImageFilter.MinFilter(shrink))
+    return np.asarray(im) > 127
+
+
+def _border_model_candidates(rgbf, lum, h, w, cands):
+    """The photo's frame is nearly always table / wall / cloth: learn its colours (up to 3 groups) and mark every
+    pixel that is clearly NOT like them.  Finds a sheet on a coloured, wooden or patterned surface even when the
+    sheet is not brighter than the surface."""
+    b = max(3, int(0.045 * min(h, w)))
+    ring = np.zeros((h, w), bool)
+    ring[:b] = ring[-b:] = True
+    ring[:, :b] = ring[:, -b:] = True
+    feat = np.stack([lum / 255.0, (rgbf[..., 0] - rgbf[..., 1]) / 128.0, (rgbf[..., 1] - rgbf[..., 2]) / 128.0], -1)
+    feat = feat * np.array([1.0, 1.6, 1.6], np.float32)
+    bp = feat[ring]
+    if len(bp) < 50:
+        return
+    cen = [np.median(bp, 0)]
+    for _ in range(2):                                                        # add the border colour farthest from the groups so far
+        d = np.min([((bp - c) ** 2).sum(1) for c in cen], 0)
+        far = bp[d > np.percentile(d, 85)]
+        if len(far) < 30:
+            break
+        cen.append(np.median(far, 0))
+    for _ in range(4):                                                        # a few k-means rounds on the border pixels
+        dd = np.stack([((bp - c) ** 2).sum(1) for c in cen], 1)
+        lab = dd.argmin(1)
+        cen = [bp[lab == i].mean(0) if (lab == i).sum() > 20 else cen[i] for i in range(len(cen))]
+    dd = np.stack([((bp - c) ** 2).sum(1) for c in cen], 1)
+    lab = dd.argmin(1)
+    # each group: its centre and how spread it is (a wavy wood is spread, a plain wall is not)
+    sp = []
+    for i in range(len(cen)):
+        di = np.sqrt(dd[lab == i, i]) if (lab == i).sum() > 20 else np.array([0.05])
+        sp.append(max(0.035, float(np.percentile(di, 92))))
+    fl = feat.reshape(-1, 3)
+    dist = np.min([np.sqrt(((fl - c) ** 2).sum(1)) / sp[i] for i, c in enumerate(cen)], 0).reshape(h, w)
+    dist = _blur_u8(np.clip(dist * 20.0, 0, 255), 1.5) / 20.0
+    d8 = np.clip(dist * 20.0, 0, 255).astype(np.uint8)
+    t = _otsu(d8) / 20.0
+    for thr in sorted({max(1.6, t), max(2.2, t * 1.4), 3.2}):
+        m = dist > thr
+        m = _morph(m, 5, 5)                                                   # close the writing
+        m = _morph(m, None, 5)                                                # open: drop thin bits of clutter
+        m = _morph(m, 5, None)
+        _candidates(m, h, w, cands, "border")
+
+
+def _smooth_candidates(lum, h, w, cands):
+    """A sheet / card is smooth, a wooden table, cloth or a busy surface is not: regions with little fine texture."""
+    G = _blur_u8(lum, 0.8)
+    m1, m2 = _box_mean(G, 5), _box_mean(G * G, 5)
+    sd = np.sqrt(np.maximum(m2 - m1 * m1, 0.0))
+    for pct in (45, 60):
+        t = float(np.percentile(sd, pct))
+        for k in (9, 15):
+            m = sd < max(t, 3.0)
+            m = _morph(m, k, k + 2)
+            m = _morph(m, None, 7)
+            m = _morph(m, 7, None)
+            _candidates(m, h, w, cands, "smooth")
+
+
 def _score(mask):
     h, w = mask.shape
     lab = _components(mask)
@@ -164,16 +245,30 @@ def _blur_u8(a, sigma):
 
 
 def _grad(G):
+    """Gradient of a grey (h,w) or colour (h,w,3) picture. For colour the magnitude is the length of the colour vector,
+    so an edge between two colours of the same brightness (a dark card on a dark, shadowed table) is still an edge."""
     gx = np.zeros_like(G)
     gy = np.zeros_like(G)
     gx[:, 1:-1] = (G[:, 2:] - G[:, :-2]) * 0.5
     gy[1:-1] = (G[2:] - G[:-2]) * 0.5
+    if G.ndim == 3:
+        return gx, gy, np.sqrt((gx * gx + gy * gy).sum(2))
     return gx, gy, np.hypot(gx, gy)
+
+
+def _across(gx, gy, xs, ys, n):
+    """Size of the step across a side (normal n) at the given positions."""
+    a = _sample(gx, xs, ys) * n[0] + _sample(gy, xs, ys) * n[1]
+    return np.sqrt((a * a).sum(-1)) if a.ndim == 2 else np.abs(a)
+
+
+def _blur_rgb(a, sigma):
+    return np.stack([_blur_u8(a[..., i], sigma) for i in range(3)], -1)
 
 
 def _sample(a, xs, ys):
     """Nearest-neighbour samples of a 2-D array at float positions (clipped to the picture)."""
-    h, w = a.shape
+    h, w = a.shape[:2]
     return a[np.clip(np.rint(ys).astype(int), 0, h - 1), np.clip(np.rint(xs).astype(int), 0, w - 1)]
 
 
@@ -206,7 +301,7 @@ def _edge_support(q, gx, gy, gm, scale, band):
         for o in offs:
             xs, ys = px + n[0] * o, py + n[1] * o
             g = _sample(gm, xs, ys)
-            along = np.abs(_sample(gx, xs, ys) * n[0] + _sample(gy, xs, ys) * n[1])        # step across the side
+            along = _across(gx, gy, xs, ys, n)        # step across the side
             ok = along > 0.6 * np.maximum(g, 1e-6)
             best = np.maximum(best, np.where(ok, along, 0.0))
         vals.append(float(np.mean(np.minimum(1.0, best / scale))))
@@ -286,6 +381,17 @@ def _candidates(mask, h, w, out, tag):
         out.append({"quad": quad, "solid": solidity, "sides": sides, "area": _poly_area(quad) / float(h * w), "tag": tag})
 
 
+def _poly_overlap(q1, q2):
+    """Rough IoU of two quads (rasterised on a small grid)."""
+    pts = np.asarray(list(q1) + list(q2), np.float64)
+    x0, y0 = pts.min(0)
+    x1, y1 = pts.max(0)
+    f = 80.0 / max(x1 - x0, y1 - y0, 1.0)
+    n = (int((y1 - y0) * f) + 2, int((x1 - x0) * f) + 2)
+    m = [_poly_mask([((x - x0) * f, (y - y0) * f) for x, y in q], n) for q in (q1, q2)]
+    return float((m[0] & m[1]).sum()) / max(1.0, float((m[0] | m[1]).sum()))
+
+
 def _is_convex(q):
     s = []
     for i in range(4):
@@ -308,8 +414,12 @@ def _refine_on_edges(quad, G, search):
         score = np.zeros((len(offs), len(t)))
         for k, o in enumerate(offs):
             xs, ys = px + n[0] * o, py + n[1] * o
-            along = np.abs(_sample(gx, xs, ys) * n[0] + _sample(gy, xs, ys) * n[1])
-            score[k] = along * (1.0 - 0.35 * abs(o) / max(1.0, search))                    # prefer the nearest strong edge
+            along = _across(gx, gy, xs, ys, n)
+            # step over +-1.5 px against the step over +-6 px: ~1 for a sharp edge, small for a soft shadow
+            na, nb = _sample(G, xs + n[0] * 1.5, ys + n[1] * 1.5), _sample(G, xs - n[0] * 1.5, ys - n[1] * 1.5)
+            wa, wb = _sample(G, xs + n[0] * 6.0, ys + n[1] * 6.0), _sample(G, xs - n[0] * 6.0, ys - n[1] * 6.0)
+            crisp = np.clip(np.abs(na - nb) / (np.abs(wa - wb) + 3.0), 0.0, 1.0)
+            score[k] = along * (0.35 + 0.65 * crisp) * (1.0 - 0.35 * abs(o) / max(1.0, search))   # prefer the nearest sharp edge
         k = score.argmax(0)
         strong = score.max(0) > 0.25 * (score.max() + 1e-6)
         if strong.sum() < 8:
@@ -394,7 +504,12 @@ def detect_document(img, return_score=False):
         m2 = np.asarray(Image.fromarray((m2 * 255).astype(np.uint8)).filter(ImageFilter.MedianFilter(5))) > 0
         _candidates(m2, h, w, cands, "kmeans")
         _candidates(~m2, h, w, cands, "kmeans")
-    best = None
+    try:
+        _border_model_candidates(rgbf, lum, h, w, cands)
+        _smooth_candidates(lum, h, w, cands)
+    except Exception:                                   # the extra ways are a bonus: never break the main one
+        pass
+    scored = []
     ring = max(5, int(0.03 * max(h, w)))
     for c in cands:
         q = c["quad"]
@@ -405,25 +520,47 @@ def detect_document(img, return_score=False):
         a = c["area"]
         sz = min(1.0, a / 0.20) ** 0.6 * (1.0 - max(0.0, a - 0.92) * 4)
         sc = (min(1.0, c["solid"]) ** 3) * (0.12 + edge) ** 1.3 * (0.10 + min(1.0, con * 4.0)) ** 0.45 * sz * (1.0 - 0.10 * c["sides"])
-        if best is None or sc > best[0]:
-            best = (sc, q, edge, con)
-    gh, gw = G.shape
-    if best is not None and best[0] > 0.25 and best[2] > 0.18:
-        q = best[1]
-        # snap to the edges at a larger size
+        if _DEBUG is not None:
+            _DEBUG.append((sc, c["tag"], q, edge, con, c["solid"], a))
+        scored.append((sc, q, edge, con))
+    scored.sort(key=lambda r: -r[0])
+    best = None
+    if scored and scored[0][0] > 0.25 and scored[0][2] > 0.18:
+        # the best few outlines are snapped onto the real edges (in a larger picture) and judged AGAIN on the snapped
+        # sides, so a shape that is a bit too big / too small (shadow, hand, table edge) loses to the one that is exact
         s2 = min(2.5, 900.0 / float(max(W, H)) / s) if s * max(W, H) < 900 else 1.0
         if s2 > 1.2:
             big = img.convert("L").resize((max(8, round(W * s * s2)), max(8, round(H * s * s2))), Image.Resampling.BOX)
-            Gb = _blur_u8(np.asarray(big, np.float32), 1.0)
+        else:
+            s2 = 1.0
+            big = img.convert("L").resize((sw, sh), Image.Resampling.BOX)
+        Gb = np.asarray(big, np.float32)
+        bx, by, bm = _grad(Gb)
+        bscale = float(np.percentile(bm, 94)) + 1e-3
+        seen = []
+        for sc, q, edge, con in scored[:12]:
+            if sc < 0.25 or edge < 0.18:
+                break
+            if any(_poly_overlap(q, o) > 0.985 for o in seen):
+                continue
+            seen.append(q)
             qb = [(x * s2, y * s2) for x, y in q]
-            qb = _refine_on_edges(qb, Gb, search=max(4.0, 0.025 * max(Gb.shape)))
-            q = [(x / s2, y / s2) for x, y in qb]
-        pts = core.order_quad(q)
+            q1 = _refine_on_edges(qb, Gb, search=max(4.0, 0.025 * max(Gb.shape[:2])))
+            q1 = _refine_on_edges(q1, Gb, search=max(2.5, 0.008 * max(Gb.shape[:2])))       # second, finer pass
+            e1, _ = _edge_support(q1, bx, by, bm, bscale, 2)
+            fin = sc * (0.25 + e1)
+            if best is None or fin > best[0]:
+                best = (fin, [(x / s2, y / s2) for x, y in q1], e1, con, sc)
+            if len(seen) >= 4:
+                break
+    if best is not None:
+        pts = core.order_quad(best[1])
         res = [(x / s, y / s) for x, y in pts]
-        return (res, True, best[0]) if return_score else (res, True)
+        info = {"score": best[4], "edge": best[2], "contrast": best[3]}
+        return (res, True, info) if return_score else (res, True)
     mx_, my_ = 0.04 * W, 0.04 * H
     res = [(mx_, my_), (W - mx_, my_), (W - mx_, H - my_), (mx_, H - my_)]
-    return (res, False, 0.0) if return_score else (res, False)
+    return (res, False, {"score": 0.0, "edge": 0.0, "contrast": 0.0}) if return_score else (res, False)
 
 
 def aspect_ratio(quad, size):

@@ -540,5 +540,70 @@ def t_move_selection_outline():
     assert ys.min() == 10 and xs.min() == 20, "Undo puts the outline back"
 step("dragging inside a selection moves only the outline", t_move_selection_outline)
 
+def t_upscale():
+    cc = cardmod.Card(p); cc.message.connect(lambda t: None); cc.ensure_loaded()
+    w0, h0 = cc.base.size
+    old = cardmod.Card.UPSCALE_STEP
+    cardmod.Card.UPSCALE_STEP = 2.0
+    try:
+        cc.upscale()
+        assert cc.base.size == (w0 * 2, h0 * 2), cc.base.size
+        cc.undo_step()
+        assert cc.base.size == (w0, h0), "Undo must give the old size back"
+    finally:
+        cardmod.Card.UPSCALE_STEP = old
+step("upscale button: bigger, undoable", t_upscale)
+
+def t_preview_full():
+    cc = cardmod.Card(p); cc.message.connect(lambda t: None); cc.ensure_loaded()
+    cc.preview_full()
+    assert cc._fq is not None and cc.btnPreview.isChecked(), "real-quality preview must be on"
+    assert cc._fq.size_px == cc.base.size, "it shows the full-resolution result"
+    cc.preview_full()
+    assert cc._fq is None and not cc.btnPreview.isChecked(), "second press switches it off"
+    cc.preview_full(); cc.rotate(90.0)
+    assert cc._fq is None, "a change of the picture switches the preview off"
+step("real-quality preview on / off", t_preview_full)
+
+def t_auto_crop():
+    import math
+    import scanner
+    W, H = 1200, 900
+    bgim = Image.new("RGB", (W, H), (60, 52, 44)); dr = ImageDraw.Draw(bgim)
+    for i in range(0, W, 24): dr.line([(i, 0), (i + 90, H)], fill=(80, 66, 50), width=6)
+    paper = Image.new("RGB", (500, 700), (238, 236, 228)); pd = ImageDraw.Draw(paper)
+    for i in range(20): pd.text((30, 30 + i * 30), "text line %d lorem ipsum" % i, fill=(20, 20, 30))
+    quad = [(300, 120), (900, 170), (860, 800), (260, 740)]
+    co = core._coeffs(quad, [(0, 0), (500, 0), (500, 700), (0, 700)])
+    wp = paper.transform((W, H), Image.Transform.PERSPECTIVE, co, Image.Resampling.BICUBIC)
+    wm = Image.new("L", (500, 700), 255).transform((W, H), Image.Transform.PERSPECTIVE, co, Image.Resampling.BILINEAR)
+    scene = Image.composite(wp, bgim, wm)
+    sp = d + "/scene_auto.png"; scene.save(sp)
+    cc = cardmod.Card(sp); cc.message.connect(lambda t: None); cc.ensure_loaded()
+    cc.auto_crop(False)
+    if cc._tool == "persp":                                        # not sure enough: the corners are shown, Enter applies
+        cc.apply_pending()
+    w1, h1 = cc.base.size
+    assert w1 < W * 0.8 and h1 < H * 0.95, "the page is cut out: %s" % (cc.base.size,)
+    assert w1 > 200 and h1 > 200, "a usable page: %s" % (cc.base.size,)
+    cc.undo_step()
+    assert cc.base.size == (W, H), "Undo gives the whole photo back"
+    cc.auto_crop(True)
+    assert cc._tool == "persp", "Shift+A shows the 4 corners first"
+    cc.cancel_pending()
+step("auto crop finds the page, straightens it, undoable", t_auto_crop)
+
+def t_shortcut_list():
+    import re, ui
+    html = ui.shortcuts_html()
+    for tool, key in cardmod.TOOL_KEYS.items():
+        assert key in html, "the shortcut list must show %s (%s)" % (key, tool)
+    for key in ("A", "Shift+A", "Q", "F", "U"):
+        assert "<b>%s</b>" % key in html, key
+    src = open(ui.__file__, encoding="utf-8").read()
+    keys = re.findall(r'\bsc\("([^"]+)"', src) + [k for t, k in cardmod.TOOL_KEYS.items() if t != "transform"]
+    assert len(keys) == len(set(keys)), "a key is used twice: %s" % sorted(k for k in set(keys) if keys.count(k) > 1)
+step("every tool has its own key and the list shows them", t_shortcut_list)
+
 print("\nFAILED:" if steps else "\nALL OK", steps, flush=True)
 sys.exit(1 if steps else 0)

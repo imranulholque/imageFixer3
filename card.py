@@ -19,6 +19,8 @@ import core
 import textbox
 from canvas import ImageCanvas, np_to_qimage
 from compare import CompareOverlay
+from fullview import FullViewOverlay
+import scanner
 from flow import ElidedLabel, FlowLayout
 from jobs import _log, run_background
 
@@ -88,13 +90,20 @@ ACTIONS = {
     "Copying": ("copy", "Copied"), "Moving": ("move", "Moved"), "Erasing": ("erase", "Erased"),
     "Deleting": ("delete", "Deleted"), "Filling": ("fill", "Filled"), "Painting": ("paint", "Painted"),
     "Cropping": ("crop", "Cropped"), "Cropping to the shape": ("crop", "Cropped"),
-    "Rotating": ("rotate", "Rotated"), "Transforming": ("resize", "Transformed"),
+    "Rotating": ("rotate", "Rotated"), "Transforming": ("resize", "Transformed"), "Upscaling": ("resize", "Upscaled"),
     "Removing shadows": ("shadow", "Shadows removed"),
 }
 TOOL_TITLE = {"view": "Hand", "pick": "Eyedropper", "paint": "Color Brush", "move": "Move", "copy": "Copy",
               "transform": "Transform"}
-TOOL_KEYS = {"move": "V", "rect": "M", "lasso": "L", "color": "W", "brush": "B", "erase_brush": "E", "crop": "C",
-             "pick": "I", "paint": "P", "view": "H", "transform": "Ctrl+T"}
+# The key of every tool (the window registers them from this table; Settings > Keyboard shortcuts lists them).
+TOOL_KEYS = {"brush": "B", "rect": "M", "ellipse": "Shift+M", "lasso": "L", "color": "W", "deselect": "Shift+D",
+             "move": "V", "copy": "Shift+V", "transform": "Ctrl+T",
+             "erase_brush": "E", "erase_rect": "Shift+E", "erase_ellipse": "Ctrl+E", "erase_lasso": "Alt+E",
+             "crop": "C", "persp": "S", "crop_circle": "Shift+C", "crop_oval": "Ctrl+Shift+C", "crop_round": "Alt+C",
+             "pick": "I", "paint": "P", "view": "H"}
+# Auto crop: sure about the paper -> crops at once; not sure -> shows the 4 corners to drag.
+AUTO_OK_SCORE = 0.6
+AUTO_OK_EDGE = 0.6
 
 
 def action_for(label):
@@ -897,12 +906,23 @@ class Card(QWidget):
         self.btnCompare = QPushButton("Compare")
         self.btnCompare.setCheckable(True)
         self.btnCompare.setToolTip("Show the original on the left and the edited picture on the right, in the picture itself.\n"
-                                   "Click again to switch it off.")
+                                   "Click again to switch it off.   Key: Q  (Shift+Q = slider / side by side)")
         self.btnCompare.hide()                      # only a picture that was changed has something to compare
         self.btnCmpMode = QPushButton("Slider")
-        self.btnCmpMode.setToolTip("Slider (drag the line)  /  Side by side")
+        self.btnCmpMode.setToolTip("Slider (drag the line)  /  Side by side   (Shift+Q)")
         self.btnCmpMode.hide()
         self._cmp = None                            # the overlay while comparing
+        self.btnPreview = QPushButton("Preview")
+        self.btnPreview.setCheckable(True)
+        self.btnPreview.setToolTip("Real quality: shows the picture with every real pixel, exactly as Save, Copy and drag-out will give it.\n"
+                                   "(While you edit, a big picture is shown a little smaller to stay fast.)  Zoom in with Ctrl+1 = 100%.\n"
+                                   "Click again to switch it off.   Key: F")
+        self.btnPreview.hide()
+        self._fq = None                             # the overlay while the real-quality preview is on
+        self.btnUpscale = QPushButton("Upscale")
+        self.btnUpscale.setToolTip("Make the picture bigger and keep it sharp. Every click = one more step "
+                                   "(set the step in Settings > Upscale step).   Key: U   (Ctrl+Z undoes it)")
+        self.btnUpscale.hide()
         self.btnRemove = QPushButton("Remove")
         self.btnRemove.setProperty("danger", True)
         self.btnRemove.setToolTip("Remove this picture from the list (the file on the disk is not touched)")
@@ -915,7 +935,7 @@ class Card(QWidget):
         r1.addWidget(self.lblInfo)
         r1.addWidget(self.lblState)
         r1.addStretch(1)
-        for b in (self.btnPanel, self.btnCompare, self.btnCmpMode, self.btnUndo, self.btnRedo, self.btnReset, self.btnRemove):
+        for b in (self.btnPanel, self.btnCompare, self.btnCmpMode, self.btnPreview, self.btnUpscale, self.btnUndo, self.btnRedo, self.btnReset, self.btnRemove):
             r1.addWidget(b)
         root.addLayout(r1)
 
@@ -934,24 +954,26 @@ class Card(QWidget):
         T = self.choose_tool
         self.menuSelect = self._menu_button("Select", [
             ("Brush select\tB", lambda: T("brush")),
-            ("Box\tM", lambda: T("rect")), ("Ellipse", lambda: T("ellipse")),
+            ("Box\tM", lambda: T("rect")), ("Ellipse\tShift+M", lambda: T("ellipse")),
             ("Freehand\tL", lambda: T("lasso")), ("Color range\tW", lambda: T("color")),
             ("Deselect brush\tShift+D", lambda: T("deselect")),
             None, ("Select all\tCtrl+A", self.select_all), ("Deselect\tCtrl+D", self.deselect),
             ("Inverse\tCtrl+Shift+I", self.invert_selection)], "Ways to select a part of the picture")
         self.menuMove = self._menu_button("Move", [
-            ("Move\tV", lambda: T("move")), ("Copy", lambda: T("copy")),
+            ("Move\tV", lambda: T("move")), ("Copy\tShift+V", lambda: T("copy")),
             ("Transform\tCtrl+T", self.start_transform)], "Move, copy or resize the selection")
         self.menuErase = self._menu_button("Erase", [
-            ("Brush\tE", lambda: T("erase_brush")), ("Box", lambda: T("erase_rect")),
-            ("Ellipse", lambda: T("erase_ellipse")), ("Freehand", lambda: T("erase_lasso")), None,
+            ("Brush\tE", lambda: T("erase_brush")), ("Box\tShift+E", lambda: T("erase_rect")),
+            ("Ellipse\tCtrl+E", lambda: T("erase_ellipse")), ("Freehand\tAlt+E", lambda: T("erase_lasso")), None,
             ("Delete selection\tDel", self.delete_selection),
             ("Fill with color", self.fill_selection)], "Remove things; the place is filled from around it")
         self.menuCrop = self._menu_button("Crop", [
-            ("Crop\tC", lambda: T("crop")), ("Straighten", lambda: T("persp")), None,
-            ("To circle", lambda: T("crop_circle")), ("To oval", lambda: T("crop_oval")),
-            ("To rounded box", lambda: T("crop_round")), ("To selection shape", self.crop_to_selection), None,
-            ("Rotate left", lambda: self.rotate(90.0)), ("Rotate right", lambda: self.rotate(-90.0))],
+            ("Auto crop (find the page, crop and straighten)\tA", lambda: self.auto_crop(False)),
+            ("Auto crop, then let me fix the corners\tShift+A", lambda: self.auto_crop(True)), None,
+            ("Crop\tC", lambda: T("crop")), ("Straighten (4 corners)\tS", lambda: T("persp")), None,
+            ("To circle\tShift+C", lambda: T("crop_circle")), ("To oval\tCtrl+Shift+C", lambda: T("crop_oval")),
+            ("To rounded box\tAlt+C", lambda: T("crop_round")), ("To selection shape\tAlt+X", self.crop_to_selection), None,
+            ("Rotate left\tShift+R", lambda: self.rotate(90.0)), ("Rotate right\tR", lambda: self.rotate(-90.0))],
             "Crop (also a picture you placed: signature, stamp ...) to a box, circle, oval, rounded box or any selected shape; "
             "straighten a photographed page; rotate")
         self.menus = {"select": self.menuSelect, "move": self.menuMove, "erase": self.menuErase, "crop": self.menuCrop}
@@ -1033,6 +1055,15 @@ class Card(QWidget):
             b.clicked.connect(lambda _=False, f=fn: f())
             tfl.addWidget(b)
         a.addWidget(self.tfBox)
+        self.cropBox = QWidget()
+        cbl = QHBoxLayout(self.cropBox)
+        cbl.setContentsMargins(0, 0, 0, 0)
+        cbl.setSpacing(6)
+        self.btnFindPage = QPushButton("Find the page automatically  (A)")
+        self.btnFindPage.setToolTip("Looks for the paper / card / page in the picture and puts the 4 corners on it. Then drag a corner if needed, Enter = apply.")
+        self.btnFindPage.clicked.connect(lambda: self.auto_crop(True))
+        cbl.addWidget(self.btnFindPage)
+        a.addWidget(self.cropBox)
         self.sizeBox = QWidget()
         sb = QHBoxLayout(self.sizeBox)
         sb.setContentsMargins(0, 0, 0, 0)
@@ -1220,6 +1251,8 @@ class Card(QWidget):
         self.btnRedo.clicked.connect(self.redo_step)
         self.btnReset.clicked.connect(self.reset_image)
         self.btnCompare.clicked.connect(self.compare)
+        self.btnPreview.clicked.connect(self.preview_full)
+        self.btnUpscale.clicked.connect(self.upscale)
         self.btnCmpMode.clicked.connect(self._cmp_mode)
         self.btnRemove.clicked.connect(lambda: self.removeRequested.emit(self))
         self.btnPanel.clicked.connect(self._panel_clicked)
@@ -1265,6 +1298,8 @@ class Card(QWidget):
         self.btnUndo.setText("\u21b6" if compact else "\u21b6 Undo")
         self.btnRedo.setText("\u21b7" if compact else "Redo \u21b7")
         self.btnRemove.setText("\u2715" if compact else "Remove")
+        self.btnPreview.setText("\u25c9" if compact else "Preview")
+        self.btnUpscale.setText("\u2922" if compact else "Upscale")
         self._r1.setSpacing(4 if compact else 8)
         self._root.setContentsMargins(*((6, 4, 4, 2) if compact or short else (10, 6, 8, 4)))
         self._root.setSpacing(3 if short else 4)
@@ -1315,6 +1350,12 @@ class Card(QWidget):
     def _panel_clicked(self, on):
         Card.PANEL_USER = bool(on)
         side_sync().panelChanged.emit(bool(on))
+
+    def toggle_panel(self):
+        """Ctrl+B: show / hide the side panel (same as the Panel button)."""
+        on = not self.btnPanel.isChecked()
+        self.btnPanel.setChecked(on)
+        self._panel_clicked(on)
 
     def _sync_hint(self):
         self.lblHint.setVisible((not self._short) or self._hint_warn)
@@ -1893,6 +1934,8 @@ class Card(QWidget):
         self.btnReset.setEnabled(self._loaded and self.is_edited())
         can_cmp = self._loaded and self.is_edited()
         self.btnCompare.setVisible(can_cmp)
+        self.btnPreview.setVisible(self._loaded)
+        self.btnUpscale.setVisible(self._loaded)
         if not can_cmp and self._cmp is not None:          # back to the original: nothing left to compare
             self._compare_off()
         self.btnCmpMode.setVisible(can_cmp and self._cmp is not None)
@@ -1945,7 +1988,11 @@ class Card(QWidget):
             return
         if not self._loaded or not self.is_edited() or self.canvas._img is None:
             self.btnCompare.setChecked(False)
+            if self._loaded:
+                self.message.emit("Nothing to compare yet: the picture has not been changed.")
             return
+        if self._fq is not None:
+            self._fq_off()
         self._go_move()                                    # the hand: wheel and drag move the picture while comparing
 
         def show(orig):
@@ -1983,6 +2030,146 @@ class Card(QWidget):
         self.btnCompare.setChecked(False)
         self.btnCmpMode.setVisible(False)
 
+    # ------------------------------------------------ real-quality preview
+    def preview_full(self):
+        """The Preview button: on = the picture is shown with all its real pixels, exactly what Save / Copy / drag gives
+        (the editing copy of a big picture is smaller).  Click again = off."""
+        if self._fq is not None:
+            self._fq_off()
+            return
+        if not self._loaded or self.canvas._img is None:
+            self.btnPreview.setChecked(False)
+            return
+        if self.ctx is not None:
+            self.btnPreview.setChecked(False)
+            self._warn("Preview shows the whole page. Click 'Back to the page' first.")
+            return
+        if self._cmp is not None:
+            self._compare_off()
+        self._go_move()                                    # the hand: wheel and drag move the picture
+        args = self.render_args()
+        ver = self._ver
+
+        def work(progress):
+            progress(0.1, "making the real-quality picture")
+            out = core.render_full(*args)
+            progress(0.8, "showing it")
+            rgb = out.convert("RGB")
+            return np_to_qimage(np.asarray(rgb)), rgb.size
+
+        def done(r):
+            q, size = r
+            if self._dead or self._fq is not None or ver != self._ver or not self.btnPreview.isChecked():
+                self.btnPreview.setChecked(self._fq is not None)
+                return
+            self._fq = FullViewOverlay(self.canvas, q, size)
+            self.btnPreview.setChecked(True)
+            self._notify("compare", "Real quality is on",
+                         "%d \u00d7 %d px, as Save / Copy give it. Ctrl+1 = 100%%. Click Preview (F) again to switch it off" % size)
+
+        def fail(msg):
+            self.btnPreview.setChecked(False)
+        self.btnPreview.setChecked(True)
+        self._job("Making the real-quality picture", work, done, fail)
+
+    def _fq_off(self):
+        if self._fq is not None:
+            self._fq.close_overlay()
+            self._fq = None
+        self.btnPreview.setChecked(False)
+
+    # ------------------------------------------------ upscale
+    UPSCALE_STEP = 1.5                                     # set from Settings > Upscale step
+
+    def upscale(self):
+        """The Upscale button: the picture (the page, or the picture layer being edited) gets UPSCALE_STEP times bigger and
+        stays sharp. One click = one undo step; click again for more."""
+        if not self._loaded:
+            return
+        if self._fq is not None:
+            self._fq_off()
+        if self._tool in CROP_KEYS or self._tool == "transform" or self._place_id is not None:
+            self._place_id = None
+            self._hide_layer = None
+            self._go_move()
+        f = float(self.UPSCALE_STEP)
+        base, alpha = self.base, self.alpha
+        if core.upscale_size(base.size, f) is None:
+            self._warn("Already as big as it can get. The limit is %d px on the long side." % core.MAX_UPSCALE_SIDE)
+            return
+        am = (lambda progress: core.upscale_image(alpha, f, mask=True)) if self.ctx is not None and alpha is not None else None
+        self._fx_hint = {"title": "Upscaled", "detail": lambda: "%d \u00d7 %d px  (\u00d7%g)" % (self.base.size[0], self.base.size[1], f)}
+        self._edit_base("Upscaling", lambda progress: core.upscale_image(base, f), keep_sel=False, refit=True, alpha_make=am)
+
+    # ------------------------------------------------ auto crop
+    @staticmethod
+    def _inset_quad(quad, k=0.005):
+        """The 4 corners moved a hair towards the middle, so no dark sliver of the table is left at the edge."""
+        cx = sum(p[0] for p in quad) / 4.0
+        cy = sum(p[1] for p in quad) / 4.0
+        return [(cx + (x - cx) * (1.0 - k), cy + (y - cy) * (1.0 - k)) for x, y in quad]
+
+    def auto_crop(self, adjust=False):
+        """Finds the paper / card / book page in the picture, cuts it out and makes it straight and rectangular.
+        Sure about the page: done at once (Ctrl+Z undoes it).  Not sure, or adjust=True: the 4 corners are shown on the
+        picture, drag them if needed, then Enter."""
+        if not self._loaded:
+            return
+        if self.ctx is not None:
+            self._warn("Auto crop works on the whole page. Click 'Back to the page' first.")
+            return
+        if self._fq is not None:
+            self._fq_off()
+        if self._tool in CROP_KEYS or self._tool == "transform" or self._place_id is not None:
+            self._place_id = None
+            self._hide_layer = None
+            self._go_move()
+        base = self.base
+
+        def work(progress):
+            progress(0.15, "looking for the page")
+            return scanner.detect_document(base, return_score=True)
+
+        def done(r):
+            if self._dead or self.base is not base:
+                return
+            quad, found, info = r
+            W, H = base.size
+            area = abs(sum(quad[i][0] * quad[(i + 1) % 4][1] - quad[(i + 1) % 4][0] * quad[i][1] for i in range(4))) / 2.0
+            sure = found and info["score"] >= AUTO_OK_SCORE and info["edge"] >= AUTO_OK_EDGE and area >= 0.08 * W * H
+            if sure and not adjust:
+                self._warp_apply(self._inset_quad(quad), "Auto cropped")
+                return
+            self._set_tool("persp")                       # show the 4 corners, the user may drag them
+            s = self.scale
+            self.canvas.set_quad([(x * s, y * s) for x, y in quad])
+            if found and sure:
+                self._notify("crop", "Page found", "Drag a corner if it is not exact, then press Enter")
+            elif found:
+                self._notify("crop", "Not sure about the page", "Check the 4 corners, drag them onto the page corners, then press Enter")
+            else:
+                self._notify("crop", "No page found clearly", "Drag the 4 corners onto the page corners, then press Enter")
+        self._job("Looking for the page", work, done)
+
+    def _warp_apply(self, quad, title="Straightened"):
+        """Cut the area inside 4 corners (picture pixels) out and make it a straight rectangle with the page's real proportions."""
+        base, alpha = self.base, self.alpha
+        inlayer = self.ctx is not None
+        back = self._auto_back
+
+        def make(progress):
+            return core.warp_quad(base, quad) if inlayer else scanner.straighten(base, quad)
+        am = (lambda progress: core.warp_quad(alpha.convert("RGB"), quad).convert("L")) if inlayer else None
+
+        def after():
+            self._clear_clone()
+            self._go_move()
+            if back:
+                self._auto_back = False
+                self.leave_layer()
+        self._fx_hint = {"title": title, "detail": lambda: "%d \u00d7 %d px" % self.base.size}
+        self._edit_base("Cropping", make, keep_sel=False, refit=True, after=after, alpha_make=am)
+
     def _cmp_mode(self):
         if self._cmp is None:
             return
@@ -2019,6 +2206,8 @@ class Card(QWidget):
         self._drop_temp_files()
         if self._cmp is not None:
             self._compare_off()
+        if self._fq is not None:
+            self._fq_off()
         for t in ("_timer", "_focus_timer", "_gest_timer", "_bg_timer", "_shadow_timer", "_type_timer"):
             tm = getattr(self, t, None)
             if tm is not None:
@@ -2308,6 +2497,8 @@ class Card(QWidget):
 
     def _touch(self):
         self._ver += 1
+        if self._fq is not None:                       # the picture changed: the real-quality preview is out of date
+            self._fq_off()
         if not self._gest:
             self._cur_snap = self._snap()
         self._update_buttons()
@@ -3879,6 +4070,8 @@ class Card(QWidget):
             self._place_id = None
             self._hide_layer = None
             self._timer.start()
+        if key != "view" and self._fq is not None:                   # a tool needs the editing copy, not the preview
+            self._fq_off()
         mode, shape = TOOL_MODE[key]
         old_tool = self._tool
         self._tool = key
@@ -3899,8 +4092,9 @@ class Card(QWidget):
         pend = key in CROP_KEYS or key == "transform"
         self.btnApply.setVisible(pend)
         self.btnCancel.setVisible(pend)
-        self.optsA.setVisible(sel_t or er or key in ("transform", "paint"))
+        self.optsA.setVisible(sel_t or er or key in ("transform", "paint", "crop", "persp"))
         self.tfBox.setVisible(key == "transform")
+        self.cropBox.setVisible(key in ("crop", "persp"))
         self.optsB.setVisible(sel_t or key in MOVE_KEYS)
         self.modeBox.setVisible(sel_t)
         self.sizeBox.setVisible(key in ("quick", "brush", "erase_brush", "deselect", "paint"))
@@ -4070,7 +4264,8 @@ class Card(QWidget):
             quad = [(x / s, y / s) for x, y in c.quad_img()]
 
             def make(progress):
-                return core.warp_quad(base, quad)
+                # the page keeps the real proportions of the sheet; a picture layer and its transparency must stay the same size
+                return core.warp_quad(base, quad) if inlayer else scanner.straighten(base, quad)
             if inlayer:                                       # the transparency is straightened the same way
                 alpha_make = lambda progress: core.warp_quad(alpha.convert("RGB"), quad).convert("L")
         elif self._tool in CROP_SHAPE:                        # circle / oval / rounded box

@@ -2408,3 +2408,32 @@ def remove_stamp(img, mask):
     result = img.copy()
     result.paste(Image.fromarray(np.clip(res + 0.5, 0, 255).astype(np.uint8)), (box[0], box[1]))
     return result
+
+
+# ---------------------------------------------------------------- upscale
+MAX_UPSCALE_SIDE = 16000            # the longest side an upscaled picture may get (pixels)
+
+
+def upscale_size(size, factor):
+    """New size for an upscale, or None if the result would be too big."""
+    w, h = size
+    nw, nh = max(1, int(round(w * factor))), max(1, int(round(h * factor)))
+    if max(nw, nh) > MAX_UPSCALE_SIDE or nw * nh > Image.MAX_IMAGE_PIXELS * 0.8:
+        return None
+    return nw, nh
+
+
+def upscale_image(img, factor=1.5, mask=False):
+    """Make the picture `factor` times bigger and keep it sharp: Lanczos (no blocky pixels, no halos worth speaking of),
+    then a gentle edge sharpening that only touches real edges (flat paper and photo noise are left alone), so text and
+    lines do not turn soft.  mask=True: a transparency mask - plain smooth resize, no sharpening."""
+    size = upscale_size(img.size, factor)
+    if size is None:
+        raise ValueError("The picture would become too big (more than %d px on the long side)" % MAX_UPSCALE_SIDE)
+    if mask:
+        return img.resize(size, Image.Resampling.BICUBIC)
+    big = img.resize(size, Image.Resampling.LANCZOS)
+    f = max(1.0, float(factor))
+    radius = 0.7 + 0.5 * f                                   # the blur of the resize grows with the factor
+    percent = int(min(120, 45 + 55 * (f - 1.0)))
+    return big.filter(_PilFilter.UnsharpMask(radius=radius, percent=percent, threshold=3))

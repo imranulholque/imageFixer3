@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QDial
 import core
 import updater
 import winutil
-from card import CROP_KEYS, EXPORT_DIR, Card
+from card import CROP_KEYS, EXPORT_DIR, TOOL_KEYS, Card
 from feedback import DropOverlay, install_ripples
 from flow import ElidedLabel
 from savedlg import SaveAllDialog
@@ -381,6 +381,110 @@ class Carousel(QWidget):
     def wheelEvent(self, e):
         e.ignore()          # the wheel belongs to whatever is under the pointer (picture, side panel, thumbnails)
 
+# ---- Settings > Keyboard shortcuts: ONE list; the tool rows come from the same table the keys are registered from
+def _k(tool):
+    return TOOL_KEYS[tool]
+
+
+SHORTCUT_GROUPS = (
+    ("Files and saving", (
+        ("Ctrl+O", "Choose files"),
+        ("Ctrl+V", "Paste pictures (or a PDF) from the clipboard"),
+        ("Ctrl+C", "Copy the picture (full quality)"),
+        ("Ctrl+S", "Save (replaces the original; asked once)"),
+        ("Ctrl+Shift+S", "Save all edited pictures"),
+        ("Ctrl+P", "Print"))),
+    ("Undo / Redo", (
+        ("Ctrl+Z", "Undo, step by step"),
+        ("Ctrl+Y  or  Ctrl+Shift+Z", "Redo"))),
+    ("Select tools", (
+        (_k("brush"), "Brush select"),
+        (_k("rect"), "Box select"),
+        (_k("ellipse"), "Ellipse select"),
+        (_k("lasso"), "Freehand select (lasso)"),
+        (_k("color"), "Color range select"),
+        (_k("deselect"), "Deselect brush"))),
+    ("Move tools", (
+        (_k("move"), "Move  (Alt + drag = copy)"),
+        (_k("copy"), "Copy"),
+        (_k("transform"), "Transform (resize / rotate) the selection"))),
+    ("Erase tools", (
+        (_k("erase_brush"), "Erase brush"),
+        (_k("erase_rect"), "Erase box"),
+        (_k("erase_ellipse"), "Erase ellipse"),
+        (_k("erase_lasso"), "Erase freehand"))),
+    ("Crop tools", (
+        ("A", "AUTO CROP: finds the page / card / book page, crops it and makes it straight"),
+        ("Shift+A", "Auto crop, but first show the 4 corners so you can drag them"),
+        (_k("crop"), "Crop (box)"),
+        (_k("persp"), "Straighten (drag the 4 corners)"),
+        (_k("crop_circle"), "Crop to circle"),
+        (_k("crop_oval"), "Crop to oval"),
+        (_k("crop_round"), "Crop to rounded box"),
+        ("Alt+X", "Crop to the selection shape"),
+        ("R  /  Shift+R", "Turn 90 degrees right / left (picture or text box selected, else the page)"))),
+    ("Other tools", (
+        (_k("pick"), "Eyedropper"),
+        (_k("paint"), "Color brush"),
+        (_k("view"), "Hand (Space + drag also pans)"),
+        ("T", "New text box"))),
+    ("Look at the picture", (
+        ("Q", "Compare with the original: on / off"),
+        ("Shift+Q", "Compare: slider / side by side"),
+        ("F", "Real-quality preview: on / off (every real pixel, as Save / Copy give it; Ctrl+1 for 100%)"),
+        ("U", "Upscale: make the picture bigger and sharp (each press = one step; the step is in Settings)"),
+        ("Ctrl+B", "Show / hide the side panel"))),
+    ("Selection", (
+        ("Ctrl+A", "Select all"),
+        ("Ctrl+D", "Deselect"),
+        ("Ctrl+Shift+I", "Inverse selection"),
+        ("Shift + select", "Add to selection"),
+        ("Alt + select", "Subtract from selection"),
+        ("Delete / Backspace", "Delete the selection (filled from the paper around it)"))),
+    ("Transform / placing a picture or text box", (
+        ("Enter", "Apply (also Crop, Straighten and the Auto crop corners)"),
+        ("Esc", "Cancel"),
+        ("Arrow keys", "Nudge 1 px  (Shift = 10 px)"),
+        ("[  and  ]", "Rotate 1 degree"),
+        ("Ctrl+[  and  Ctrl+]", "Rotate 15 degrees"),
+        ("Ctrl+Alt+Left / Right", "Rotate 90 degrees"),
+        ("Shift + drag", "Dead straight (sideways, up / down or diagonal)"),
+        ("Alt + drag", "Copy instead of move"),
+        ("Double click", "Edit the text of a text box"))),
+    ("Layers (overlay pictures and text boxes)", (
+        ("Ctrl+Alt+Up", "Move the selected layer UP one step"),
+        ("Ctrl+Alt+Down", "Move the selected layer DOWN one step"),
+        ("Ctrl+Alt+Shift+Up", "Bring the selected layer to the very TOP"),
+        ("Ctrl+Alt+Shift+Down", "Send the selected layer to the very BOTTOM"),
+        ("Delete", "Remove the selected layer"),
+        ("Ctrl + click", "Select a layer while another tool is active"),
+        ("Click empty place", "Done / deselect the layer"))),
+    ("View", (
+        ("Ctrl + wheel", "Zoom"),
+        ("Ctrl +  /  Ctrl -", "Zoom in / out"),
+        ("Ctrl+0", "Fit to window"),
+        ("Ctrl+1", "Actual size (100%)"),
+        ("Wheel", "Up / down (Shift + wheel = left / right)"),
+        ("Left / Right", "Previous / next picture"))),
+    ("Thumbnails (bottom)", (
+        ("Click, Ctrl+click, Shift+click", "Select one / many"),
+        ("Ctrl+A", "Select all"),
+        ("Del", "Remove selected from the list (files stay)"))),
+)
+
+
+def shortcuts_html():
+    from html import escape
+    out = []
+    for title, rows in SHORTCUT_GROUPS:
+        out.append("<h3 style='margin:12px 0 4px'>%s</h3><table cellspacing='0' cellpadding='3'>" % escape(title))
+        for keys, text in rows:
+            out.append("<tr><td style='white-space:nowrap; padding-right:18px'><b>%s</b></td><td>%s</td></tr>"
+                       % (escape(keys), escape(text)))
+        out.append("</table>")
+    return "\n".join(out)
+
+
 
 # ------------------------------------------------------------- main window
 class MainWindow(QMainWindow):
@@ -440,6 +544,7 @@ class MainWindow(QMainWindow):
         install_ripples(QApplication.instance())   # every button gives a soft wave where it is pressed
         self.updater.start()                      # auto update: looks for a new build a few seconds after start (if switched on)
         self._apply_ui_size(self.settings.value("ui_size", "auto", type=str), say=False)
+        self._apply_upscale(self.settings.value("upscale_step", "1.5", type=str), say=False)
         self._fit_layout()
         self._refresh_dir()
         self._refresh_counts()
@@ -620,6 +725,8 @@ class MainWindow(QMainWindow):
         self._radio_menu(m, "Interface size", "ui_size", self._apply_ui_size,
                          (("auto", "Automatic"), ("small", "Small"), ("normal", "Normal"), ("large", "Large"),
                           ("xl", "Extra large")))
+        self._radio_menu(m, "Upscale step (each click on Upscale)", "upscale_step", self._apply_upscale,
+                         (("1.25", "A little  (x 1.25)"), ("1.5", "Normal  (x 1.5)"), ("2", "Double  (x 2)")), default="1.5")
         m.addSeparator()
         q = QAction("Exit Image Fixer", self)
         q.triggered.connect(self.quit_app)
@@ -633,7 +740,7 @@ class MainWindow(QMainWindow):
         dlg.resize(620, 640)
         lay = QVBoxLayout(dlg)
         view = QTextBrowser()
-        view.setHtml("<h3 style='margin:12px 0 4px'>Files and saving</h3><table cellspacing='0' cellpadding='3'><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl+O</b></td><td>Choose files</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl+V</b></td><td>Paste pictures (or a PDF) from the clipboard</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl+C</b></td><td>Copy the picture</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl+S</b></td><td>Save (replaces the original; asked once)</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl+Shift+S</b></td><td>Save all edited pictures</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl+P</b></td><td>Print</td></tr></table>\n<h3 style='margin:12px 0 4px'>Undo / Redo</h3><table cellspacing='0' cellpadding='3'><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl+Z</b></td><td>Undo, step by step</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl+Y  or  Ctrl+Shift+Z</b></td><td>Redo</td></tr></table>\n<h3 style='margin:12px 0 4px'>Tools (press the letter)</h3><table cellspacing='0' cellpadding='3'><tr><td style='white-space:nowrap; padding-right:18px'><b>V</b></td><td>Move</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>M</b></td><td>Box select</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>L</b></td><td>Freehand select (lasso)</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>W</b></td><td>Color range select</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>B</b></td><td>Brush select</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>E</b></td><td>Erase brush</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>C</b></td><td>Crop</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>I</b></td><td>Eyedropper</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>P</b></td><td>Color brush</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>H</b></td><td>Hand (Space + drag also pans)</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>T</b></td><td>New text box</td></tr></table>\n<h3 style='margin:12px 0 4px'>Selection</h3><table cellspacing='0' cellpadding='3'><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl+A</b></td><td>Select all</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl+D</b></td><td>Deselect</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl+Shift+I</b></td><td>Inverse selection</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Shift + select</b></td><td>Add to selection</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Alt + select</b></td><td>Subtract from selection</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Delete / Backspace</b></td><td>Delete the selection (filled from the paper around it)</td></tr></table>\n<h3 style='margin:12px 0 4px'>Transform / placing a picture or text box</h3><table cellspacing='0' cellpadding='3'><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl+T</b></td><td>Transform the selection</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Enter</b></td><td>Apply</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Esc</b></td><td>Cancel</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Arrow keys</b></td><td>Nudge 1 px  (Shift = 10 px)</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>[  and  ]</b></td><td>Rotate 1 degree</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl+[  and  Ctrl+]</b></td><td>Rotate 15 degrees</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl+Alt+Left / Right</b></td><td>Rotate 90 degrees</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>R  /  Shift+R</b></td><td>Turn 90 degrees right / left (picture or text box selected, else the page)</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Shift + drag</b></td><td>Dead straight (sideways, up / down or diagonal)</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Alt + drag</b></td><td>Copy instead of move</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Double click</b></td><td>Edit the text of a text box</td></tr></table>\n<h3 style='margin:12px 0 4px'>Layers (overlay pictures and text boxes)</h3><table cellspacing='0' cellpadding='3'><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl+Alt+Up</b></td><td>Move the selected layer UP one step</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl+Alt+Down</b></td><td>Move the selected layer DOWN one step</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl+Alt+Shift+Up</b></td><td>Bring the selected layer to the very TOP</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl+Alt+Shift+Down</b></td><td>Send the selected layer to the very BOTTOM</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Delete</b></td><td>Remove the selected layer</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl + click</b></td><td>Select a layer while another tool is active</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Click empty place</b></td><td>Done / deselect the layer</td></tr></table>\n<h3 style='margin:12px 0 4px'>View</h3><table cellspacing='0' cellpadding='3'><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl + wheel</b></td><td>Zoom</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl +  /  Ctrl -</b></td><td>Zoom in / out</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl+0</b></td><td>Fit to window</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl+1</b></td><td>Actual size (100%)</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Wheel</b></td><td>Up / down (Shift + wheel = left / right)</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Left / Right</b></td><td>Previous / next picture</td></tr></table>\n<h3 style='margin:12px 0 4px'>Thumbnails (bottom)</h3><table cellspacing='0' cellpadding='3'><tr><td style='white-space:nowrap; padding-right:18px'><b>Click, Ctrl+click, Shift+click</b></td><td>Select one / many</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Ctrl+A</b></td><td>Select all</td></tr><tr><td style='white-space:nowrap; padding-right:18px'><b>Del</b></td><td>Remove selected from the list (files stay)</td></tr></table>")
+        view.setHtml(shortcuts_html())
         lay.addWidget(view)
         close = QPushButton("Close")
         close.clicked.connect(dlg.accept)
@@ -649,11 +756,11 @@ class MainWindow(QMainWindow):
                     "Made by <b>%s</b><br><br>Version: %s" % (AUTHOR, updater.version_text()))
         box.exec()
 
-    def _radio_menu(self, menu, title, key, fn, choices):
+    def _radio_menu(self, menu, title, key, fn, choices, default="auto"):
         sub = menu.addMenu(title)
         grp = QActionGroup(self)
         grp.setExclusive(True)
-        cur = self.settings.value(key, "auto", type=str)
+        cur = self.settings.value(key, default, type=str)
         for val, text in choices:
             a = QAction(text, self)
             a.setCheckable(True)
@@ -882,10 +989,19 @@ class MainWindow(QMainWindow):
         sc("Enter", cur(lambda c: c.apply_pending()), lambda: "Apply" if self._pending_active() else None)
         sc("Escape", cur(lambda c: c.cancel_pending()), lambda: "Cancel" if self._pending_active() else None)
         # tools (single letters, like in a picture editor): the toast of the tool says the letter
-        for key, tool in (("V", "move"), ("M", "rect"), ("L", "lasso"), ("W", "color"), ("B", "brush"),
-                          ("E", "erase_brush"), ("C", "crop"), ("I", "pick"), ("P", "paint"), ("H", "view")):
-            sc(key, cur(lambda c, t=tool: c.choose_tool(t)))
+        for tool, key in TOOL_KEYS.items():                      # every tool has a key (Ctrl+T = Transform is registered above)
+            if tool != "transform":
+                sc(key, cur(lambda c, t=tool: c.choose_tool(t)))
         sc("T", cur(lambda c: c.add_text_layer()), "Text box")
+        sc("Alt+X", cur(lambda c: c.crop_to_selection()), "Crop to the selection shape")
+        # auto crop, compare, real-quality preview, upscale, panel
+        sc("A", cur(lambda c: c.auto_crop(False)), "Auto crop")
+        sc("Shift+A", cur(lambda c: c.auto_crop(True)), "Auto crop (check the corners)")
+        sc("Q", cur(lambda c: c.compare()), "Compare with the original")
+        sc("Shift+Q", cur(lambda c: c._cmp_mode()), "Compare: slider / side by side")
+        sc("F", cur(lambda c: c.preview_full()), "Real-quality preview")
+        sc("U", cur(lambda c: c.upscale()), "Upscale")
+        sc("Ctrl+B", cur(lambda c: c.toggle_panel()), "Show / hide the side panel")
         # layer order (which overlay / text box is above which)
         sc("Ctrl+Alt+Up", cur(lambda c: c.order_selected(1)), "Layer up")
         sc("Ctrl+Alt+Down", cur(lambda c: c.order_selected(-1)), "Layer down")
@@ -1022,6 +1138,16 @@ class MainWindow(QMainWindow):
         core.set_preview_max(n)
         if say:
             self.say("Picture detail set. It is used for pictures opened from now on (up to %d px on the long side)." % n)
+
+    def _apply_upscale(self, v, say=True):
+        """Settings > Upscale step: how much bigger the picture gets with one click on Upscale."""
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            f = 1.5
+        Card.UPSCALE_STEP = min(4.0, max(1.1, f))
+        if say:
+            self.say("Every click on Upscale now makes the picture x %g bigger." % Card.UPSCALE_STEP)
 
     def _apply_ui_size(self, mode, say=True):
         """Text / button size: automatic = from the screen (small laptop screens a bit smaller, 4K a bit larger)."""

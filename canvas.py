@@ -763,6 +763,12 @@ class ImageCanvas(QWidget):
     def quad_img(self):
         return [(q.x(), q.y()) for q in self._quad]
 
+    def set_quad(self, pts):
+        """Put the 4 corner points of the Straighten tool somewhere (picture pixels of the on-screen copy)."""
+        if len(pts) == 4:
+            self._quad = [QPointF(float(x), float(y)) for x, y in pts]
+            self.update()
+
     def set_quick_brush(self, size_prev):
         self.quick_prev = max(1.0, float(size_prev))
         self.update()

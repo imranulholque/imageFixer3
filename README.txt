@@ -21,7 +21,11 @@ Clean many text pictures (WhatsApp photos, scans) and print them. One big card p
                 Even out the light, Shadow size, Lift shadows, Whiten paper, Darken text. Select a part first = fix only that part.
  - Text tab:    Text sharpness, Line & shape sharpness, Faint strokes, Text darkness, Clean specks.
  - Erase v:     Brush / Box / Ellipse / Freehand: filled from around. Alt + click = copy from that spot.
- - Crop v:      Crop, Straighten (4 corners), Crop to circle / oval / rounded box / the selection shape, Rotate left / right.
+ - Crop v:      AUTO CROP (key A), Crop (C), Straighten (S, 4 corners), Crop to circle / oval / rounded box / the selection shape, Rotate left / right.
+                AUTO CROP finds the paper / ID card / book page / newspaper in the photo (on a plain, wooden, cloth or busy background),
+                cuts it out, removes the camera angle and keeps the real shape of the sheet.  When it is sure, it crops at once (Ctrl+Z
+                undoes it).  When it is not sure, or with Shift+A ("Auto crop, then let me fix the corners"), the 4 corners are put on
+                the page and you can drag them, then Enter.  In Crop / Straighten, the button "Find the page automatically" does the same.
                 A picture you placed (signature, stamp ...): select it, then pick any crop - it is cropped alone and becomes
                 transparent outside the shape. (Click outside the picture first to crop the page instead.)
 Slow work shows a progress bar at the bottom; the window stays usable.
@@ -194,3 +198,17 @@ TEXT BOX  (Aa tab, or the "T  Text box" button in the top bar)
 - Look: size (pt, as on A4), Bold / Italic / Underline / Strike, UPPERCASE / lowercase / Small caps / Capitalize, Left / Center /
   Right / Justify, text color, opacity, letter spacing, line spacing, box width (wrapping), outline, shadow and a highlight box.
   The last look you used is used for the next new text box.
+
+COMPARE / PREVIEW / UPSCALE  (top right of a picture)
+ - Compare (key Q; Shift+Q = slider / side by side): the original and the edited picture together. Click or press again to switch it off.
+ - Preview (key F): "real quality".  While you edit, a big picture is shown a little smaller so the program stays fast.  Preview shows the
+   full-resolution result - every real pixel, exactly what Save, Copy (Ctrl+C) and drag-out to another program give.  Ctrl+1 = 100%.
+   Wheel / drag still move the picture.  Any change of the picture switches Preview off.  (Save / Copy / drag always use the full picture.)
+ - Upscale (key U): makes the picture bigger and keeps it sharp.  Every click = one step (Settings > Upscale step: x1.25, x1.5, x2).
+   Ctrl+Z undoes it.  Limit: 16000 px on the long side.
+
+KEYS OF EVERY TOOL  (also listed in Settings > Keyboard shortcuts)
+ Select: B brush, M box, Shift+M ellipse, L freehand, W color range, Shift+D deselect brush.   Move: V, Shift+V copy, Ctrl+T transform.
+ Erase: E brush, Shift+E box, Ctrl+E ellipse, Alt+E freehand.   Crop: A auto crop, Shift+A auto crop + fix corners, C crop, S straighten,
+ Shift+C circle, Ctrl+Shift+C oval, Alt+C rounded box, Alt+X selection shape, R / Shift+R turn 90 degrees.
+ Others: I eyedropper, P color brush, H hand, T text box, Q compare, Shift+Q compare mode, F real-quality preview, U upscale, Ctrl+B panel.
