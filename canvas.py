@@ -62,6 +62,9 @@ class ImageCanvas(QWidget):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMinimumSize(240, 240)
         self._img = None
+        self._bare = None                     # the page WITHOUT the layers (shown instead of _img while layers are drawn live)
+        self._live = []                       # layers drawn live over it, at screen resolution: dicts img / pts / n
+        self._live_small = {}
         self._src = None
         self._iw = 0
         self._ih = 0
@@ -123,6 +126,7 @@ class ImageCanvas(QWidget):
     # ------------------------------------------------------------ content
     def set_message(self, text):
         self._img = None
+        self._bare, self._live = None, []
         self._src = None
         self._iw = self._ih = 0
         self._msg = text
@@ -131,6 +135,7 @@ class ImageCanvas(QWidget):
     def set_images(self, qimg, src):
         """New picture (or new size): show it fitted to the window."""
         self._img = qimg
+        self._bare, self._live = None, []
         self._src = src
         self._iw, self._ih = qimg.width(), qimg.height()
         self._drag = None
@@ -141,9 +146,13 @@ class ImageCanvas(QWidget):
         self._fit()
         self._update_cursor()
 
-    def set_display(self, qimg, src=None):
-        """Same size, new pixels (slider moved): keep zoom and position."""
+    def set_display(self, qimg, src=None, bare=None):
+        """Same size, new pixels (slider moved): keep zoom and position.  bare = the page without its layers (the layers
+        are then drawn live, see set_live); without it the picture is shown as it is."""
         self._img = qimg
+        self._bare = bare
+        if bare is None:
+            self._live = []
         if src is not None:
             self._src = src
         self.update()
@@ -777,12 +786,69 @@ class ImageCanvas(QWidget):
         self.clone_delta = None if delta is None else QPointF(delta[0], delta[1])
         self.update()
 
+    # ------------------------------------------------ layers drawn live (sharp at any zoom)
+    def set_bare(self, bare):
+        """The page without its layers (None: the shown picture already has them baked in)."""
+        self._bare = bare
+        if bare is None:
+            self._live = []
+        self.update()
+
+    def set_live(self, layers):
+        """Layers to draw over the page at screen resolution: [{'img': QImage, 'pts': [(x, y) ...] in picture pixels, 'n': n}].
+        Only used while the page without layers (set_bare) is known - else the baked picture is shown as before."""
+        self._live = list(layers) if (self._bare is not None and layers) else []
+        keep = {L["img"].cacheKey() for L in self._live}
+        self._live_small = {k: v for k, v in self._live_small.items() if k[0] in keep}
+        self.update()
+
+    def _disp(self):
+        return self._bare if (self._live and self._bare is not None) else self._img
+
+    def _small(self, img, want):
+        """The layer picture shrunk (area filter) to about the size it is shown at: thin strokes stay sharp."""
+        key = (img.cacheKey(), int(want) // 6 * 6)
+        hit = self._live_small.get(key)
+        if hit is None:
+            hit = img.scaledToWidth(max(1, key[1]), Qt.TransformationMode.SmoothTransformation)
+            self._live_small[key] = hit
+        return hit
+
+    def _paint_live(self, p):
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        dpr = self._dpr()
+        for L in self._live:
+            img, n = L["img"], L["n"]
+            wp = [self.to_wid(QPointF(x, y)) for x, y in L["pts"]]
+            a, b, c, d = wp[0], wp[n], wp[n * (n + 1)], wp[-1]
+            tw = max(math.hypot(a.x() - b.x(), a.y() - b.y()), math.hypot(c.x() - d.x(), c.y() - d.y()))
+            want = int(tw * dpr)
+            if want >= 8 and img.width() > want * 1.3:
+                img = self._small(img, want)
+            w, h = float(img.width()), float(img.height())
+            for i in range(n):
+                for j in range(n):
+                    sq = [QPointF(j * w / n, i * h / n), QPointF((j + 1) * w / n, i * h / n),
+                          QPointF((j + 1) * w / n, (i + 1) * h / n), QPointF(j * w / n, (i + 1) * h / n)]
+                    dq = [wp[i * (n + 1) + j], wp[i * (n + 1) + j + 1], wp[(i + 1) * (n + 1) + j + 1], wp[(i + 1) * (n + 1) + j]]
+                    try:
+                        H = core.homography([(q.x(), q.y()) for q in sq], [(q.x(), q.y()) for q in dq])
+                    except Exception:
+                        continue
+                    p.save()
+                    p.setTransform(QTransform(H[0, 0], H[1, 0], H[2, 0], H[0, 1], H[1, 1], H[2, 1], H[0, 2], H[1, 2], H[2, 2]))
+                    p.drawImage(QRectF(sq[0], sq[2]), img, QRectF(sq[0], sq[2]))
+                    p.restore()
+        p.restore()
+
     # -------------------------------------------------------------- crisp zoom-out
     def _dpr(self):
         return max(1.0, float(self.devicePixelRatioF()))
 
     def _scaled_key(self):
-        return (self._img.cacheKey(), round(self.zoom, 4), round(self._dpr(), 2))
+        return (self._disp().cacheKey(), round(self.zoom, 4), round(self._dpr(), 2))
 
     def _scaled_ready(self):
         """The shrunk copy for the current zoom, or None (then the normal drawing is used and a better copy is made
@@ -802,7 +868,7 @@ class ImageCanvas(QWidget):
         w = max(1, int(round(self._iw * self.zoom * dpr)))
         h = max(1, int(round(self._ih * self.zoom * dpr)))
         key = self._scaled_key()
-        s = self._img.scaled(w, h, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        s = self._disp().scaled(w, h, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
         s.setDevicePixelRatio(dpr)
         self._scaled = (key, s)
         self.update()
@@ -824,8 +890,10 @@ class ImageCanvas(QWidget):
             p.save()
             p.translate(self.off)
             p.scale(self.zoom, self.zoom)
-            p.drawImage(0, 0, self._img)
+            p.drawImage(0, 0, self._disp())
             p.restore()
+        if self._live:
+            self._paint_live(p)
         pv = self._preview_image() if (self.sel_preview and self.mode == self.SELECT) else None
         if pv is not None:                                  # Color range preview: white = selected, black = not
             p.save()

@@ -74,6 +74,8 @@ LAYERS (own tab: "Layers", right side after Aa): one list with every overlay pic
  Keys: Ctrl+Alt+Up / Down (one step), Ctrl+Alt+Shift+Up / Down (to the very top / bottom).
  Picture tab = only add a picture + its background settings. Aa tab = text settings.
  Text boxes are named "Text box 1, 2 ..." (not by their words). Changing color / size / font / shadow in the Aa tab shows on the page at once.
+ Overlay pictures and text boxes are drawn on the screen live at their own full sharpness (also when zoomed in), not baked into the
+ page's smaller on-screen copy, so you can judge the edit. Save / print always use the full-size picture.
  Every shortcut is listed in Settings > Keyboard shortcuts...
 
 SETTINGS (top right): start with Windows, Send to entry, save folder, Auto update.

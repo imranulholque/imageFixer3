@@ -2099,9 +2099,11 @@ class Card(QWidget):
         lab = core.rgb_to_lab(prev) if core.active_adjs(adjs) else None
         out = core.render(prev, adjs, look, lab=lab, cache=cache,
                           sel=sel if (sel is not None and sel.shape == prev.shape[:2]) else None)
+        bare = np_to_qimage(out) if deco is not None else None       # the page without its layers (they are drawn live)
         if deco is not None:
             out = deco(out)
-        return {"prev": prev, "scale": scale, "lab": lab, "cache": cache, "out": out, "qimg": np_to_qimage(out)}
+        return {"prev": prev, "scale": scale, "lab": lab, "cache": cache, "out": out, "qimg": np_to_qimage(out),
+                "bare": bare}
 
     @staticmethod
     def _deco_from(ctx, alpha, layers, hide=None, cache=None):
@@ -2150,8 +2152,10 @@ class Card(QWidget):
         qimg = v.get("qimg") or np_to_qimage(v["out"])
         if refit:
             self.canvas.set_images(qimg, self.prev)
+            self.canvas.set_bare(v.get("bare"))
         else:
-            self.canvas.set_display(qimg, self.prev)
+            self.canvas.set_display(qimg, self.prev, v.get("bare"))
+        self._sync_live()
         self.canvas.set_selection(self.sel)
         self._hl_key = None
         self._sel_label()
@@ -2173,6 +2177,49 @@ class Card(QWidget):
             if a["id"] == self._focus_id:
                 return a
         return None
+
+    _live_cache = None
+
+    def _live_image(self, l):
+        """The layer's picture for drawing on screen: big (sharp when zoomed in), kept until the layer changes."""
+        if self._live_cache is None:
+            self._live_cache = {}
+        sig = (id(l["rgb"]), id(l["a"]), l.get("opacity", 100))
+        hit = self._live_cache.get(l["id"])
+        if hit is not None and hit[0] == sig:
+            return hit[2]
+        rgba = core.layer_rgba(l, pend=False)
+        f = min(1.0, 2400.0 / max(rgba.size))
+        if f < 1.0:
+            rgba = rgba.resize((max(1, int(rgba.width * f)), max(1, int(rgba.height * f))), Image.Resampling.LANCZOS)
+        arr = np.ascontiguousarray(np.asarray(rgba))
+        qi = QImage(arr.data, arr.shape[1], arr.shape[0], arr.shape[1] * 4, QImage.Format.Format_RGBA8888).copy()
+        self._live_cache[l["id"]] = (sig, (l["rgb"], l["a"]), qi)     # (the objects are kept so their ids stay unique)
+        return qi
+
+    def _sync_live(self):
+        """Draw every visible layer on the screen at full sharpness (the one being moved is drawn by the Transform box).
+        The page itself comes without layers; saving / printing never use this (they are made at full size)."""
+        cv = getattr(self, "canvas", None)
+        if cv is None or self.prev is None:
+            return
+        if self.ctx is not None or cv._bare is None:
+            cv.set_live([])
+            return
+        PH, PW = self.prev.shape[:2]
+        live = []
+        for l in self.layers:
+            if not l.get("visible", True) or l["id"] == self._hide_layer:
+                continue
+            try:
+                live.append({"img": self._live_image(l), "pts": [(x * PW, y * PH) for x, y in l["grid"]], "n": l["n"]})
+            except Exception:
+                _log("live layer")
+                cv.set_live([])
+                return
+        if self._live_cache:
+            self._live_cache = {k: v for k, v in self._live_cache.items() if any(x["id"] == k for x in self.layers)}
+        cv.set_live(live)
 
     def _compute(self):
         """Render on the spot (tests, small jobs)."""
@@ -2221,19 +2268,20 @@ class Card(QWidget):
                 out0 = core.render(prev, adjs, look, lab=lab, cache=cache, sel=sel)
             out = deco(out0) if deco is not None else out0
             hl = None if focus is None else core.get_mask(prev, focus, lab, cache)
-            return np_to_qimage(out), hl, lab, out0
+            return np_to_qimage(out), hl, lab, out0, (np_to_qimage(out0) if deco is not None else None)
 
         def done(res):
             self._rendering = False
             if self._dead:
                 return
             if gen == self._view_gen:
-                out, hl, lab, out0 = res
+                out, hl, lab, out0, bare = res
                 if bkey is not None:
                     self._base_cache = (bkey, (prev, sel, self.base), out0)
                 if self._lab is None and lab is not None:
                     self._lab = lab
-                self.canvas.set_display(out)
+                self.canvas.set_display(out, None, bare)
+                self._sync_live()
                 self._show_highlight(focus, hl)
             if self._again:
                 self._again = False
@@ -2870,6 +2918,7 @@ class Card(QWidget):
     def toggle_layer(self, lid, visible):
         self._checkpoint()
         self._replace_layer(lid, visible=bool(visible))
+        self._sync_live()
         self._touch()
         self._timer.start()
 
@@ -2930,6 +2979,7 @@ class Card(QWidget):
         self._place_id = None
         self._hide_layer = None
         self._go_move()
+        self._sync_live()
         self._timer.start()
 
     def _layer_at(self, x, y, skip=None):
@@ -3238,6 +3288,7 @@ class Card(QWidget):
                                       "R = turn 90°, Delete = remove, click outside = done.  To change which one is in front "
                                       "use the Layers tab.")
         self.btnLayerDone.setVisible(self.ctx is not None)
+        self._sync_live()
         l = None if self.sel_layer is None else self._layer(self.sel_layer)
         self.bgGroup.setEnabled(self.ctx is None and l is not None and l.get("text") is None)
         tp = getattr(self, "textPanel", None)
