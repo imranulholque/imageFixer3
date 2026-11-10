@@ -212,3 +212,11 @@ KEYS OF EVERY TOOL  (also listed in Settings > Keyboard shortcuts)
  Erase: E brush, Shift+E box, Ctrl+E ellipse, Alt+E freehand.   Crop: A auto crop, Shift+A auto crop + fix corners, C crop, S straighten,
  Shift+C circle, Ctrl+Shift+C oval, Alt+C rounded box, Alt+X selection shape, R / Shift+R turn 90 degrees.
  Others: I eyedropper, P color brush, H hand, T text box, Q compare, Shift+Q compare mode, F real-quality preview, U upscale, Ctrl+B panel.
+
+NEW (less memory): old Undo / Redo steps live on the disk
+- Only the newest 2 steps of a picture stay in memory; older ones are written (lossless, raw pixels) to a temporary
+  folder and read back by Ctrl+Z / Ctrl+Y.  Saved, copied and printed pictures are exactly as sharp as before.
+- The history is now deeper (up to 40 different pictures per page instead of 12) and uses far less RAM.
+- If the disk has less than 2 GB free, or writing fails, the program silently goes back to keeping steps in memory.
+- Temporary files are removed when a picture is closed, when the program exits, and at the next start after a crash
+  (folders named ImageFixer_undo_* in the Windows temp folder).

@@ -107,6 +107,11 @@ def main():
     name = "ImageFixer-" + (os.environ.get("USERNAME") or os.environ.get("USER") or "user")
     if forward(name, paths):
         return 0
+    try:
+        import spill
+        spill.cleanup_old()                       # temporary undo files left by a crashed / killed session
+    except Exception:
+        pass
 
     # not running yet: load the heavy parts now (numpy, Pillow, the window)
     import ui

@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (QSplitter, QApplication, QButtonGroup, QCheckBox,
                                QVBoxLayout, QWidget)
 
 import core
+import spill
 import textbox
 from canvas import ImageCanvas, np_to_qimage
 from compare import CompareOverlay
@@ -2567,11 +2568,28 @@ class Card(QWidget):
                 "shadow": self._shadow_done, "sel": self.sel, "ops": self.ops, "shadow_src": self.shadow_src,
                 "ctx": self.ctx, "alpha": self.alpha, "stash": self._stash, "layers": list(self.layers)}
 
+    KEEP_RESIDENT = 2          # the newest steps stay in memory (instant undo); older ones live on the disk, lossless
+
+    def _spill_old(self, steps):
+        """Old steps: their big pictures go to a temporary file (raw pixels, no quality loss, read back by Undo / Redo)."""
+        if not spill.can_write():
+            return
+        for i in range(len(steps) - self.KEEP_RESIDENT):
+            if not spill.is_demoted(steps[i]):
+                steps[i] = spill.demote(steps[i])
+
+    def _history_too_big(self, disk):
+        n, nbytes = spill.cost(self.undo)
+        if disk:
+            return n > spill.MAX_PICTURES or nbytes > spill.MAX_BYTES
+        return n > 12                                # no room on the disk: the old memory limit
+
     def _push_undo(self, st):
         self.undo.append(st)
         self.redo = []
-        while len(self.undo) > 80 or len({id(x) for e in self.undo for x in [e["base"], e.get("shadow_src")] + [l["rgb"] for l in e.get("layers", [])]
-                                      if x is not None}) > 12:
+        self._spill_old(self.undo)
+        disk = spill.can_write()
+        while len(self.undo) > 80 or (len(self.undo) > 1 and self._history_too_big(disk)):
             self.undo.pop(0)
         self._update_buttons()
 
@@ -2668,10 +2686,19 @@ class Card(QWidget):
             fx.info("undo", "Nothing to undo", "this is how it was opened")
             return
         st = self.undo.pop()
+        try:
+            st = spill.promote(st)
+        except Exception as ex:                      # the temporary file was removed by something else
+            _log("undo: %s" % ex)
+            self.undo = []
+            self._update_buttons()
+            fx.info("undo", "Cannot undo further", "the temporary undo file is gone")
+            return
         lab = st.get("label") or "last change"
         snap = self._snap()
         snap["label"] = lab
         self.redo.append(snap)
+        self._spill_old(self.redo)
         self._goto(st)
         fx.info("undo", "Undo", lab + (", %d more to undo" % len(self.undo) if self.undo else ", back to the start"))
         fx.pulse("undo")
@@ -2688,10 +2715,19 @@ class Card(QWidget):
             fx.info("redo", "Nothing to redo")
             return
         st = self.redo.pop()
+        try:
+            st = spill.promote(st)
+        except Exception as ex:
+            _log("redo: %s" % ex)
+            self.redo = []
+            self._update_buttons()
+            fx.info("redo", "Cannot redo", "the temporary undo file is gone")
+            return
         lab = st.get("label") or "change"
         snap = self._snap()
         snap["label"] = lab
         self.undo.append(snap)
+        self._spill_old(self.undo)
         self._goto(st)
         fx.info("redo", "Redo", lab + (", %d more to redo" % len(self.redo) if self.redo else ""))
         fx.pulse("redo")
