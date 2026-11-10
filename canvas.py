@@ -626,7 +626,7 @@ class ImageCanvas(QWidget):
         poly = QPolygonF(self._corners())
         if poly.containsPoint(self.to_img(pos), Qt.FillRule.OddEvenFill):
             return "move"
-        return "outside" if t.get("layer") else "rotate"
+        return "outside" if self._tf.get("layer") else "rotate"
 
     def _tf_start(self, hit, ip):
         t = self._tf
