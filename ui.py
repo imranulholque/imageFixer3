@@ -67,10 +67,7 @@ class Strip(QListWidget):
     removeRequested = Signal(list)      # uids of the selected pictures
     copyRequested = Signal(list)
     duplicateRequested = Signal(list)
-    overlayRequested = Signal(list)     # put these pictures on the picture that is being worked on
     printRequested = Signal(list)
-    menuClosed = Signal()
-    current_uid = None                  # set by the window: the uid of the picture that is being worked on
     stepRequested = Signal(int)         # wheel over the thumbnails: +1 = next picture, -1 = previous
 
     def __init__(self):
@@ -140,44 +137,26 @@ class Strip(QListWidget):
         super().keyPressEvent(e)
 
     def _context_menu(self, pos):
-        cur = self.current_uid() if self.current_uid else None
         it = self.itemAt(pos)
-        changed = False
         if it is not None and not it.isSelected():
-            # a right-click only SELECTS the thumbnail: it must not slide to it, because 'Add as overlay' puts the
-            # picture on the one that is being worked on
-            self.blockSignals(True)
             self.clearSelection()
             it.setSelected(True)
-            self.blockSignals(False)
-            changed = True
         u = self.uids()
         n = len(u)
         what = "this picture" if n == 1 else "%d pictures" % n
-        others = [x for x in u if x != cur]
         m = QMenu(self)
         a_dup = m.addAction("Duplicate %s" % what)
-        if len(others) > 1:
-            ov_text = "Add these %d pictures as overlays on the picture I am working on" % len(others)
-        else:
-            ov_text = "Add this picture as overlay on the picture I am working on"
-        a_ov = m.addAction(ov_text)
         a_pr = m.addAction("Print %s\tCtrl+P" % what)
         m.addSeparator()
         a_rm = m.addAction("Remove %s\tDel" % what)
         a_cp = m.addAction("Copy %s\tCtrl+C" % what)
-        m.addSeparator()
-        a_all = m.addAction("Select all\tCtrl+A")
         for a_ in (a_dup, a_pr, a_rm, a_cp):
             a_.setEnabled(n > 0)
-        a_ov.setEnabled(bool(others) and cur is not None)
-        if cur is not None and n > 0 and not others:
-            a_ov.setToolTip("This is the picture you are working on. Right-click another picture to put it on this one.")
+        m.addSeparator()
+        a_all = m.addAction("Select all\tCtrl+A")
         act = m.exec(self.viewport().mapToGlobal(pos))
         if act is a_dup:
             self.duplicateRequested.emit(u)
-        elif act is a_ov:
-            self.overlayRequested.emit(others)
         elif act is a_pr:
             self.printRequested.emit(u)
         elif act is a_rm:
@@ -186,15 +165,6 @@ class Strip(QListWidget):
             self.copyRequested.emit(u)
         elif act is a_all:
             self.selectAll()
-            changed = False
-        if changed and cur is not None:                 # the selection goes back to the picture that is shown
-            for r in range(self.count()):
-                if self.item(r).data(Qt.ItemDataRole.UserRole) == cur:
-                    self.blockSignals(True)
-                    self.setCurrentRow(r, QItemSelectionModel.SelectionFlag.ClearAndSelect)
-                    self.blockSignals(False)
-                    break
-        self.menuClosed.emit()
 
     # ---- mouse: Qt does the selection; we start the drag ourselves
     def mousePressEvent(self, e):
@@ -446,7 +416,7 @@ SHORTCUT_GROUPS = (
         ("Ctrl+S", "Save (replaces the original; asked once)"),
         ("Ctrl+Shift+S", "Save all edited pictures"),
         ("Ctrl+P", "Print: opens your print program (Settings > Print program) with the selected pictures, or with this picture; without a program it opens the Windows print window"),
-        ("Right-click a thumbnail", "Duplicate, Add as overlay on the picture you are working on, Print, Remove, Copy"))),
+        ("Right-click a thumbnail", "Duplicate, Print, Remove, Copy"))),
     ("Undo / Redo", (
         ("Ctrl+Z", "Undo, step by step"),
         ("Ctrl+Y  or  Ctrl+Shift+Z", "Redo"))),
@@ -891,10 +861,7 @@ class MainWindow(QMainWindow):
         self.strip.removeRequested.connect(self.remove_by_uids)
         self.strip.copyRequested.connect(self.copy_by_uids)
         self.strip.duplicateRequested.connect(self.duplicate_by_uids)
-        self.strip.overlayRequested.connect(self.overlay_by_uids)
         self.strip.printRequested.connect(lambda uids: self.print_cards([c for c in (self._card(x) for x in uids) if c is not None]))
-        self.strip.menuClosed.connect(self._refresh_counts)
-        self.strip.current_uid = lambda: (self.carousel.current().uid if self.carousel.current() is not None else None)
         self.strip.setDragEnabled(False)
         self.strip.setDragDropMode(QAbstractItemView.DragDropMode.NoDragDrop)
         self.strip.setDefaultDropAction(Qt.DropAction.CopyAction)
@@ -1586,7 +1553,7 @@ class MainWindow(QMainWindow):
         md.setUrls(urls)
         return md
 
-    # ------------------------------------------------------------ duplicate / overlay (thumbnail right-click)
+    # ------------------------------------------------------------ duplicate (thumbnail right-click)
     def duplicate_by_uids(self, uids):
         """Right-click > Duplicate: a copy of the picture AS IT LOOKS NOW (edits included) is added right behind it.
         The copy is a new picture of its own, edit it freely; the original is not touched."""
@@ -1622,36 +1589,6 @@ class MainWindow(QMainWindow):
             self.say("Duplicated %d picture(s): the copy is right behind the original." % added if added else "Nothing was duplicated.")
         self.runner.run("Duplicating " + (cards[0].name if len(cards) == 1 else "%d pictures" % len(cards)), work, done,
                         lambda msg: self.say("Could not duplicate: " + msg.splitlines()[0]))
-
-    def overlay_by_uids(self, uids):
-        """Right-click > Add as overlay: the picture (as it looks now) becomes an overlay picture on the picture that
-        is being worked on, exactly like 'Add picture' in the Picture tab, but nothing is taken away from it."""
-        target = self.carousel.current()
-        cards = [c for c in dict.fromkeys(self._card(x) for x in uids) if c is not None and c is not target]
-        if target is None or not cards or self._busy():
-            return
-        if not getattr(target, "_loaded", False):
-            self.say("Wait a moment: the picture you are working on is still opening.")
-            return
-        sources = [c.render_source() for c in cards]
-        names = [os.path.splitext(c.name)[0] for c in cards]
-
-        def work(progress):
-            out = []
-            for i, src in enumerate(sources):
-                progress(i / len(sources), "%d / %d" % (i + 1, len(sources)))
-                out.append(src())
-            return out
-
-        def done(images):
-            if target not in self.carousel.cards:
-                return
-            if self.carousel.current() is not target:
-                self.carousel.go_to(self.carousel.cards.index(target))
-            for im, nm in zip(images, names):
-                target.add_picture(image=im, name=nm, keep_background=True)
-        self.runner.run("Preparing the overlay", work, done,
-                        lambda msg: self.say("Could not add the overlay: " + msg.splitlines()[0]))
 
     # ------------------------------------------------------------ print program (Ctrl+P) + sleeping
     def _build_print_menu(self, menu):
