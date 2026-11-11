@@ -29,6 +29,34 @@ EXPORT_DIR = os.path.join(tempfile.gettempdir(), "imagefixer_export")
 CLIP_FILES = set()      # files the clipboard points to right now: never deleted while another program may still paste them
 EXPORT_LOCK = __import__("threading").Lock()
 
+# ---- remembered options: every option the person changes is kept for the next start of the program
+_PREFS = None
+
+
+def _prefs():
+    """One shared settings object (writes are collected and flushed by Qt itself - no write on every slider tick)."""
+    global _PREFS
+    if _PREFS is None:
+        from PySide6.QtCore import QSettings
+        _PREFS = QSettings("ImageFixer", "ImageFixer")
+    return _PREFS
+
+
+def _pref_get(key, default, typ):
+    try:
+        return _prefs().value("opt/" + key, default, type=typ)
+    except Exception:
+        return default
+
+
+def _pref_set(key, value):
+    try:
+        _prefs().setValue("opt/" + key, value)
+    except Exception:
+        pass
+
+
+
 
 def export_path(stem, ext):
     """A new free file name in the export folder. The name is reserved at once (empty file), so two background jobs
@@ -90,7 +118,7 @@ HINTS = {
     "ellipse": "Drag an ellipse.  Shift = add,  Alt = subtract.  Drag INSIDE the selection = move only the outline.",
     "lasso": "Draw freely around an area like with a pen. When you let go it closes by itself.  Shift = add,  Alt = subtract.  Drag INSIDE the selection = move only the outline.",
     "color": "Click a color: every place with that color is selected.  Fuzziness = how wide (move it after the click, it updates).  "
-             "Shift+click = add a color,  Alt+click = take a color out.  The clicked color also becomes the fill color.",
+             "Shift+click = add a color,  Alt+click = take a color out. ",
     "move": "Drag inside the selection to move it (old place is filled from around).  Alt + drag = copy.",
     "copy": "Drag the selection: a copy is placed there, the original stays.",
     "transform": "Scale / Rotate, Skew, Distort, Perspective, Warp (buttons).  Drag inside = move (Alt + drag = place a copy, the original stays), round handle = rotate.  Keys: [ ] rotate 1°, Ctrl+[ ] 15°, arrows move.  "
@@ -771,6 +799,7 @@ class Card(QWidget):
         self._short = False
         self._hint_warn = False
         self._build()
+        self._load_prefs()
 
     # ------------------------------------------------------------------ ui helpers
     @staticmethod
@@ -1484,7 +1513,7 @@ class Card(QWidget):
 
         # ---- color range + fill color: one thing
         g2, gl2 = self._group_box("Color range & fill")
-        hc = QLabel("Choose the Color range tool and click a color: it is selected, and it becomes the fill color. "
+        hc = QLabel("Choose the Color range tool and click a color: it is selected. "
                     "Fuzziness (how wide) is in the bar above the picture.")
         hc.setObjectName("hint")
         hc.setWordWrap(True)
@@ -1508,9 +1537,6 @@ class Card(QWidget):
         fw = QWidget()
         fw.setLayout(fr)
         gl2.addWidget(fw)
-        self.chkUseClick = QCheckBox("A Color range click sets the fill color")
-        self.chkUseClick.setChecked(True)
-        gl2.addWidget(self.chkUseClick)
         self.btnFill = QPushButton("Fill selection with this color")
         self.btnDelete = QPushButton("Delete selection  (Del)")
         self.btnDelete.setToolTip("Remove what is selected; the place is filled from its surroundings")
@@ -1823,6 +1849,76 @@ class Card(QWidget):
         self.tabGroup.button(i).setChecked(True)
         self.stackPages.setCurrentIndex(i)
 
+    # ------------------------------------------------ remembered options
+    def _load_prefs(self):
+        """Put the options back the way the person left them last time (checkboxes, sliders, fill color, Picture tab)."""
+        def blocked(w, fn):
+            w.blockSignals(True)
+            try:
+                fn()
+            finally:
+                w.blockSignals(False)
+        for key, w in (("keep_ink", self.chkInk), ("near_click", self.chkLocal), ("snap_edges", self.chkSnap)):
+            v = _pref_get(key, w.isChecked(), bool)
+            blocked(w, lambda w=w, v=v: w.setChecked(bool(v)))
+        self.keep_ink = self.chkInk.isChecked()
+        v = int(_pref_get("near_pct", self.localSlider.value(), int))
+        blocked(self.localSlider, lambda: self.localSlider.setValue(v))
+        self.lblLocalV.setText("%d%%" % self.localSlider.value())
+        self._tolv = int(_pref_get("tolerance", self._tolv, int))
+        self._fuzz = int(_pref_get("fuzziness", self._fuzz, int))
+        hx = str(_pref_get("fill_hex", "", str)).lstrip("#")
+        if len(hx) == 6:
+            try:
+                self.fill_rgb = (int(hx[0:2], 16), int(hx[2:4], 16), int(hx[4:6], 16))
+                self._paint_swatch()
+            except ValueError:
+                pass
+        # Picture tab: these are the start values of every new picture, and what the panel shows
+        bg = dict(self.BG_DEFAULT)
+        for k in ("strength", "soft", "fine", "specks", "opacity"):
+            bg[k] = int(_pref_get("bg_" + k, bg[k], int))
+        for k in ("uneven", "remove"):
+            bg[k] = bool(_pref_get("bg_" + k, bg[k], bool))
+        t = str(_pref_get("bg_tint", bg["tint"], str))
+        bg["tint"] = t if t in ("orig", "black", "blue") else "orig"
+        self.BG_DEFAULT = bg
+        for k in ("strength", "soft", "fine", "specks", "opacity"):
+            r = self.bgRows[k]
+            blocked(r.sl, lambda r=r, k=k: r.sl.setValue(int(bg[k])))
+            r.val.setText("%d%%" % int(bg[k]))
+        blocked(self.chkUneven, lambda: self.chkUneven.setChecked(bg["uneven"]))
+        blocked(self.chkBg, lambda: self.chkBg.setChecked(bg["remove"]))
+        blocked(self.tintGroup, lambda: self.tintGroup.button(("orig", "black", "blue").index(bg["tint"])).setChecked(True))
+        # save from now on, whenever one of them changes
+        self.chkInk.toggled.connect(lambda on: _pref_set("keep_ink", bool(on)))
+        self.chkLocal.toggled.connect(lambda on: _pref_set("near_click", bool(on)))
+        self.chkSnap.toggled.connect(lambda on: _pref_set("snap_edges", bool(on)))
+        self.localSlider.valueChanged.connect(lambda v: _pref_set("near_pct", int(v)))
+        self.tolSlider.valueChanged.connect(self._save_tol_pref)
+        self._prefs_ready = True                         # from now on every change of the fill color is saved too
+        for r in self.bgRows.values():
+            r.changed.connect(lambda _v=0: self._save_bg_prefs())
+        self.chkUneven.toggled.connect(lambda _=False: self._save_bg_prefs())
+        self.chkBg.toggled.connect(lambda _=False: self._save_bg_prefs())
+        self.tintGroup.idClicked.connect(lambda _=0: self._save_bg_prefs())
+
+    def _save_tol_pref(self, _v=0):
+        _pref_set("tolerance", int(self._tolv))
+        _pref_set("fuzziness", int(self._fuzz))
+
+    def _save_fill_pref(self):
+        r, g, b = self.fill_rgb
+        _pref_set("fill_hex", "%02X%02X%02X" % (r, g, b))
+
+    def _save_bg_prefs(self):
+        p = self._bg_params()
+        for k in ("strength", "soft", "fine", "specks", "uneven", "tint", "remove"):
+            _pref_set("bg_" + k, p[k])
+        _pref_set("bg_opacity", int(self.bgRows["opacity"].sl.value()))
+        self.BG_DEFAULT = dict(self.BG_DEFAULT, **{k: p[k] for k in ("strength", "soft", "fine", "specks", "uneven", "tint", "remove")},
+                               opacity=int(self.bgRows["opacity"].sl.value()))
+
     def _paint_swatch(self):
         r, g, b = self.fill_rgb
         self.swatch.setStyleSheet("background: rgb(%d,%d,%d); border-radius: 7px; border: 1px solid #4a5268;" % (r, g, b))
@@ -1831,6 +1927,8 @@ class Card(QWidget):
             self.canvas.set_paint(self.fill_rgb, self.opSlider.value() / 100.0)
         if hasattr(self, "edHex") and not self.edHex.hasFocus():
             self.edHex.setText("#%02X%02X%02X" % (r, g, b))
+        if getattr(self, "_prefs_ready", False):
+            self._save_fill_pref()
 
     def _set_fill(self, rgb):
         self.fill_rgb = tuple(int(v) for v in rgb)
@@ -4022,10 +4120,6 @@ class Card(QWidget):
                                     "sel": self.sel}
                         self._update_ring()
                 self._set_selection(mask, mode, after=remember)
-                if info is not None and getattr(self, "chkUseClick", None) is not None \
-                        and self.chkUseClick.isChecked() and mode != "sub":
-                    self.fill_rgb = info[0]                    # the clicked color is the fill color now
-                    self._paint_swatch()
         self._job("Selecting", work, done)
 
     def _deselect_brush(self, data, size_prev):

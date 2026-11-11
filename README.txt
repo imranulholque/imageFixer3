@@ -134,7 +134,7 @@ NEW (round 5)
   a much better paper finder for busy backgrounds. The phone window is now a dropdown under the button.
 - Compare is shown IN the picture (slider or side by side); click it again to switch it off.
 - Select: Color range has Fuzziness (updates live after the click, optional 'Near the click'); new Deselect brush (Select menu) takes
-  parts out of a selection accurately; the clicked color becomes the fill color; Fill / Delete / eyedropper / hex in one group;
+  parts out of a selection accurately; Fill / Delete / eyedropper / hex in one group;
   'Remove a stamp or mark' (keep dark writing) is its own group at the top of the Color tab (Color tab = stamp removal, Color range & fill, Picked colors).
 - Shadow tab: Newspaper / book photo -> white page (one click + slider, both directions); 'keep photos and faces' removed.
 - Text options are stronger at 100% (faint writing gets dark, the paper stays white).
@@ -228,3 +228,8 @@ NEW (less memory): old Undo / Redo steps live on the disk
 - If the disk has less than 2 GB free, or writing fails, the program silently goes back to keeping steps in memory.
 - Temporary files are removed when a picture is closed, when the program exits, and at the next start after a crash
   (folders named ImageFixer_undo_* in the Windows temp folder).
+
+- Remembered options: the program keeps the options you change and brings them back at the next start: "Keep the dark writing under
+  the stamp", "Near the click" (+ its size), "Snap to edges", Tolerance / Fuzziness, the fill color, and everything in the Picture tab
+  (Remove background, Remove more, Keep faint strokes, Remove specks, Edge softness, Opacity, Uneven paper, Ink color - these are also
+  the start values of every new picture you add).
