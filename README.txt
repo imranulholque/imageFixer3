@@ -23,9 +23,11 @@ Clean many text pictures (WhatsApp photos, scans) and print them. One big card p
  - Erase v:     Brush / Box / Ellipse / Freehand: filled from around. Alt + click = copy from that spot.
  - Crop v:      AUTO CROP (key A), Crop (C), Straighten (S, 4 corners), Crop to circle / oval / rounded box / the selection shape, Rotate left / right.
                 AUTO CROP finds the paper / ID card / book page / newspaper in the photo (on a plain, wooden, cloth or busy background),
-                cuts it out, removes the camera angle and keeps the real shape of the sheet.  When it is sure, it crops at once (Ctrl+Z
-                undoes it).  When it is not sure, or with Shift+A ("Auto crop, then let me fix the corners"), the 4 corners are put on
-                the page and you can drag them, then Enter.  In Crop / Straighten, the button "Find the page automatically" does the same.
+                cuts it out, removes the camera angle and keeps the real shape of the sheet.  There is ONE auto crop option: it puts
+                the 4 corners on the page it found, you can drag a corner if needed, then Enter crops and straightens (Ctrl+Z undoes it).
+                A page that has almost the colour of the table (white on light grey, cream on wood ...) is found by its colour step,
+                even when the printed text has stronger edges than the page edge.  In Crop / Straighten, the button "Find the page
+                automatically" does the same.
                 A picture you placed (signature, stamp ...): select it, then pick any crop - it is cropped alone and becomes
                 transparent outside the shape. (Click outside the picture first to crop the page instead.)
 Slow work shows a progress bar at the bottom; the window stays usable.
@@ -105,7 +107,8 @@ NEW (round 4)
 NEW (round 4)
 - Thumbnails: click, Ctrl+click, Shift+click, drag a box, Ctrl+A to select. Del removes the selected pictures from the list
   (files on the disk are never touched), Ctrl+C copies them, dragging takes all selected pictures to another program.
-  Right-click a thumbnail for the same as a menu.
+  Right-click a thumbnail for the same as a menu, plus: Duplicate (a copy of the picture as it looks now, put right behind it),
+  Add as overlay (the picture, as it looks now, is placed as an overlay picture on the picture you are working on) and Print.
 - Pictures open in the background (progress bar, window never freezes); adding / saving / copying many pictures is done in small
   steps or in a worker thread. Settings > "Picture detail" sets how sharp the on-screen picture is (Automatic = from your screen);
   Settings > "Interface size" scales the text and buttons. Toolbars wrap instead of being cut off on a small window.
@@ -120,6 +123,11 @@ NEW (round 5)
   while the picture is open). A picture from the phone / clipboard has no original: it goes to the save folder, which is asked once and
   then remembered (change it with Save as... or the folder button). Save as... = folder, name, format JPG / PNG / PDF.
   Save all edited... = replace the originals OR a folder (Browse...), remembered. Print... (Ctrl+P).
+  Settings > Print program: choose any program (.exe).  Ctrl+P (or Print...) then opens the picture(s) in it at full resolution, with
+  all edits, nothing is saved: two or more selected thumbnails = all of them, otherwise only the picture you are working on.
+  Image Fixer then goes to the tray and sleeps (old undo pictures go to the disk, memory is given back, economy mode); your pictures
+  and edits are kept.  Click the tray icon to continue.  This sleep can be switched off in the same menu.  Without a chosen
+  program Ctrl+P opens the normal Windows print window.
   Edited copies made for copy / drag / print are temporary: they are removed with the picture and when the program exits.
 - Incoming pictures (drag, Ctrl+V, phone / QR): in the PICTURE tab they become an overlay on the current page, in any other tab a new main picture.
 - Phone: new page (Scan / Send / Scan a saved photo, drag corners AND sides, Original / Clean / Gray / B&W, turn, auto next page),
@@ -209,7 +217,7 @@ COMPARE / PREVIEW / UPSCALE  (top right of a picture)
 
 KEYS OF EVERY TOOL  (also listed in Settings > Keyboard shortcuts)
  Select: B brush, M box, Shift+M ellipse, L freehand, W color range, Shift+D deselect brush.   Move: V, Shift+V copy, Ctrl+T transform.
- Erase: E brush, Shift+E box, Ctrl+E ellipse, Alt+E freehand.   Crop: A auto crop, Shift+A auto crop + fix corners, C crop, S straighten,
+ Erase: E brush, Shift+E box, Ctrl+E ellipse, Alt+E freehand.   Crop: A auto crop (find the page + fix corners), C crop, S straighten,
  Shift+C circle, Ctrl+Shift+C oval, Alt+C rounded box, Alt+X selection shape, R / Shift+R turn 90 degrees.
  Others: I eyedropper, P color brush, H hand, T text box, Q compare, Shift+Q compare mode, F real-quality preview, U upscale, Ctrl+B panel.
 

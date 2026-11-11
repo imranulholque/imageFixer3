@@ -454,6 +454,143 @@ def _refine_on_edges(quad, G, search):
     return out
 
 
+# ----------------------------------------------------------------- colour-based edge refinement (v3)
+def _lab_blur(lab, passes=2):
+    """Light smoothing of a Lab picture (two 3x3 box passes): kills sensor noise, keeps a real colour step."""
+    out = np.empty_like(lab)
+    for i in range(3):
+        a = lab[..., i]
+        for _ in range(passes):
+            a = _box_mean(a, 3)
+        out[..., i] = a
+    return out
+
+
+def _fit_line(P, tol=3.0):
+    """Robust straight line through points (trims the ones that are not on it). Returns (centre, direction) or None."""
+    P = np.asarray(P, np.float64)
+    if len(P) < 4:
+        return None
+    for _ in range(4):
+        c = P.mean(0)
+        _, _, vt = np.linalg.svd(P - c)
+        d = vt[0]
+        res = np.abs((P - c) @ np.array([-d[1], d[0]]))
+        keep = res <= max(1.0, 2.0 * np.median(res))
+        if keep.all():
+            break
+        if keep.sum() < 4:
+            return None
+        P = P[keep]
+    c = P.mean(0)
+    _, _, vt = np.linalg.svd(P - c)
+    if np.abs((P - c) @ np.array([-vt[0][1], vt[0][0]])).max() > tol:      # the points must really lie on one straight line
+        return None
+    return c, vt[0], len(P)
+
+
+def _expand_to_paper(lab, quad, max_grow=0.17, chunks=12):
+    """The first outline is often only the PRINTED AREA of the page (dark text gives much stronger edges than a page
+    edge that is the same colour as the table).  Here every side is moved outwards through the white margin until
+    the COLOUR really changes (paper colour -> table colour).  The change is looked for with the middle value of
+    many points along the side, so noise and the grain of a wooden table do not disturb it, and the paper colour is
+    measured locally, so a shadow or uneven light on the page does not matter.
+    Returns (quad, number of sides that moved)."""
+    h, w = lab.shape[:2]
+    q = np.asarray(quad, np.float64)
+    cen = q.mean(0)
+    lb = _lab_blur(lab)
+    # paper colour of the whole inside (the lighter 60 %: ink is left out) and how much it varies by itself
+    inner = _poly_mask(cen + (q - cen) * 0.92, (h, w))
+    if inner.sum() < 200:
+        return quad, 0
+    pix = lb[inner]
+    keep = pix[:, 0] >= np.percentile(pix[:, 0], 40)
+    pc_g = np.median(pix[keep], 0)
+    far = ~_poly_mask(cen + (q - cen) * 1.28, (h, w))
+    if far.sum() < 0.015 * h * w:
+        return quad, 0                                      # the page fills the picture: nothing to find outside
+    S = int(max(8, max_grow * max(h, w)))
+    sustain = max(5, int(0.011 * max(h, w)))
+    sides = _quad_sides(q)
+    lines, moved = [], 0
+    for a, b, n, L in sides:
+        if L < 20:
+            return quad, 0
+        d = (b - a) / L
+        pts, hit_off = [], []
+        for k in range(chunks):
+            t0, t1 = 0.06 + 0.88 * k / chunks, 0.06 + 0.88 * (k + 1) / chunks
+            m = max(10, int(L * (t1 - t0)))
+            tt = np.linspace(t0, t1, m)
+            px = a[0] + (b[0] - a[0]) * tt
+            py = a[1] + (b[1] - a[1]) * tt
+            offs = np.arange(-10, S + 1, 1.0)
+            X = px[:, None] + n[0] * offs[None, :]
+            Y = py[:, None] + n[1] * offs[None, :]
+            inside_img = (X >= 0) & (X <= w - 1) & (Y >= 0) & (Y <= h - 1)
+            lim = np.where(inside_img.all(0))[0]
+            if len(lim) < 4:
+                continue
+            last = int(lim.max()) if lim.max() == len(offs) - 1 else int(np.argmin(inside_img.all(0))) - 1
+            col = lb[np.clip(np.rint(Y).astype(int), 0, h - 1), np.clip(np.rint(X).astype(int), 0, w - 1)]   # (m, O, 3)
+            # the local paper colour: lighter half of what lies just inside the outline
+            ref = col[:, 0:9].reshape(-1, 3)
+            ref = ref[ref[:, 0] >= np.median(ref[:, 0])]
+            pc = np.median(ref, 0)
+            if np.sqrt(((pc - pc_g) ** 2).sum()) > 25.0:
+                pc = pc_g
+            prof = np.median(np.sqrt(((col - pc) ** 2).sum(2)), 0)                                         # (O,)
+            prof = np.convolve(np.pad(prof, 1, mode="edge"), np.ones(3) / 3.0, mode="valid")
+            top = min(len(prof), last + 1)
+            if top - 10 < 3 * sustain:
+                continue
+            third = max(sustain, (top - 10) // 3)
+            inner_lv = float(np.percentile(prof[10:10 + third], 25))                                      # paper margin
+            outer_lv = float(np.median(prof[top - third:top]))                                             # what lies beyond
+            step = outer_lv - inner_lv
+            if step < 2.0:
+                continue
+            thr = inner_lv + 0.5 * step                                                                    # the edge is half way up
+            hit = None
+            for i in range(10, top - sustain):
+                if prof[i:i + sustain].min() >= thr and (prof[i:top] >= thr).mean() >= 0.88:      # and it STAYS changed (an ink row does not)
+                    hit = i
+                    break
+            if hit is None:
+                continue
+            if hit > 10:                                       # sub-pixel: where the profile crosses the threshold
+                p0, p1 = prof[hit - 1], prof[hit]
+                hit = hit - 1 + (thr - p0) / max(p1 - p0, 1e-6)
+            o = offs[0] + hit
+            pts.append((px.mean() + n[0] * o, py.mean() + n[1] * o))
+            hit_off.append(o)
+        ln = _fit_line(pts) if len(pts) >= max(5, chunks // 2) else None
+        if ln is not None and ln[2] >= max(5, chunks // 2) - 1 and abs(float(np.median(hit_off))) >= 3.0:   # a tiny move is not worth trusting
+            lines.append((ln[0], ln[1]))
+            moved += 1
+        else:
+            lines.append((np.asarray(a, np.float64), d))
+    if moved == 0:
+        return quad, 0
+    out = []
+    for i in range(4):
+        c1, d1 = lines[i - 1]
+        c2, d2 = lines[i]
+        M = np.array([d1, -d2]).T
+        if abs(np.linalg.det(M)) < 1e-6:
+            return quad, 0
+        t = np.linalg.solve(M, c2 - c1)
+        out.append(tuple(c1 + t[0] * d1))
+    out = core.order_quad(out)
+    ratio = _poly_area(out) / max(_poly_area(q), 1.0)
+    if (not _is_convex(out) or not (0.9 < ratio < 2.6)
+            or np.abs(np.asarray(out) - q).max() > 0.24 * max(h, w)):
+        return quad, 0
+    return out, moved
+
+
+
 def detect_document(img, return_score=False):
     """Finds the 4 corners of the paper. Returns (corners [(x,y) TL,TR,BR,BL in picture pixels], found: bool).
     Works with many ways of segmenting the photo (brightness, 'paper-ness' = bright and colourless, and the area
@@ -555,6 +692,13 @@ def detect_document(img, return_score=False):
                 break
     if best is not None:
         pts = core.order_quad(best[1])
+        try:                                           # page edge that is nearly the table's colour: find it by colour
+            labs = core.rgb_to_lab(np.asarray(img.convert("RGB").resize(big.size, Image.Resampling.BOX)))
+            ex, n_moved = _expand_to_paper(labs, [(x * s2, y * s2) for x, y in pts])
+            if n_moved:
+                pts = core.order_quad([(x / s2, y / s2) for x, y in ex])
+        except Exception:
+            pass
         res = [(x / s, y / s) for x, y in pts]
         info = {"score": best[4], "edge": best[2], "contrast": best[3]}
         return (res, True, info) if return_score else (res, True)

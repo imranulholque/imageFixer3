@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QDial
                                QPushButton, QSizePolicy, QStackedLayout, QSystemTrayIcon, QTextBrowser, QVBoxLayout, QWidget)
 
 import core
+import extprint
 import updater
 import winutil
 from card import CLIP_FILES, CROP_KEYS, EXPORT_DIR, TOOL_KEYS, Card, export_path
@@ -65,6 +66,11 @@ class Strip(QListWidget):
     to other programs."""
     removeRequested = Signal(list)      # uids of the selected pictures
     copyRequested = Signal(list)
+    duplicateRequested = Signal(list)
+    overlayRequested = Signal(list)     # put these pictures on the picture that is being worked on
+    printRequested = Signal(list)
+    menuClosed = Signal()
+    current_uid = None                  # set by the window: the uid of the picture that is being worked on
     stepRequested = Signal(int)         # wheel over the thumbnails: +1 = next picture, -1 = previous
 
     def __init__(self):
@@ -134,27 +140,61 @@ class Strip(QListWidget):
         super().keyPressEvent(e)
 
     def _context_menu(self, pos):
+        cur = self.current_uid() if self.current_uid else None
         it = self.itemAt(pos)
+        changed = False
         if it is not None and not it.isSelected():
+            # a right-click only SELECTS the thumbnail: it must not slide to it, because 'Add as overlay' puts the
+            # picture on the one that is being worked on
+            self.blockSignals(True)
             self.clearSelection()
             it.setSelected(True)
+            self.blockSignals(False)
+            changed = True
         u = self.uids()
         n = len(u)
         what = "this picture" if n == 1 else "%d pictures" % n
+        others = [x for x in u if x != cur]
         m = QMenu(self)
+        a_dup = m.addAction("Duplicate %s" % what)
+        if len(others) > 1:
+            ov_text = "Add these %d pictures as overlays on the picture I am working on" % len(others)
+        else:
+            ov_text = "Add this picture as overlay on the picture I am working on"
+        a_ov = m.addAction(ov_text)
+        a_pr = m.addAction("Print %s\tCtrl+P" % what)
+        m.addSeparator()
         a_rm = m.addAction("Remove %s\tDel" % what)
         a_cp = m.addAction("Copy %s\tCtrl+C" % what)
-        a_rm.setEnabled(n > 0)
-        a_cp.setEnabled(n > 0)
         m.addSeparator()
         a_all = m.addAction("Select all\tCtrl+A")
+        for a_ in (a_dup, a_pr, a_rm, a_cp):
+            a_.setEnabled(n > 0)
+        a_ov.setEnabled(bool(others) and cur is not None)
+        if cur is not None and n > 0 and not others:
+            a_ov.setToolTip("This is the picture you are working on. Right-click another picture to put it on this one.")
         act = m.exec(self.viewport().mapToGlobal(pos))
-        if act is a_rm:
+        if act is a_dup:
+            self.duplicateRequested.emit(u)
+        elif act is a_ov:
+            self.overlayRequested.emit(others)
+        elif act is a_pr:
+            self.printRequested.emit(u)
+        elif act is a_rm:
             self.removeRequested.emit(u)
         elif act is a_cp:
             self.copyRequested.emit(u)
         elif act is a_all:
             self.selectAll()
+            changed = False
+        if changed and cur is not None:                 # the selection goes back to the picture that is shown
+            for r in range(self.count()):
+                if self.item(r).data(Qt.ItemDataRole.UserRole) == cur:
+                    self.blockSignals(True)
+                    self.setCurrentRow(r, QItemSelectionModel.SelectionFlag.ClearAndSelect)
+                    self.blockSignals(False)
+                    break
+        self.menuClosed.emit()
 
     # ---- mouse: Qt does the selection; we start the drag ourselves
     def mousePressEvent(self, e):
@@ -332,6 +372,18 @@ class Carousel(QWidget):
         self._anim.stop()
         self._layout()
 
+    def move_after(self, card, ref):
+        """Puts `card` right behind `ref`.  The picture that is shown stays the picture that is shown."""
+        if card not in self.cards or ref not in self.cards or card is ref:
+            return
+        cur = self.cards[self._idx]
+        self.cards.remove(card)
+        self.cards.insert(self.cards.index(ref) + 1, card)
+        self._idx = self.cards.index(cur)
+        self._pos = float(self._idx)
+        self._anim.stop()
+        self._layout()
+
     def go_to(self, i, animate=True):
         if not self.cards:
             return
@@ -393,7 +445,8 @@ SHORTCUT_GROUPS = (
         ("Ctrl+C", "Copy the picture (full quality)"),
         ("Ctrl+S", "Save (replaces the original; asked once)"),
         ("Ctrl+Shift+S", "Save all edited pictures"),
-        ("Ctrl+P", "Print"))),
+        ("Ctrl+P", "Print: opens your print program (Settings > Print program) with the selected pictures, or with this picture; without a program it opens the Windows print window"),
+        ("Right-click a thumbnail", "Duplicate, Add as overlay on the picture you are working on, Print, Remove, Copy"))),
     ("Undo / Redo", (
         ("Ctrl+Z", "Undo, step by step"),
         ("Ctrl+Y  or  Ctrl+Shift+Z", "Redo"))),
@@ -414,8 +467,7 @@ SHORTCUT_GROUPS = (
         (_k("erase_ellipse"), "Erase ellipse"),
         (_k("erase_lasso"), "Erase freehand"))),
     ("Crop tools", (
-        ("A", "AUTO CROP: finds the page / card / book page, crops it and makes it straight"),
-        ("Shift+A", "Auto crop, but first show the 4 corners so you can drag them"),
+        ("A", "AUTO CROP: finds the page / card / book page and shows the 4 corners; drag one if needed, Enter crops and straightens"),
         (_k("crop"), "Crop (box)"),
         (_k("persp"), "Straighten (drag the 4 corners)"),
         (_k("crop_circle"), "Crop to circle"),
@@ -496,6 +548,7 @@ class MainWindow(QMainWindow):
         self._paste_n = 0
         self.items = {}
         self._sync = False
+        self._hibernating = False
         self.runner = JobRunner(self)
         self.runner.changed.connect(self._job_changed)
         self.phone = None
@@ -662,7 +715,7 @@ class MainWindow(QMainWindow):
         self.actSaveAs = act("Save as...", lambda: self._with_loaded(self.save_card_as))
         self.actSaveAll = act("Save all edited...", self.save_all)
         self.actPdfAll = act("All pages as one PDF", self.save_all_pdf)
-        self.actPrint = act("Print...\tCtrl+P", lambda: self._with_loaded(lambda c: self.print_cards([c])))
+        self.actPrint = act("Print...\tCtrl+P", lambda: self._with_loaded(lambda c: self.print_cards(self.print_targets())))
         m.addSeparator()
         self.actCopy = act("Copy picture\tCtrl+C", lambda: self._with_loaded(lambda c: c.copy_image()))
         self.btnSaveMore.setMenu(m)
@@ -712,6 +765,7 @@ class MainWindow(QMainWindow):
         self.actAbout.triggered.connect(self.about)
         m.addAction(self.actAbout)
         m.addSeparator()
+        self._build_print_menu(m)
         a = QAction("Choose save folder...", self)
         a.triggered.connect(self.choose_dir)
         m.addAction(a)
@@ -836,6 +890,11 @@ class MainWindow(QMainWindow):
         self.strip.stepRequested.connect(lambda d: self.carousel.next() if d > 0 else self.carousel.prev())
         self.strip.removeRequested.connect(self.remove_by_uids)
         self.strip.copyRequested.connect(self.copy_by_uids)
+        self.strip.duplicateRequested.connect(self.duplicate_by_uids)
+        self.strip.overlayRequested.connect(self.overlay_by_uids)
+        self.strip.printRequested.connect(lambda uids: self.print_cards([c for c in (self._card(x) for x in uids) if c is not None]))
+        self.strip.menuClosed.connect(self._refresh_counts)
+        self.strip.current_uid = lambda: (self.carousel.current().uid if self.carousel.current() is not None else None)
         self.strip.setDragEnabled(False)
         self.strip.setDragDropMode(QAbstractItemView.DragDropMode.NoDragDrop)
         self.strip.setDefaultDropAction(Qt.DropAction.CopyAction)
@@ -969,7 +1028,7 @@ class MainWindow(QMainWindow):
         sc("Shift+R", lambda: self._with_current(lambda c: c.rotate_key(90.0)), "Turn 90\u00b0 left")
         sc("Ctrl+V", self.paste, "Paste")
         sc("Ctrl+C", cur(lambda c: self.copy_cards([c])), "Copy picture")
-        sc("Ctrl+P", cur(lambda c: self.print_cards([c])), "Print")
+        sc("Ctrl+P", cur(lambda c: self.print_cards(self.print_targets())), "Print")
         sc("Ctrl+O", self.choose_files)
         sc("Ctrl+S", cur(self.save_card), "Save")
         sc("Ctrl+Shift+S", self.save_all, "Save all edited")
@@ -995,8 +1054,7 @@ class MainWindow(QMainWindow):
         sc("T", cur(lambda c: c.add_text_layer()), "Text box")
         sc("Alt+X", cur(lambda c: c.crop_to_selection()), "Crop to the selection shape")
         # auto crop, compare, real-quality preview, upscale, panel
-        sc("A", cur(lambda c: c.auto_crop(False)), "Auto crop")
-        sc("Shift+A", cur(lambda c: c.auto_crop(True)), "Auto crop (check the corners)")
+        sc("A", cur(lambda c: c.auto_crop()), "Auto crop (find the page, then fix the corners)")
         sc("Q", cur(lambda c: c.compare()), "Compare with the original")
         sc("Shift+Q", cur(lambda c: c._cmp_mode()), "Compare: slider / side by side")
         sc("F", cur(lambda c: c.preview_full()), "Real-quality preview")
@@ -1166,7 +1224,17 @@ class MainWindow(QMainWindow):
             self.say("Interface size changed.")
 
     # ------------------------------------------------------------ show/hide
+    def showEvent(self, e):
+        super().showEvent(e)
+        self._wake()
+
+    def changeEvent(self, e):
+        super().changeEvent(e)
+        if e.type() == QEvent.Type.WindowStateChange and not self.isMinimized():
+            self._wake()
+
     def show_front(self):
+        self._wake()
         if self.isMinimized():
             self.showNormal()
         self.show()
@@ -1518,10 +1586,209 @@ class MainWindow(QMainWindow):
         md.setUrls(urls)
         return md
 
+    # ------------------------------------------------------------ duplicate / overlay (thumbnail right-click)
+    def duplicate_by_uids(self, uids):
+        """Right-click > Duplicate: a copy of the picture AS IT LOOKS NOW (edits included) is added right behind it.
+        The copy is a new picture of its own, edit it freely; the original is not touched."""
+        cards = [c for c in dict.fromkeys(self._card(x) for x in uids) if c is not None]
+        if not cards or self._busy():
+            return
+        jobs = []
+        for c in cards:
+            stem = os.path.splitext(c.name)[0] + " copy"
+            jobs.append((c, c.render_source(), core.unique_path(self.tmp, stem, ".png")))
+
+        def work(progress):
+            for i, (c, src, path) in enumerate(jobs):
+                progress(i / len(jobs), "%d / %d" % (i + 1, len(jobs)))
+                core.save_image(src(), path, src=c.path)
+            return [p for _, _, p in jobs]
+
+        def done(paths):
+            added = 0
+            for (c, _, _), p in zip(jobs, paths):
+                if c not in self.carousel.cards or not os.path.isfile(p):
+                    continue
+                self._add_one(p)
+                new = self.carousel.cards[-1]
+                self.carousel.move_after(new, c)                    # right behind the original, in the cards ...
+                j = self.carousel.cards.index(new)
+                self._sync = True
+                it = self.strip.takeItem(self.strip.count() - 1)
+                self.strip.insertItem(j, it)                        # ... and in the thumbnails
+                self._sync = False
+                added += 1
+            self._current_changed(self.carousel.index)
+            self.say("Duplicated %d picture(s): the copy is right behind the original." % added if added else "Nothing was duplicated.")
+        self.runner.run("Duplicating " + (cards[0].name if len(cards) == 1 else "%d pictures" % len(cards)), work, done,
+                        lambda msg: self.say("Could not duplicate: " + msg.splitlines()[0]))
+
+    def overlay_by_uids(self, uids):
+        """Right-click > Add as overlay: the picture (as it looks now) becomes an overlay picture on the picture that
+        is being worked on, exactly like 'Add picture' in the Picture tab, but nothing is taken away from it."""
+        target = self.carousel.current()
+        cards = [c for c in dict.fromkeys(self._card(x) for x in uids) if c is not None and c is not target]
+        if target is None or not cards or self._busy():
+            return
+        if not getattr(target, "_loaded", False):
+            self.say("Wait a moment: the picture you are working on is still opening.")
+            return
+        sources = [c.render_source() for c in cards]
+        names = [os.path.splitext(c.name)[0] for c in cards]
+
+        def work(progress):
+            out = []
+            for i, src in enumerate(sources):
+                progress(i / len(sources), "%d / %d" % (i + 1, len(sources)))
+                out.append(src())
+            return out
+
+        def done(images):
+            if target not in self.carousel.cards:
+                return
+            if self.carousel.current() is not target:
+                self.carousel.go_to(self.carousel.cards.index(target))
+            for im, nm in zip(images, names):
+                target.add_picture(image=im, name=nm, keep_background=True)
+        self.runner.run("Preparing the overlay", work, done,
+                        lambda msg: self.say("Could not add the overlay: " + msg.splitlines()[0]))
+
+    # ------------------------------------------------------------ print program (Ctrl+P) + sleeping
+    def _build_print_menu(self, menu):
+        sub = menu.addMenu("Print program  (Ctrl+P)")
+        self.actPrintNow = QAction("", self)
+        self.actPrintNow.setEnabled(False)
+        sub.addAction(self.actPrintNow)
+        a = QAction("Choose the program (.exe)...", self)
+        a.triggered.connect(self.choose_print_exe)
+        sub.addAction(a)
+        self.actPrintClear = QAction("Use the normal Windows print window instead", self)
+        self.actPrintClear.triggered.connect(self.clear_print_exe)
+        sub.addAction(self.actPrintClear)
+        sub.addSeparator()
+        self.actPrintSleep = QAction("After opening it: go to the tray and sleep (saves RAM and power)", self)
+        self.actPrintSleep.setCheckable(True)
+        self.actPrintSleep.setChecked(self.settings.value("print_sleep", True, type=bool))
+        self.actPrintSleep.setToolTip("Image Fixer hides in the tray and gives back memory. Your pictures and edits are kept; "
+                                      "click the tray icon to continue. Nothing is deleted until you remove a picture or exit.")
+        self.actPrintSleep.toggled.connect(lambda on: self.settings.setValue("print_sleep", on))
+        sub.addAction(self.actPrintSleep)
+        sub.aboutToShow.connect(self._refresh_print_menu)
+        self._refresh_print_menu()
+
+    def _refresh_print_menu(self):
+        exe = self.settings.value("print_exe", "", type=str)
+        self.actPrintNow.setText("Now: " + (extprint.program_name(exe) or exe) if exe else "Now: the normal Windows print window")
+        self.actPrintClear.setEnabled(bool(exe))
+
+    def choose_print_exe(self):
+        start = self.settings.value("print_exe", "", type=str) or os.environ.get("ProgramFiles", "")
+        path, _ = QFileDialog.getOpenFileName(self, "Choose the program that should open the pictures for printing", start,
+                                              "Programs (*.exe *.bat *.cmd *.com);;All files (*)")
+        if not path:
+            return
+        self.settings.setValue("print_exe", os.path.normpath(path))
+        self._refresh_print_menu()
+        self.say("Ctrl+P now opens the pictures in " + (extprint.program_name(path) or path) + ".")
+
+    def clear_print_exe(self):
+        self.settings.remove("print_exe")
+        self._refresh_print_menu()
+        self.say("Ctrl+P now opens the normal Windows print window.")
+
+    def print_targets(self):
+        """Ctrl+P: two or more selected thumbnails = all of them; otherwise only the picture that is being worked on."""
+        sel = [c for c in (self._card(x) for x in self.strip.uids()) if c is not None]
+        if len(sel) >= 2:
+            return sel
+        c = self.carousel.current()
+        return [c] if c is not None else []
+
+    def _print_external(self, cards, exe):
+        """Opens the pictures (full resolution, edits included, nothing is saved) in the chosen print program."""
+        if not os.path.isfile(exe):
+            self.say("The print program was not found. Choose it again in Settings > Print program.")
+            return
+        made, todo = {}, []
+        for c in cards:
+            p = c.export_ready()                             # untouched = its own file; edited = the file made before
+            if p and os.path.isfile(p):
+                made[c.uid] = p
+            else:
+                stem, ext = c.out_name()
+                todo.append((c, c.render_source(), export_path(stem, ext), c._ver if c._loaded else None))
+
+        def finish():
+            files = [made.get(c.uid) for c in cards]
+            err = extprint.launch(exe, files)
+            if err:
+                self.say(err)
+                return
+            name = extprint.program_name(exe) or exe
+            self.say("Opened %d picture(s) in %s." % (len([f for f in files if f]), name))
+            if self.settings.value("print_sleep", True, type=bool):
+                QTimer.singleShot(900, self.hibernate)
+
+        if not todo:
+            finish()
+            return
+
+        def work(progress):
+            for i, (c, src, path, ver) in enumerate(todo):
+                progress(i / len(todo), "%d / %d" % (i + 1, len(todo)))
+                core.save_image(src(), path, src=c.path)
+            return True
+
+        def done(_):
+            for c, _src, path, ver in todo:
+                made[c.uid] = path
+                if ver is not None and c._loaded and c._ver == ver:
+                    c.set_export(ver, path)                  # the next print / drag reuses this file
+            finish()
+        self.runner.run("Preparing %d picture(s) for %s" % (len(cards), extprint.program_name(exe) or "the print program"),
+                        work, done, lambda msg: self.say("Could not prepare the pictures: " + msg.splitlines()[0]))
+
+    def hibernate(self):
+        """The print program is open: go to the tray and sleep.  Only what can be made again is dropped (old undo pictures
+        go to the disk, caches, free memory); the pictures, the edits and the undo steps stay."""
+        if self._hibernating or self.quitting:
+            return
+        if self.runner.heavy_busy:                           # something is still being saved / made: try again soon
+            QTimer.singleShot(3000, self.hibernate)
+            return
+        self._hibernating = True
+        if self.tray is not None:
+            self.hide()
+            self.tray.setToolTip("Image Fixer is sleeping (your work is kept). Click to open it.")
+        else:
+            self.showMinimized()
+        for c in self.carousel.cards:
+            c.hibernate()
+        try:
+            from PySide6.QtGui import QPixmapCache
+            QPixmapCache.clear()
+        except Exception:
+            pass
+        extprint.economy_mode(True)
+        extprint.trim_memory()
+        QTimer.singleShot(5000, lambda: extprint.trim_memory() if self._hibernating else None)
+
+    def _wake(self):
+        if not self._hibernating:
+            return
+        self._hibernating = False
+        extprint.economy_mode(False)
+        if self.tray is not None:
+            self.tray.setToolTip("Image Fixer  -  by " + AUTHOR)
+
     # ------------------------------------------------------------ print (with all edits; nothing is saved)
     def print_cards(self, cards):
         cards = [c for c in cards if c is not None]
         if not cards or self._busy():
+            return
+        exe = self.settings.value("print_exe", "", type=str)
+        if exe:                                           # the program the user chose in Settings > Print program
+            self._print_external(cards, exe)
             return
         try:
             from PySide6.QtPrintSupport import QPrintDialog, QPrinter

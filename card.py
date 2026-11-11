@@ -130,7 +130,7 @@ TOOL_KEYS = {"brush": "B", "rect": "M", "ellipse": "Shift+M", "lasso": "L", "col
              "erase_brush": "E", "erase_rect": "Shift+E", "erase_ellipse": "Ctrl+E", "erase_lasso": "Alt+E",
              "crop": "C", "persp": "S", "crop_circle": "Shift+C", "crop_oval": "Ctrl+Shift+C", "crop_round": "Alt+C",
              "pick": "I", "paint": "P", "view": "H"}
-# Auto crop: sure about the paper -> crops at once; not sure -> shows the 4 corners to drag.
+# Auto crop: always shows the 4 corners on the page it found (drag one if needed, Enter = crop). 'Sure' only changes the message.
 AUTO_OK_SCORE = 0.6
 AUTO_OK_EDGE = 0.6
 
@@ -997,8 +997,7 @@ class Card(QWidget):
             ("Delete selection\tDel", self.delete_selection),
             ("Fill with color", self.fill_selection)], "Remove things; the place is filled from around it")
         self.menuCrop = self._menu_button("Crop", [
-            ("Auto crop (find the page, crop and straighten)\tA", lambda: self.auto_crop(False)),
-            ("Auto crop, then let me fix the corners\tShift+A", lambda: self.auto_crop(True)), None,
+            ("Auto crop (find the page, then fix the corners)\tA", lambda: self.auto_crop()), None,
             ("Crop\tC", lambda: T("crop")), ("Straighten (4 corners)\tS", lambda: T("persp")), None,
             ("To circle\tShift+C", lambda: T("crop_circle")), ("To oval\tCtrl+Shift+C", lambda: T("crop_oval")),
             ("To rounded box\tAlt+C", lambda: T("crop_round")), ("To selection shape\tAlt+X", self.crop_to_selection), None,
@@ -1090,7 +1089,7 @@ class Card(QWidget):
         cbl.setSpacing(6)
         self.btnFindPage = QPushButton("Find the page automatically  (A)")
         self.btnFindPage.setToolTip("Looks for the paper / card / page in the picture and puts the 4 corners on it. Then drag a corner if needed, Enter = apply.")
-        self.btnFindPage.clicked.connect(lambda: self.auto_crop(True))
+        self.btnFindPage.clicked.connect(lambda: self.auto_crop())
         cbl.addWidget(self.btnFindPage)
         a.addWidget(self.cropBox)
         self.sizeBox = QWidget()
@@ -2138,10 +2137,9 @@ class Card(QWidget):
         cy = sum(p[1] for p in quad) / 4.0
         return [(cx + (x - cx) * (1.0 - k), cy + (y - cy) * (1.0 - k)) for x, y in quad]
 
-    def auto_crop(self, adjust=False):
-        """Finds the paper / card / book page in the picture, cuts it out and makes it straight and rectangular.
-        Sure about the page: done at once (Ctrl+Z undoes it).  Not sure, or adjust=True: the 4 corners are shown on the
-        picture, drag them if needed, then Enter."""
+    def auto_crop(self, adjust=True):
+        """Finds the paper / card / book page in the picture and puts the 4 corners on it (one option: find + fix corners).
+        Drag a corner if it is not exact, then Enter = cut it out and make it straight and rectangular (Ctrl+Z undoes it)."""
         if not self._loaded:
             return
         if self.ctx is not None:
@@ -2166,10 +2164,7 @@ class Card(QWidget):
             W, H = base.size
             area = abs(sum(quad[i][0] * quad[(i + 1) % 4][1] - quad[(i + 1) % 4][0] * quad[i][1] for i in range(4))) / 2.0
             sure = found and info["score"] >= AUTO_OK_SCORE and info["edge"] >= AUTO_OK_EDGE and area >= 0.08 * W * H
-            if sure and not adjust:
-                self._warp_apply(self._inset_quad(quad), "Auto cropped")
-                return
-            self._set_tool("persp")                       # show the 4 corners, the user may drag them
+            self._set_tool("persp")                       # the 4 corners, on the page, ready to drag
             s = self.scale
             self.canvas.set_quad([(x * s, y * s) for x, y in quad])
             if found and sure:
@@ -2230,6 +2225,21 @@ class Card(QWidget):
                     os.remove(p)
             except OSError:
                 pass
+
+    def hibernate(self):
+        """The window goes to sleep (tray): the undo / redo pictures move to the temporary disk file and the render cache is
+        dropped.  Nothing of the work is lost: Undo / Redo read the pictures back, the cache is made again when needed."""
+        if self._dead:
+            return
+        if spill.can_write():
+            for steps in (self.undo, self.redo):
+                for i in range(len(steps)):
+                    try:
+                        if not spill.is_demoted(steps[i]):
+                            steps[i] = spill.demote(steps[i])
+                    except Exception:
+                        pass
+        self._cache = {}
 
     def dispose(self):
         """The picture is being removed: stop timers, ignore everything that is still being computed for it."""
@@ -3050,23 +3060,28 @@ class Card(QWidget):
             self.canvas.set_tf_image(self._layer_qimage(l))                # the finished picture of the text
             self.canvas.setFocus()
 
-    def add_picture(self, path=None):
-        """A picture (signature, stamp ...) becomes a new layer: background removed, then placed on the page."""
+    def add_picture(self, path=None, image=None, name=None, keep_background=False):
+        """A picture (signature, stamp ...) becomes a new layer: background removed, then placed on the page.
+        image = a PIL picture that is already in memory (another picture of the carousel, as it looks now) instead of a
+        file; keep_background = put it as it is, do not take its paper / background away."""
         self.ensure_loaded()
         if not self._loaded:
             return
         if self.ctx is not None:
-            self.leave_layer(lambda: self.add_picture(path))
+            self.leave_layer(lambda: self.add_picture(path, image, name, keep_background))
             return
-        if path is None:
+        if path is None and image is None:
             path, _ = QFileDialog.getOpenFileName(self, "Add picture (signature, stamp ...)", "",
                                                   "Pictures (*.png *.jpg *.jpeg *.bmp *.webp *.tif *.tiff)")
             if not path:
                 return
         bg = dict(self.BG_DEFAULT)
+        if keep_background:
+            bg["remove"] = False
+        label = name or os.path.basename(path or "")
 
         def work(progress):
-            im = ImageOps.exif_transpose(Image.open(path))
+            im = image.copy() if image is not None else ImageOps.exif_transpose(Image.open(path))
             rgba = im.convert("RGBA")
             a = rgba.split()[3]
             sa = a if a.getextrema()[0] < 250 else None          # a PNG that is already transparent keeps its holes
@@ -3093,7 +3108,7 @@ class Card(QWidget):
             if hn > 0.6:
                 wn, hn = wn * 0.6 / hn, 0.6
             x0, y0 = 0.5 - wn / 2, 0.5 - hn / 2
-            layer = {"id": self._layer_seq, "name": os.path.basename(path) or "Picture %d" % self._layer_seq,
+            layer = {"id": self._layer_seq, "name": label or "Picture %d" % self._layer_seq,
                      "rgb": cut.convert("RGB"), "a": cut.split()[3], "src": rgb, "sa": sa, "bg": bg,
                      "grid": [(x0, y0), (x0 + wn, y0), (x0, y0 + hn), (x0 + wn, y0 + hn)], "n": 1,
                      "opacity": 100, "visible": True}
