@@ -107,8 +107,8 @@ NEW (round 4)
 NEW (round 4)
 - Thumbnails: click, Ctrl+click, Shift+click, drag a box, Ctrl+A to select. Del removes the selected pictures from the list
   (files on the disk are never touched), Ctrl+C copies them, dragging takes all selected pictures to another program.
-  Right-click a thumbnail for the same as a menu, plus: Duplicate (a copy of the picture as it looks now, put right behind it),
-  Add as overlay (the picture, as it looks now, is placed as an overlay picture on the picture you are working on) and Print.
+  Right-click a thumbnail for the same as a menu, plus: Duplicate (a copy of the picture as it looks now, put right behind it)
+  and Print.
 - Pictures open in the background (progress bar, window never freezes); adding / saving / copying many pictures is done in small
   steps or in a worker thread. Settings > "Picture detail" sets how sharp the on-screen picture is (Automatic = from your screen);
   Settings > "Interface size" scales the text and buttons. Toolbars wrap instead of being cut off on a small window.
