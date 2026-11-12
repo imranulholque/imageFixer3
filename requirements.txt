@@ -5,3 +5,4 @@ pillow-heif
 segno
 pyinstaller
 pypdfium2
+opencv-python-headless

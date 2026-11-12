@@ -642,7 +642,7 @@ def _expand_to_paper(lab, quad, max_grow=0.17, chunks=12):
 
 
 
-def detect_document(img, return_score=False):
+def _detect_document_legacy(img, return_score=False):
     """Finds the 4 corners of the paper. Returns (corners [(x,y) TL,TR,BR,BL in picture pixels], found: bool).
     Works with many ways of segmenting the photo (brightness, 'paper-ness' = bright and colourless, and the area
     closed by strong edges); every candidate outline is judged by how well its four sides lie on real edges, how
@@ -1290,3 +1290,629 @@ def _purity_factor(J, q):
         return 0.55 + 0.45 * float(np.clip((dom - 0.35) / 0.4, 0.0, 1.0))
     except Exception:
         return 1.0
+
+
+# ======================================================================= v5: fast OpenCV page finder
+# The v1-v4 finder above builds ~100 candidate outlines with pure numpy (slow connected-components, thousands of judge calls
+# for a hill-climb).  This one does the same job with OpenCV primitives (connected components, contours, LSD line segments,
+# Sobel) and replaces the corner hill-climb by a direct least-squares fit of each side to the strongest real edge.
+# If OpenCV is missing, or this finder is not confident, the old finder is used.
+try:
+    import cv2
+except Exception:                                    # no OpenCV: the old finder still works
+    cv2 = None
+
+FAST_SIDE = 640                                      # long side of the picture used to FIND the outline
+REFINE_SIDE = 1100                                   # long side of the picture used to place the 4 sides exactly
+FAST_LINES = "never"                                 # straight-line outlines: always / weak (only when the other ways found nothing good) / never
+FAST_LINES_T = 0.25
+FAST_OUT = 0.15                                      # a corner may lie this share of the picture outside it (a page cut off by the photo)
+FAST_WHOLE = 0.8                                     # a bigger outline holding the best one wins when it scores at least this share of it
+FAST_CONFIDENT = 0.30                                # below this the old (slow) finder is asked as well
+
+
+def _f_otsu(u8):
+    return float(cv2.threshold(u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[0])
+
+
+def _f_resize(rgb, side):
+    h, w = rgb.shape[:2]
+    s = min(1.0, side / float(max(h, w)))
+    if s >= 1.0:
+        return rgb, 1.0
+    return cv2.resize(rgb, (max(8, int(round(w * s))), max(8, int(round(h * s)))), interpolation=cv2.INTER_AREA), s
+
+
+def _f_iou(q1, q2, size=96):
+    pts = np.asarray(list(q1) + list(q2), np.float64)
+    x0, y0 = pts.min(0)
+    x1, y1 = pts.max(0)
+    f = size / max(x1 - x0, y1 - y0, 1.0)
+    n = (int((y1 - y0) * f) + 3, int((x1 - x0) * f) + 3)
+    ms = []
+    for q in (q1, q2):
+        m = np.zeros(n, np.uint8)
+        cv2.fillPoly(m, [np.rint(((np.asarray(q) - (x0, y0)) * f)).astype(np.int32)], 1)
+        ms.append(m > 0)
+    return float((ms[0] & ms[1]).sum()) / max(1.0, float((ms[0] | ms[1]).sum()))
+
+
+class _FJudge:
+    """Scores an outline: do its 4 sides lie on real colour edges, is the colour different just inside / outside every side,
+    does the outside look like the picture's frame (table), is the inside one paper colour.  All vectorised."""
+
+    def __init__(self, small):
+        self.h, self.w = small.shape[:2]
+        f = small.astype(np.float32) / 255.0
+        lab = cv2.GaussianBlur(cv2.cvtColor(f, cv2.COLOR_RGB2LAB), (0, 0), 1.0)
+        self.lab = lab
+        self.gx = cv2.Sobel(lab, cv2.CV_32F, 1, 0, ksize=3) / 8.0
+        self.gy = cv2.Sobel(lab, cv2.CV_32F, 0, 1, ksize=3) / 8.0
+        self.gm = np.sqrt((self.gx ** 2 + self.gy ** 2).sum(2))
+        self.gscale = max(float(np.percentile(self.gm, 95)), 2.5)
+        self.base = float(np.mean(np.minimum(1.0, self.gm / self.gscale)))
+        try:
+            self.bg = _bg_distance(small.astype(np.float32))
+        except Exception:
+            self.bg = None
+
+    def value(self, q, S=40):
+        h, w = self.h, self.w
+        Q = np.asarray(q, np.float64)
+        cen = Q.mean(0)
+        B = np.roll(Q, -1, 0)
+        D = B - Q
+        Ls = np.maximum(np.hypot(D[:, 0], D[:, 1]), 1e-6)
+        N = np.stack([D[:, 1], -D[:, 0]], 1) / Ls[:, None]
+        N = np.where(((N * ((Q + B) / 2 - cen)).sum(1) < 0)[:, None], -N, N)
+        t = np.linspace(0.07, 0.93, S)
+        X = Q[:, 0:1] + t[None] * D[:, 0:1]
+        Y = Q[:, 1:2] + t[None] * D[:, 1:2]
+        mx = max(h, w)
+        d_in = max(3.0, 0.016 * mx)
+        band = max(2, int(round(0.007 * mx)))
+        ok = (X >= 0) & (X <= w - 1) & (Y >= 0) & (Y <= h - 1)
+        m_ = 0.012 * mx + 1.5
+        near_rim = (X < m_) | (X > w - 1 - m_) | (Y < m_) | (Y > h - 1 - m_)
+        EX, EY = X + N[:, 0:1] * 2.2 * d_in, Y + N[:, 1:2] * 2.2 * d_in
+        out_of = (EX < 0) | (EX > w - 1) | (EY < 0) | (EY > h - 1)
+        on_rim = (near_rim.mean(1) > 0.8) | ((~ok).mean(1) > 0.5) | (out_of.mean(1) > 0.6)
+
+        offs = np.arange(-band, band + 1, 1.0)
+        XX = X[:, :, None] + N[:, 0, None, None] * offs
+        YY = Y[:, :, None] + N[:, 1, None, None] * offs
+        xi = np.clip(np.rint(XX).astype(np.intp), 0, w - 1)
+        yi = np.clip(np.rint(YY).astype(np.intp), 0, h - 1)
+        dn = self.gx[yi, xi] * N[:, 0, None, None, None] + self.gy[yi, xi] * N[:, 1, None, None, None]
+        mag = np.sqrt((dn * dn).sum(-1))
+        aligned = mag > 0.55 * self.gm[yi, xi]
+        val = np.where(aligned, mag, 0.0).max(2)
+        sup_s = np.minimum(1.0, val / self.gscale)
+        sup_s = np.where(ok, sup_s, 0.0)
+        sup_s.sort(1)
+        sup_all = sup_s[:, int(0.15 * S):].mean(1)
+
+        def lab_at(o):
+            a = np.clip(np.rint(X + N[:, 0:1] * o).astype(np.intp), 0, w - 1)
+            b = np.clip(np.rint(Y + N[:, 1:2] * o).astype(np.intp), 0, h - 1)
+            return self.lab[b, a]
+        i1 = (lab_at(-d_in) + lab_at(-2.2 * d_in)) / 2
+        u = (lab_at(d_in) + lab_at(2.2 * d_in)) / 2
+        de_all = np.sqrt(((i1 - u) ** 2).sum(2))
+        if self.bg is not None:
+            bi = self.bg[np.clip(np.rint(Y - N[:, 1:2] * 1.6 * d_in).astype(np.intp), 0, h - 1),
+                         np.clip(np.rint(X - N[:, 0:1] * 1.6 * d_in).astype(np.intp), 0, w - 1)]
+            ox, oy = X + N[:, 0:1] * 1.6 * d_in, Y + N[:, 1:2] * 1.6 * d_in
+            bo = self.bg[np.clip(np.rint(oy).astype(np.intp), 0, h - 1), np.clip(np.rint(ox).astype(np.intp), 0, w - 1)]
+            near_edge = np.minimum(np.minimum(ox, w - 1 - ox), np.minimum(oy, h - 1 - oy))
+        ringw = max(3, int(0.045 * min(h, w))) * 1.3
+        # paper colour = the lighter half of a coarse grid inside the outline; just OUTSIDE a real page edge the colour is NOT
+        # paper (table, wall).  Outside the top of a text block it still is - which is how a text row is told from the page edge.
+        uu = np.linspace(0.12, 0.88, 7)
+        gx_, gy_ = np.meshgrid(uu, uu)
+        top = Q[0] + (Q[1] - Q[0]) * gx_[..., None]
+        bot = Q[3] + (Q[2] - Q[3]) * gx_[..., None]
+        gp = top + (bot - top) * gy_[..., None]
+        gl = self.lab[np.clip(np.rint(gp[..., 1]).astype(np.intp), 0, h - 1), np.clip(np.rint(gp[..., 0]).astype(np.intp), 0, w - 1)].reshape(-1, 3)
+        pcol = np.median(gl[gl[:, 0] >= np.median(gl[:, 0])], 0)
+        o1 = lab_at(0.7 * d_in)                                           # close to the side: the white margin of a page is narrow
+        o2 = lab_at(1.3 * d_in)
+        od_all = np.minimum(np.sqrt(((o1 - pcol) ** 2).sum(2)), np.sqrt(((o2 - pcol) ** 2).sum(2)))     # ink on the page does not count as 'not paper'
+        outs = []
+        n1 = lab_at(-0.25 * d_in)                                          # just INSIDE a side: must still be paper
+        n2 = lab_at(-0.5 * d_in)
+        nd_all = np.minimum(np.minimum(np.sqrt(((n1 - pcol) ** 2).sum(2)), np.sqrt(((n2 - pcol) ** 2).sum(2))),
+                            np.minimum(np.sqrt(((n1 - i1) ** 2).sum(2)), np.sqrt(((n2 - i1) ** 2).sum(2))))   # paper colour: global OR just inside this side (uneven light)
+        insd = []
+        sup, spl, bgs, inn = [], [], [], []
+        rim = 0
+        for i in range(4):
+            if on_rim[i]:
+                rim += 1
+                outs.append(0.6); insd.append(0.7)
+                sup.append(0.6); spl.append(0.5); bgs.append(0.5)
+                inn.append(np.median(i1[i], 0))
+                continue
+            if ok[i].sum() < 6:
+                outs.append(0.0); insd.append(0.0)
+                sup.append(0.0); spl.append(0.0); bgs.append(0.0); inn.append(None)
+                continue
+            outs.append(float(np.clip((np.median(od_all[i][ok[i] & ~out_of[i]] if (ok[i] & ~out_of[i]).any() else od_all[i]) - 3.0) / 7.0, 0.0, 1.0)))
+            insd.append(float(np.clip(1.0 - (float(np.median(nd_all[i][ok[i]])) - 6.0) / 10.0, 0.0, 1.0)))
+            sup.append(float(sup_all[i]))
+            good = ok[i] & ~out_of[i]
+            spl.append(float(np.median(de_all[i][good])) / 9.0 if good.any() else 0.6)
+            inn.append(np.median(i1[i][ok[i]], 0))
+            if self.bg is None or not good.any():
+                bgs.append(0.6)
+            elif float(np.median(near_edge[i])) < ringw:
+                bgs.append(0.5)
+            else:
+                bgs.append(float(np.clip((np.median(bi[i][good]) - np.median(bo[i][good])) / 3.0, 0.0, 1.0)))
+        iv = [v for v in inn if v is not None]
+        flat = 0.0
+        if len(iv) >= 3:
+            flat = max(float(np.sqrt(((iv[a] - iv[b]) ** 2).sum())) for a in range(len(iv)) for b in range(a + 1, len(iv)))
+        sup = np.array(sup)
+        spl = np.clip(np.array(spl), 0.0, 1.0)
+        # the corners of a sheet are about right angles, even in perspective (slightly relaxed)
+        ang = []
+        for i in range(4):
+            a_, b_, c_ = Q[i - 1] - Q[i], Q[(i + 1) % 4] - Q[i], None
+            ca = float(a_ @ b_) / (np.hypot(*a_) * np.hypot(*b_) + 1e-9)
+            ang.append(math.degrees(math.acos(max(-1.0, min(1.0, ca)))))
+        dev = max(abs(a - 90.0) for a in ang)
+        shape = 1.0 - 0.45 * float(np.clip((dev - 22.0) / 30.0, 0.0, 1.0))
+        area = _poly_area(Q) / float(h * w)
+        sz = min(1.0, area / 0.16) ** 0.55 * (min(1.0, area / 0.9) ** 0.3) * (1.0 - max(0.0, area - 0.93) * 6)
+        edge = 0.5 * float(sup.mean()) + 0.5 * float(sup.min())
+        split = 0.5 * float(spl.mean()) + 0.5 * float(spl.min())
+        fl = 1.0 / (1.0 + max(0.0, flat - 18.0) / 28.0)
+        bgv = 0.5 * float(np.mean(bgs)) + 0.5 * float(np.min(bgs))
+        outv = 0.5 * float(np.mean(outs)) + 0.5 * float(np.min(outs))
+        insv = 0.5 * float(np.mean(insd)) + 0.5 * float(np.min(insd))
+        v = (0.25 + 0.75 * outv) * (0.35 + 0.65 * insv) * ((0.10 + edge) ** 1.3 * (0.07 + split) ** 0.9 * sz * (0.5 + 0.5 * fl) * (0.30 + 0.70 * bgv) * shape
+             * (1.0, 0.92, 0.72, 0.36, 0.12)[min(4, rim)])
+        return v, {"edge_mean": float(sup.mean()), "edge_min": float(sup.min()), "split_mean": float(spl.mean()),
+                   "bg_mean": float(np.mean(bgs)), "rim": rim, "area": area, "sup": sup, "spl": spl, "out": outs, "ins": insd}
+
+    def purity(self, q):
+        """1.0 = clearly one dominant colour inside (a sheet), down to 0.55 for a patchwork (cloth pattern, half a table)."""
+        m = np.zeros((self.h, self.w), np.uint8)
+        cv2.fillPoly(m, [np.rint(np.asarray(q)).astype(np.int32)], 1)
+        px = self.lab[m > 0]
+        if len(px) < 30:
+            return 1.0
+        if len(px) > 4000:
+            px = px[:: len(px) // 4000 + 1]
+        ref = np.median(px, 0)
+        dom = float((np.sqrt(((px - ref) ** 2).sum(1)) < 12.0).mean())
+        return 0.55 + 0.45 * float(np.clip((dom - 0.35) / 0.4, 0.0, 1.0))
+
+
+def _f_quads_from_mask(mask, tag, out, topk=3, hit=None):
+    h, w = mask.shape
+    m = mask.astype(np.uint8)
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=4)
+    if n <= 1:
+        return
+    order = np.argsort(-stats[1:, cv2.CC_STAT_AREA])[:topk] + 1
+    if hit is not None:                                      # only the region that holds the seed
+        ov = np.bincount(lab[hit > 0].ravel(), minlength=n)
+        ov[0] = 0
+        order = [int(np.argmax(ov))] if ov.max() > 0 else []
+    for cid in order:
+        if stats[cid, cv2.CC_STAT_AREA] < 0.015 * h * w:
+            break
+        x, y, bw, bh = stats[cid, :4]
+        sides = int(y == 0) + int(y + bh == h) + int(x == 0) + int(x + bw == w)
+        if sides >= 4:
+            continue
+        comp = (lab == cid).astype(np.uint8)
+        cnts, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        if not cnts:
+            continue
+        c = max(cnts, key=cv2.contourArea)
+        hull_i = cv2.convexHull(c)
+        if len(hull_i) < 3:
+            continue
+        hull = [tuple(map(float, p)) for p in hull_i[:, 0, :]]
+        ha = _poly_area(hull)
+        if ha < 0.02 * h * w or ha > 0.985 * h * w:
+            continue
+        solid = min(1.0, float(cv2.contourArea(c)) / max(ha, 1.0))
+        pts = c[:, 0, :]
+        quads = []
+        quads.append(_simplify_enclosing(hull))
+        quads.append(_simplify_to_quad(hull))
+        quads.append([tuple(map(float, p)) for p in cv2.boxPoints(cv2.minAreaRect(hull_i))])
+        eps = 0.01
+        while eps < 0.12:                                       # Douglas-Peucker down to 4 corners
+            ap = cv2.approxPolyDP(hull_i, eps * cv2.arcLength(hull_i, True), True)
+            if len(ap) <= 4:
+                if len(ap) == 4:
+                    quads.append([tuple(map(float, p)) for p in ap[:, 0, :]])
+                break
+            eps *= 1.5
+        for quad in quads:
+            if len(quad) != 4:
+                continue
+            quad = _order(quad)
+            if not _is_convex(quad):
+                continue
+            qa = _poly_area(quad)
+            if qa > 1.4 * ha or qa < 0.88 * ha:
+                continue
+            out.append({"quad": quad, "solid": solid, "tag": tag})
+
+
+def _f_dedupe(cands, tol):
+    """Many ways of segmenting give the very same outline: keep one (corner distance below tol px)."""
+    keep, arrs = [], []
+    for c in cands:
+        a = np.asarray(c["quad"], np.float64)
+        if arrs and (np.abs(np.stack(arrs) - a).max(axis=(1, 2)) < tol).any():
+            continue
+        keep.append(c)
+        arrs.append(a)
+    return keep
+
+
+def _f_clean(mask, close, open_=0):
+    m = mask.astype(np.uint8)
+    if close:
+        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close, close)))
+    if open_:
+        m = cv2.morphologyEx(m, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_, open_)))
+    return m
+
+
+def _f_candidates(small, J):
+    h, w = small.shape[:2]
+    gray = cv2.cvtColor(small, cv2.COLOR_RGB2GRAY)
+    gb = cv2.GaussianBlur(gray, (0, 0), 1.2)
+    mx, mn = small.max(2).astype(np.float32), small.min(2).astype(np.float32)
+    sat = (mx - mn) / np.maximum(mx, 1.0)
+    P = cv2.GaussianBlur(np.clip(gray.astype(np.float32) * (1.0 - 0.75 * sat), 0, 255).astype(np.uint8), (0, 0), 1.2)
+    c = []
+    k5 = 5
+    for arr, both in ((gb, True), (P, False)):
+        t = _f_otsu(arr)
+        for dt in (0, -20, 20, -40, 40):
+            thr = int(min(250, max(5, t + dt)))
+            _f_quads_from_mask(_f_clean(arr > thr, k5, k5), "light", c)
+            if both:
+                _f_quads_from_mask(_f_clean(arr <= thr, k5, k5), "dark", c)
+    # colour edges (brightness AND hue): the area they enclose
+    labu = cv2.cvtColor(small, cv2.COLOR_RGB2LAB)
+    for ch in (gb, labu[..., 1], labu[..., 2]):
+        chb = cv2.GaussianBlur(ch, (0, 0), 1.0)
+        med = float(np.median(chb))
+        for sg in (0.33, 0.6):
+            e = cv2.Canny(chb, max(8, (1 - sg) * med * 0.5), max(24, (1 + sg) * med * 0.5 + 20))
+            e = cv2.dilate(e, np.ones((3, 3), np.uint8))
+            _f_quads_from_mask(e == 0, "edge", c)
+    # what is NOT like the frame of the picture (table, wall, cloth)
+    if J.bg is not None:
+        d8 = np.clip(J.bg * 20.0, 0, 255).astype(np.uint8)
+        t = _f_otsu(d8) / 20.0
+        for thr in sorted({max(1.6, t), max(2.2, t * 1.4), 3.2}):
+            _f_quads_from_mask(_f_clean(_f_clean(J.bg > thr, 5, 0), 0, 5), "border", c)
+    # two colour groups (paper / the rest)
+    try:
+        lab = J.lab
+        feat = np.stack([lab[..., 0] / 100.0, lab[..., 1] / 90.0 * 1.6, lab[..., 2] / 90.0 * 1.6], -1).reshape(-1, 3)
+        sub = np.ascontiguousarray(feat[:: max(1, len(feat) // 6000)], np.float32)
+        crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 12, 0.5)
+        _, _, cen = cv2.kmeans(sub, 2, None, crit, 2, cv2.KMEANS_PP_CENTERS)
+        d0 = ((feat - cen[0]) ** 2).sum(1)
+        d1 = ((feat - cen[1]) ** 2).sum(1)
+        m2 = cv2.medianBlur((d0 < d1).reshape(h, w).astype(np.uint8) * 255, 5) > 0
+        _f_quads_from_mask(m2, "kmeans", c)
+        _f_quads_from_mask(~m2, "kmeans", c)
+    except Exception:
+        pass
+    # smooth regions (a sheet is smooth, a wooden table is not)
+    try:
+        m1 = cv2.blur(gb.astype(np.float32), (5, 5))
+        sd = np.sqrt(np.maximum(cv2.blur(gb.astype(np.float32) ** 2, (5, 5)) - m1 * m1, 0.0))
+        for pct in (45, 60):
+            t = max(float(np.percentile(sd, pct)), 3.0)
+            _f_quads_from_mask(_f_clean(_f_clean(sd < t, 13, 0), 0, 7), "smooth", c)
+    except Exception:
+        pass
+    return c
+
+
+def _f_grow(J, seed_quad, shrink, out, tag="grow"):
+    """Paper colour from inside a seed outline, then every connected pixel of that colour: the sheet itself, without the
+    laminate, the table or a ruler next to it (their colour differs a little, and that is enough)."""
+    h, w = J.h, J.w
+    q = np.asarray(seed_quad, np.float64)
+    cen = q.mean(0)
+    m0 = np.zeros((h, w), np.uint8)
+    cv2.fillPoly(m0, [np.rint(cen + (q - cen) * shrink).astype(np.int32)], 1)
+    pix = J.lab[m0 > 0]
+    if len(pix) < 50:
+        return
+    pc = np.median(pix[pix[:, 0] >= np.percentile(pix[:, 0], 45)], 0)
+    d = np.sqrt(((J.lab - pc) ** 2).sum(2))
+    for T in (7.0, 11.0, 16.0):
+        m = _f_clean(_f_clean(d < T, 7, 0), 0, 5)
+        _f_quads_from_mask(m, tag, out, topk=1, hit=m0)
+
+
+def _f_lines(small, max_lines=16):
+    """Straight lines that run along real edges: LSD segments of brightness and of both colour channels, merged into lines."""
+    h, w = small.shape[:2]
+    labu = cv2.cvtColor(small, cv2.COLOR_RGB2LAB)
+    chans = [cv2.GaussianBlur(labu[..., i], (0, 0), 0.8) for i in range(3)]
+    segs = []
+    try:
+        lsd = cv2.createLineSegmentDetector(cv2.LSD_REFINE_STD)
+        for ch in chans:
+            r = lsd.detect(ch)[0]
+            if r is not None:
+                segs.extend(np.asarray(r).reshape(-1, 4).tolist())          # (N,1,4) in OpenCV 4, (N,4) in 5
+    except Exception:
+        for ch in chans:
+            e = cv2.Canny(ch, 30, 90)
+            r = cv2.HoughLinesP(e, 1, np.pi / 180, 40, minLineLength=int(0.12 * max(h, w)), maxLineGap=6)
+            if r is not None:
+                segs.extend(np.asarray(r).reshape(-1, 4).tolist())
+    minlen = 0.05 * max(h, w)
+    groups = []                                           # [nx, ny, rho, weight]
+    for x1, y1, x2, y2 in sorted(segs, key=lambda s: -math.hypot(s[2] - s[0], s[3] - s[1])):
+        L = math.hypot(x2 - x1, y2 - y1)
+        if L < minlen:
+            break
+        nx, ny = (y1 - y2) / L, (x2 - x1) / L
+        rho = nx * (x1 + x2) / 2 + ny * (y1 + y2) / 2
+        for g in groups:
+            dot = nx * g[0] + ny * g[1]
+            s_ = 1.0 if dot >= 0 else -1.0
+            if abs(dot) > 0.9976 and abs(s_ * rho - g[2]) < 0.012 * math.hypot(h, w):        # < 4 deg and ~1 % of the diagonal
+                wsum = g[3] + L
+                g[0] = (g[0] * g[3] + s_ * nx * L) / wsum
+                g[1] = (g[1] * g[3] + s_ * ny * L) / wsum
+                nn = math.hypot(g[0], g[1]) or 1.0
+                g[0] /= nn; g[1] /= nn
+                g[2] = (g[2] * g[3] + s_ * rho * L) / wsum
+                g[3] = wsum
+                break
+        else:
+            groups.append([nx, ny, rho, L])
+    groups.sort(key=lambda g: -g[3])
+    lines = []
+    for nx, ny, rho, wt in groups[:max_lines]:
+        phi = math.atan2(ny, nx)
+        if phi < 0:
+            phi += math.pi
+            rho = -rho
+        if phi >= math.pi:
+            phi -= math.pi
+            rho = -rho
+        lines.append((phi, rho, wt))
+    return lines
+
+
+class _FRefiner:
+    """Places the 4 sides exactly: for many points along a side finds the sharpest colour step across it (within a small
+    distance of where the side is now), fits ONE straight line through those steps (outliers - a printed frame, a fold, a
+    finger - are trimmed away), and crosses the four lines.  Replaces the old corner-by-corner hill-climb."""
+
+    def __init__(self, mid):
+        f = mid.astype(np.float32) / 255.0
+        lab = cv2.GaussianBlur(cv2.cvtColor(f, cv2.COLOR_RGB2LAB), (0, 0), 1.2)
+        self.h, self.w = mid.shape[:2]
+        self.gx = cv2.Sobel(lab, cv2.CV_32F, 1, 0, ksize=3) / 8.0
+        self.gy = cv2.Sobel(lab, cv2.CV_32F, 0, 1, ksize=3) / 8.0
+        self.L = lab[..., 0]
+
+    def _at(self, a, X, Y):
+        return a[np.clip(np.rint(Y).astype(np.intp), 0, self.h - 1), np.clip(np.rint(X).astype(np.intp), 0, self.w - 1)]
+
+    def refine(self, quad, search):
+        h, w = self.h, self.w
+        lines = []
+        M = 80
+        for a, b, n, L in _quad_sides(quad):
+            t = np.linspace(0.06, 0.94, M)
+            px = a[0] + (b[0] - a[0]) * t
+            py = a[1] + (b[1] - a[1]) * t
+            offs = np.arange(-search, search + 0.01, 1.0)
+            X = px[:, None] + n[0] * offs[None, :]
+            Y = py[:, None] + n[1] * offs[None, :]
+            dn = self._at(self.gx, X, Y) * n[0] + self._at(self.gy, X, Y) * n[1]            # (M, O, 3)
+            mag = np.sqrt((dn * dn).sum(-1))
+            s1 = np.abs(self._at(self.L, X + n[0] * 1.5, Y + n[1] * 1.5) - self._at(self.L, X - n[0] * 1.5, Y - n[1] * 1.5))
+            s2 = np.abs(self._at(self.L, X + n[0] * 6.0, Y + n[1] * 6.0) - self._at(self.L, X - n[0] * 6.0, Y - n[1] * 6.0))
+            crisp = np.clip(s1 / (s2 + 3.0), 0.0, 1.0)                                      # sharp edge ~1, soft shadow small
+            score = mag * (0.35 + 0.65 * crisp) * (1.0 - 0.35 * np.abs(offs)[None, :] / max(1.0, search))
+            k = score.argmax(1)
+            best = score.max(1)
+            strong = best > 0.25 * (best.max() + 1e-6)
+            ob = offs[k]
+            sel = strong.copy()
+            fit = None
+            for _ in range(5):
+                if sel.sum() < 0.35 * M:
+                    fit = None
+                    break
+                fit = np.polyfit(t[sel], ob[sel], 1, w=best[sel])
+                res = np.abs(ob - np.polyval(fit, t))
+                nsel = strong & (res <= max(1.0, 2.0 * float(np.median(res[sel]))))
+                if (nsel == sel).all():
+                    break
+                sel = nsel
+            if fit is None or sel.sum() < 0.35 * M:
+                lines.append((np.asarray(a, np.float64), (np.asarray(b) - np.asarray(a)) / max(L, 1e-9)))
+                continue
+            o0, o1 = float(np.polyval(fit, 0.0)), float(np.polyval(fit, 1.0))
+            o0, o1 = max(-search, min(search, o0)), max(-search, min(search, o1))
+            p0 = np.asarray(a, np.float64) + n * o0
+            p1 = np.asarray(b, np.float64) + n * o1
+            d = p1 - p0
+            lines.append((p0, d / max(np.hypot(*d), 1e-9)))
+        out = []
+        for i in range(4):
+            c1, d1 = lines[i - 1]
+            c2, d2 = lines[i]
+            Mx = np.array([d1, -d2]).T
+            if abs(np.linalg.det(Mx)) < 1e-6:
+                return quad
+            tt = np.linalg.solve(Mx, c2 - c1)
+            out.append(tuple(c1 + tt[0] * d1))
+        out = _order(out)
+        old = np.asarray(quad, np.float64)
+        if (not _is_convex(out) or np.abs(np.asarray(out) - old).max() > 2.5 * search
+                or not (0.85 < _poly_area(out) / max(_poly_area(quad), 1.0) < 1.18)):
+            return quad
+        return out
+
+
+def _f_margin_is_paper(lab, old, new, tol=14.0, need=0.7):
+    """The band between the old and the widened outline must be PAPER (the white margin the first outline missed).  If it is
+    table / cloth / wall the widening ran over the edge of the page and is thrown away."""
+    h, w = lab.shape[:2]
+    mo = np.zeros((h, w), np.uint8)
+    me = np.zeros((h, w), np.uint8)
+    cv2.fillPoly(mo, [np.rint(np.asarray(old)).astype(np.int32)], 1)
+    cv2.fillPoly(me, [np.rint(np.asarray(new)).astype(np.int32)], 1)
+    ring = (me > 0) & (mo == 0)
+    inner = cv2.erode(mo, np.ones((9, 9), np.uint8)) > 0
+    if ring.sum() < 20 or inner.sum() < 50:
+        return True
+    pix = lab[inner]
+    pc = np.median(pix[pix[:, 0] >= np.percentile(pix[:, 0], 40)], 0)
+    d = np.sqrt(((lab[ring] - pc) ** 2).sum(1))
+    return float((d < tol).mean()) >= need
+
+
+def _f_inside(q, h, w, m=None):
+    """No corner far outside the picture (the sides of a hull cut by the picture's edge get extended into nowhere)."""
+    m = FAST_OUT if m is None else m
+    return all(-m * w <= x <= (1 + m) * w and -m * h <= y <= (1 + m) * h for x, y in q)
+
+
+def _detect_fast(img, want_debug=None):
+    """Returns (corners in picture pixels, found, info) or None."""
+    rgb = np.asarray(img.convert("RGB"))
+    H, W = rgb.shape[:2]
+    small, s = _f_resize(rgb, FAST_SIDE)
+    h, w = small.shape[:2]
+    J = _FJudge(small)
+    pool = []
+    for c in _f_dedupe(_f_candidates(small, J), 0.006 * max(h, w)):
+        q = c["quad"]
+        if _quad_ok(q, h, w):
+            pool.append((J.value(q)[0], q, c["tag"]))
+    # paper-colour growth from the best few outlines and from the middle of the picture
+    seeds = [(q_, 0.6) for _, q_, _t in sorted(pool, key=lambda r: -r[0])[:4]]
+    seeds.append(([(0.3 * w, 0.3 * h), (0.7 * w, 0.3 * h), (0.7 * w, 0.7 * h), (0.3 * w, 0.7 * h)], 1.0))
+    grown = []
+    for sq, sh in seeds:
+        try:
+            _f_grow(J, sq, sh, grown)
+        except Exception:
+            pass
+    for c in _f_dedupe(grown, 0.006 * max(h, w)):
+        q = c["quad"]
+        if _quad_ok(q, h, w):
+            pool.append((J.value(q)[0], q, c["tag"]))
+    pool = [r for r in pool if _f_inside(r[1], h, w)]
+    best_region = max([p_[0] for p_ in pool], default=0.0)
+    if FAST_LINES == "always" or (FAST_LINES == "weak" and best_region < FAST_LINES_T):
+        try:
+            for q, ar, vt in _line_quads(_f_lines(small), h, w, limit=200):
+                if _quad_ok(q, h, w):
+                    pool.append((J.value(q)[0], q, "lines"))
+        except Exception:
+            pass
+    if not pool:
+        return None
+    pool.sort(key=lambda r: -r[0])
+    starts = []
+    for v, q, tag in pool:
+        if any(_f_iou(q, o[1]) > 0.9 for o in starts):
+            continue
+        starts.append((v, q, tag))
+        if len(starts) >= 10:
+            break
+    if want_debug is not None:
+        want_debug.extend([(v, tag, [(x / s, y / s) for x, y in q]) for v, q, tag in pool[:60]])
+    mid, sm = _f_resize(rgb, REFINE_SIDE)
+    f = sm / s                                                 # small-picture pixels -> refine-picture pixels
+    R = _FRefiner(mid)
+    search = max(3.0, 0.012 * max(mid.shape[:2]))
+    scored = []
+    for v0, q, tag in starts[:7]:
+        q0 = q
+        pu = J.purity(q)
+        try:
+            qm = R.refine([(x * f, y * f) for x, y in q], search)
+            q1 = [(x / f, y / f) for x, y in qm]
+            if _quad_ok(q1, h, w):
+                v1 = J.value(q1)[0]
+                if v1 >= 0.97 * v0:
+                    q, v0 = q1, v1
+        except Exception:
+            pass
+        scored.append((v0 * pu, q, q0))
+    scored.sort(key=lambda r: -r[0])
+    if want_debug is not None:
+        want_debug.append(("scored", [(r[0], [(x / s, y / s) for x, y in r[1]]) for r in scored], None))
+    pick = scored[0]
+    # a fold, a printed frame or a header inside the page also has strong edges: when a bigger outline that holds the best one
+    # comes close in value, it is the whole sheet - take it
+    if len(scored) > 1:
+        a0 = _poly_area(pick[1])
+        m0 = np.zeros((h, w), np.uint8)
+        cv2.fillPoly(m0, [np.rint(np.asarray(pick[1])).astype(np.int32)], 1)
+        wholes = []
+        for c in scored[1:]:
+            ac = _poly_area(c[1])
+            if ac < 1.25 * a0 or ac > 4.5 * a0 or c[0] < FAST_WHOLE * pick[0]:
+                continue
+            mc = np.zeros((h, w), np.uint8)
+            cv2.fillPoly(mc, [np.rint(np.asarray(c[1])).astype(np.int32)], 1)
+            if (m0 & mc).sum() >= 0.8 * m0.sum():
+                wholes.append(c)
+        if wholes:
+            pick = max(wholes, key=lambda r: r[0])
+    val, quad = pick[0], pick[1]
+    v_, info_ = J.value(quad)
+    if val <= 0.07 or info_["edge_mean"] < 1.12 * J.base:
+        return None
+    pts = _order(quad)
+    try:                                                       # page edge that is nearly the table's colour: find it by colour
+        labs = cv2.cvtColor(mid.astype(np.float32) / 255.0, cv2.COLOR_RGB2LAB)
+        q_old = [(x * f, y * f) for x, y in pts]
+        ex, moved = _expand_to_paper(labs, q_old)
+        if moved and _f_margin_is_paper(labs, q_old, ex):
+            pts = _order([(x / f, y / f) for x, y in ex])
+    except Exception:
+        pass
+    res = [(min(max(x / s, 0.0), W - 1.0), min(max(y / s, 0.0), H - 1.0)) for x, y in pts]
+    info = {"score": min(1.2, val / 0.20), "edge": info_["edge_mean"], "contrast": info_["split_mean"], "engine": "fast"}
+    return res, True, info
+
+
+FAST_RESCUE = True                                   # not confident -> also ask the old, slower finder and keep the better one
+FAST_SURE = 0.55                                     # score (as in the 'info' dict) from which the fast answer is trusted
+
+
+def detect_document(img, return_score=False):
+    """Finds the 4 corners of the paper. Returns (corners [(x,y) TL,TR,BR,BL in picture pixels], found: bool).
+    First the fast OpenCV finder (a fraction of a second); only when it is not sure the old finder (several seconds) is asked as
+    well and the better answer is kept."""
+    best = None
+    if cv2 is not None:
+        try:
+            best = _detect_fast(img)
+        except Exception:
+            best = None
+    if best is None:                                  # the fast finder found no sheet at all: ask the old, slower one
+        best = _detect_document_legacy(img, True)
+    res, found, info = best
+    return (res, found, info) if return_score else (res, found)
