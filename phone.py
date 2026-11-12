@@ -26,13 +26,14 @@ EXT = {"JPEG": ".jpg", "PNG": ".png", "WEBP": ".webp", "BMP": ".bmp", "GIF": ".g
 def local_ip():
     """The address of this computer on the Wi-Fi / LAN (None if there is no network)."""
     cands = []
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("10.255.255.255", 1))
-        cands.append(s.getsockname()[0])
-        s.close()
-    except Exception:
-        pass
+    for target in ("8.8.8.8", "10.255.255.255", "192.168.255.255"):       # the address the computer really uses to reach the network
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect((target, 1))
+            cands.append(s.getsockname()[0])
+            s.close()
+        except Exception:
+            pass
     try:
         cands += socket.gethostbyname_ex(socket.gethostname())[2]
     except Exception:
@@ -50,6 +51,7 @@ def local_ip():
 class _Handler(BaseHTTPRequestHandler):
     server_version = "ImageFixer"
     protocol_version = "HTTP/1.1"
+    timeout = 120                                       # a dead / idle connection is closed, not kept forever
     disable_nagle_algorithm = True                      # small replies leave at once (no 40 ms wait)
     wbufsize = 64 * 1024                                # headers + body go out in one piece
 
@@ -256,53 +258,126 @@ class _Cache:
 
 
 class Tunnel:
-    """Optional 'Internet' link: asks the free localhost.run service (through the OpenSSH program that comes with
-    Windows 10 / 11) to give this computer a public https address. Nothing is installed.
-    Only this program's phone page is reachable, and only with the secret code in the link."""
-    URL = re.compile(r"https://[A-Za-z0-9.-]+\.(?:lhr\.life|localhost\.run)")
-    NOT_TUNNEL = ("admin", "docs", "www", "status", "support", "blog")
+    """Optional 'Internet' link: a free Cloudflare quick tunnel (no account). The small helper program 'cloudflared'
+    is downloaded once (about 30 MB, from github.com) next to the program's settings, then started; Cloudflare gives
+    this computer a public https address. Only this program's phone page is reachable, and only with the secret code in the link.
+    Attributes used by the window: url, error, status_text, timed_out(), alive(), stop()."""
+    URL = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
+    BASE = "https://github.com/cloudflare/cloudflared/releases/latest/download/"
 
     def __init__(self, port):
         self.port = port
         self.url = None
         self.error = None
+        self.status_text = "Starting ..."
         self.proc = None
         self.started = time.time()
-        self._start()
+        self._stopped = False
+        threading.Thread(target=self._run, daemon=True).start()
 
-    def _start(self):
+    # ---- the helper program
+    @staticmethod
+    def _bin_path():
+        import sys
+        name = "cloudflared.exe" if sys.platform == "win32" else "cloudflared"
+        root = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), ".config")
+        d = os.path.join(root, "ImageFixer")
+        os.makedirs(d, exist_ok=True)
+        return os.path.join(d, name)
+
+    def _source(self):
+        import platform
+        import sys
+        mach = platform.machine().lower()
+        arm = mach in ("arm64", "aarch64")
+        if sys.platform == "win32":
+            return self.BASE + "cloudflared-windows-amd64.exe", False
+        if sys.platform == "darwin":
+            return self.BASE + ("cloudflared-darwin-arm64.tgz" if arm else "cloudflared-darwin-amd64.tgz"), True
+        return self.BASE + ("cloudflared-linux-arm64" if arm else "cloudflared-linux-amd64"), False
+
+    def _ensure(self):
+        path = self._bin_path()
+        if os.path.isfile(path) and os.path.getsize(path) > (1 << 20):
+            return path
+        import urllib.request
+        src, tgz = self._source()
+        self.status_text = "Downloading the connection helper (only the first time) ... 0%"
+        tmp = path + ".part"
+        with urllib.request.urlopen(src, timeout=60) as resp, open(tmp, "wb") as out:
+            total = int(resp.headers.get("Content-Length") or 0)
+            got = 0
+            buf = io.BytesIO() if tgz else None
+            while True:
+                if self._stopped:
+                    raise RuntimeError("stopped")
+                chunk = resp.read(256 * 1024)
+                if not chunk:
+                    break
+                (buf or out).write(chunk)
+                got += len(chunk)
+                if total:
+                    self.status_text = "Downloading the connection helper (only the first time) ... %d%%" % (got * 100 // total)
+            if tgz:
+                import tarfile
+                buf.seek(0)
+                with tarfile.open(fileobj=buf, mode="r:gz") as tf:
+                    for m in tf.getmembers():
+                        if os.path.basename(m.name) == "cloudflared":
+                            out.write(tf.extractfile(m).read())
+                            break
+                    else:
+                        raise RuntimeError("helper not found in the download")
+        os.replace(tmp, path)
+        try:
+            os.chmod(path, 0o755)
+        except Exception:
+            pass
+        return path
+
+    # ---- the tunnel
+    def _run(self):
         import subprocess
         import sys
-        cmd = ["ssh", "-T", "-o", "StrictHostKeyChecking=accept-new", "-o", "ServerAliveInterval=30",
-               "-o", "ExitOnForwardFailure=yes", "-o", "BatchMode=yes",
-               "-R", "80:127.0.0.1:%d" % self.port, "nokey@localhost.run"]
+        try:
+            path = self._ensure()
+        except Exception as ex:
+            if not self._stopped:
+                self.error = "Could not download the connection helper: %s" % str(ex)[:120]
+            return
+        if self._stopped:
+            return
+        self.started = time.time()                        # the 30 s clock starts when the helper starts
+        self.status_text = "Connecting ... (can take up to 30 seconds)"
+        cmd = [path, "tunnel", "--url", "http://127.0.0.1:%d" % self.port, "--no-autoupdate", "--protocol", "http2"]
         flags = 0x08000000 if sys.platform == "win32" else 0
         try:
             self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                          stdin=subprocess.DEVNULL, creationflags=flags)
-        except FileNotFoundError:
-            self.error = "The 'ssh' program was not found. Install the Windows optional feature 'OpenSSH Client'."
-            return
         except Exception as ex:
-            self.error = str(ex)
+            self.error = str(ex)[:150]
             return
-        threading.Thread(target=self._read, daemon=True).start()
+        self._read()
 
     def _read(self):
+        found = None
         try:
             for raw in self.proc.stdout:
                 line = raw.decode("utf-8", "replace")
-                if self.url is None:
-                    for m in self.URL.finditer(line):
-                        host = m.group(0).split("//", 1)[1].lower()
-                        if host.split(".")[0] in self.NOT_TUNNEL or host in ("localhost.run", "lhr.life"):
-                            continue                    # the service's own pages (sign-in / docs), not our address
-                        self.url = m.group(0)
-                        break
+                if found is None:
+                    for m in self.URL.findall(line):
+                        if m != "https://api.trycloudflare.com":
+                            found = m
+                            break
+                if found is not None and self.url is None and "Registered tunnel connection" in line:
+                    time.sleep(1.5)                       # let the new address reach the DNS
+                    self.url = found
         except Exception:
             pass
+        if self._stopped:
+            return
         if self.url is None and self.error is None:
-            self.error = "Could not open the internet link (no internet, or the service is busy)."
+            self.error = "The connection helper stopped. Check the internet connection of this computer."
         elif self.url is not None:
             self.url = None
             self.error = "The internet link was closed."
@@ -311,9 +386,10 @@ class Tunnel:
         return self.proc is not None and self.proc.poll() is None
 
     def timed_out(self):
-        return self.url is None and self.error is None and time.time() - self.started > 30
+        return self.url is None and self.error is None and self.proc is not None and time.time() - self.started > 60
 
     def stop(self):
+        self._stopped = True
         try:
             if self.proc is not None and self.proc.poll() is None:
                 self.proc.kill()
@@ -325,6 +401,7 @@ class Tunnel:
 class _Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    request_queue_size = 128                            # many quick connections from the phone browser are not refused
 
 
 class PhoneServer(QObject):
@@ -396,11 +473,13 @@ class PhoneServer(QObject):
             b["n"] = n
             fname = ("Scan_%s_%02d" % (time.strftime("%Y%m%d_%H%M%S"), i + 1)) if kind == "scan" else stem
             os.makedirs(self.inbox, exist_ok=True)
-            path = os.path.join(self.inbox, fname + ext)
-            n = 2
-            while os.path.exists(path):
-                path = os.path.join(self.inbox, "%s (%d)%s" % (fname, n, ext))
-                n += 1
+            path = b["files"].get(i)                          # the phone sent this one again (bad connection): same file, no copy
+            if path is None:
+                path = os.path.join(self.inbox, fname + ext)
+                n = 2
+                while os.path.exists(path):
+                    path = os.path.join(self.inbox, "%s (%d)%s" % (fname, n, ext))
+                    n += 1
             with open(path, "wb") as f:
                 f.write(data)
             b["files"][i] = path
@@ -519,7 +598,7 @@ svg{width:26px;height:26px;fill:none;stroke:currentColor;stroke-width:2;stroke-l
 </section>
 
 <section class="scr" id="review">
- <div class="stage"><canvas id="rcv"></canvas><div class="wait" id="rWait"><div><div class="spin"></div>Cleaning the page</div></div></div>
+ <div class="stage"><canvas id="rcv"></canvas><div class="wait" id="rWait"><div><div class="spin"></div>Working</div></div></div>
  <div class="pad"><div class="seg" id="looks"><button data-l="orig">Original</button><button data-l="clean" class="on">Clean</button><button data-l="gray">Gray</button><button data-l="bw">B&amp;W</button></div></div>
  <div class="dock"><div class="row"><button class="btn" id="rRotL"><svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8M3 3v5h5"/></svg>Turn</button><button class="btn" id="rRotR">Turn<svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-3-6.7L21 8M21 3v5h-5"/></svg></button><button class="btn" id="rAdj">Corners</button></div><button class="btn pri" id="rUse">Use this page</button></div>
 </section>
@@ -541,10 +620,13 @@ svg{width:26px;height:26px;fill:none;stroke:currentColor;stroke-width:2;stroke-l
 <div id="viewer"><img id="vimg"></div>
 <script>
 const $=id=>document.getElementById(id), base=location.pathname.replace(/\/$/,'');
+const TUN=/^\/s\//.test(location.pathname), MAXSIDE=TUN?2400:3000, OUTSIDE=TUN?2000:2600, JQ=0.9;   // the page that is sent is a bit smaller over the internet link
 let pages=[], retake=-1, cur=null, busy=false, sentLog=[], tt=0, seq=0, lastOk=Date.now(), active=0;
 const DPR=()=>Math.min(window.devicePixelRatio||1,2.5);
 const LOOKNAME={orig:'Original',clean:'Clean',gray:'Gray',bw:'Black & white'};
-const api=async(p,opt)=>{active++;try{const r=await fetch(base+p,opt);lastOk=Date.now();return r;}finally{active--;prog(active>0);}};
+const api=async(p,opt,tries)=>{active++;prog(true);try{for(let k=0;;k++){try{const r=await fetch(base+p,opt);lastOk=Date.now();return r;}
+  catch(e){if(k>=(tries==null?2:tries))throw e;await new Promise(r=>setTimeout(r,500*(k+1)));}}}   // a dropped connection is tried again
+ finally{active--;prog(active>0);}};
 function show(id){for(const s of ['home','edit','review','list'])$(s).classList.toggle('on',s===id);}
 function toast(t,err,ms){clearTimeout(tt);const e=$('toast');if(!t){e.classList.remove('on');return;}e.textContent=t;e.className='on'+(err?' err':'');tt=setTimeout(()=>e.classList.remove('on'),ms||(err?5000:2200));}
 function prog(on){$('bar').classList.toggle('on',!!on);}
@@ -570,7 +652,7 @@ async function shrink(file,maxSide){ // photo -> {blob (upright JPEG), bmp}
  const im=await decode(file),w=bw(im),h=bh(im),s=Math.min(1,maxSide/Math.max(w,h));
  const c=document.createElement('canvas');c.width=Math.round(w*s);c.height=Math.round(h*s);
  const g=c.getContext('2d');g.imageSmoothingQuality='high';g.drawImage(im,0,0,c.width,c.height);if(im.close)im.close();
- return {blob:await toBlob(c,0.9),bmp:c};}
+ return {bmp:c};}      // the JPEG for the computer is made while the photo is already on screen
 function turned(src,t){ // clockwise quarter turns of a bitmap/canvas, returns a canvas
  t=((t%4)+4)%4;const w=bw(src),h=bh(src),c=document.createElement('canvas');c.width=t%2?h:w;c.height=t%2?w:h;
  const g=c.getContext('2d');g.translate(c.width/2,c.height/2);g.rotate(t*Math.PI/2);g.drawImage(src,-w/2,-h/2);return c;}
@@ -601,23 +683,27 @@ $('bScan').onclick=()=>{retake=-1;openCam();};
 $('bGal').onclick=()=>{retake=-1;$('fGal').value='';$('fGal').click();};
 $('fCam').onchange=e=>gotPhoto(e.target.files[0]);$('fGal').onchange=e=>gotPhoto(e.target.files[0]);
 // the photo goes to the computer ONCE (it keeps it, tagged with an id); after that only a few numbers travel
+async function getBlob(){if(!cur.blob)cur.blob=await cur.blobP;return cur.blob;}
 async function detect(){
  const url='/api/detect?sr='+cur.sr+(cur.id?'&id='+cur.id:'');
- let r=await api(url,{method:'POST',body:cur.id?undefined:cur.blob});
- if(r.status===410){cur.id=null;r=await api('/api/detect?sr='+cur.sr,{method:'POST',body:cur.blob});}
+ let r=await api(url,{method:'POST',body:cur.id?undefined:await getBlob()});
+ if(r.status===410){cur.id=null;r=await api('/api/detect?sr='+cur.sr,{method:'POST',body:await getBlob()});}
  const j=await r.json();if(!j.ok)throw new Error(j.error);cur.id=j.id;ok();return j;}
 async function gotPhoto(f){if(!f)return;
- const my=++seq;show('edit');$('eWait').classList.add('on');$('tip').textContent='';
- try{const s=await shrink(f,3000);cur={blob:s.blob,base:s.bmp,sr:0,view:s.bmp,w:bw(s.bmp),h:bh(s.bmp),quad:null,id:null,look:'clean',rot:0,res:null};
-  await raf();layout();                                   // the photo is on screen while the computer looks for the paper
-  cur.quad=[[.04,.04],[.96,.04],[.96,.96],[.04,.96]].map(p=>({x:p[0]*cur.w,y:p[1]*cur.h}));draw();
-  const j=await detect();if(my!==seq)return;
-  cur.quad=j.quad.map(p=>({x:p[0],y:p[1]}));setTip(j.found);$('eWait').classList.remove('on');draw();
- }catch(err){$('eWait').classList.remove('on');toast('Could not reach the computer. Scan the QR code again.',true);if(cur&&cur.view)setTip(false);}}
+ const my=++seq;toast('Opening the photo ...',false,60000);prog(true);
+ try{const s=await shrink(f,MAXSIDE),o={blob:null,base:s.bmp,sr:0,view:s.bmp,w:bw(s.bmp),h:bh(s.bmp),quad:null,id:null,look:'clean',rot:0,res:null};
+  o.blobP=toBlob(s.bmp,JQ);cur=o;toast('');prog(false);
+  show('edit');$('tip').textContent='';await raf();layout();           // the photo is on screen first, the computer looks for the paper after
+  findHere();                                                         // the paper is found right here on the phone: no waiting
+ }catch(err){prog(false);toast('Could not open this photo.',true);}}
+function findHere(){const r=detectLocal(cur.view);cur.quad=r.quad;cur.touched=false;setTip(r.found);draw();refine();}
+async function refine(){ // LAN only: the computer's finer finder may improve the outline a moment later (if the corners were not touched)
+ if(TUN)return;const me=cur,sr=cur.sr;
+ try{const j=await detect();if(cur!==me||me.sr!==sr||me.touched||!j.found)return;me.quad=j.quad.map(p=>({x:p[0],y:p[1]}));setTip(true);draw();}catch(e){}}
 function setTip(found){$('tip').textContent=found?'Paper found. Drag a round corner or a square side if the outline is not exact.':'Paper not found. Drag the corners onto the paper, or tap "Whole photo".';}
-$('eAuto').onclick=async()=>{$('eWait').classList.add('on');try{const j=await detect();cur.quad=j.quad.map(p=>({x:p[0],y:p[1]}));setTip(j.found);draw();}catch(e){toast('Failed. Try again.',true);}$('eWait').classList.remove('on');};
+$('eAuto').onclick=()=>{buzz();findHere();};
 $('eFull').onclick=()=>{const m=0.01,w=cur.w,h=cur.h;cur.quad=[{x:w*m,y:h*m},{x:w*(1-m),y:h*m},{x:w*(1-m),y:h*(1-m)},{x:w*m,y:h*(1-m)}];draw();};
-function turnSrc(cw){cur.quad=rotQuad(cur.quad,cur.w,cur.h,cw);cur.sr=(cur.sr+(cw?1:3))%4;cur.view=turned(cur.base,cur.sr);cur.w=bw(cur.view);cur.h=bh(cur.view);layout();draw();buzz();}
+function turnSrc(cw){cur.touched=true;cur.quad=rotQuad(cur.quad,cur.w,cur.h,cw);cur.sr=(cur.sr+(cw?1:3))%4;cur.view=turned(cur.base,cur.sr);cur.w=bw(cur.view);cur.h=bh(cur.view);layout();draw();buzz();}
 $('eRotL').onclick=()=>turnSrc(false);$('eRotR').onclick=()=>turnSrc(true);
 
 const cv=$('cv'),cx=cv.getContext('2d');let drag=null,scale=1;
@@ -641,7 +727,7 @@ function pos(e){const r=cv.getBoundingClientRect(),k=cv.width/r.width;return{x:(
 cv.onpointerdown=e=>{if(!cur.quad)return;const p=pos(e),d=DPR(),q=cur.quad.map(a=>({x:a.x*scale,y:a.y*scale})),m=mids(q);let best=null,bd=1e9;
  q.forEach((c,i)=>{const t=Math.hypot(c.x-p.x,c.y-p.y)-4*d;if(t<bd){bd=t;best={kind:'c',i};}});
  m.forEach((c,i)=>{const t=Math.hypot(c.x-p.x,c.y-p.y);if(t<bd){bd=t;best={kind:'m',i};}});
- if(best&&bd<64*d){drag=best;drag.start=cur.quad.map(a=>({x:a.x,y:a.y}));drag.p0=p;cv.setPointerCapture(e.pointerId);buzz();draw();}};
+ if(best&&bd<64*d){cur.touched=true;drag=best;drag.start=cur.quad.map(a=>({x:a.x,y:a.y}));drag.p0=p;cv.setPointerCapture(e.pointerId);buzz();draw();}};
 cv.onpointermove=e=>{if(!drag)return;const p=pos(e),dx=(p.x-drag.p0.x)/scale,dy=(p.y-drag.p0.y)/scale,S=drag.start;
  const cl=(v,m)=>Math.max(0,Math.min(m,v));
  if(drag.kind==='c'){cur.quad[drag.i]={x:cl(S[drag.i].x+dx,cur.w),y:cl(S[drag.i].y+dy,cur.h)};}
@@ -652,44 +738,127 @@ cv.onpointerup=cv.onpointercancel=()=>{drag=null;draw();};
 addEventListener('resize',()=>{if($('edit').classList.contains('on')&&cur&&cur.view){layout();draw();}else if($('review').classList.contains('on')&&cur&&cur.res)paintReview();});
 $('eRetake').onclick=()=>openCam();
 
-// ---------- cut out + review: the page appears at once (shown as photographed), the cleaning follows and swaps in
+// ---------- the scanner on the phone itself: finds the paper, cuts it out, cleans it. Nothing but the final picture goes to the computer.
+function blurF(a,w,h,r){ // box blur (twice-friendly), Float32Array
+ const t=new Float32Array(a.length),o=new Float32Array(a.length),k=2*r+1;
+ for(let y=0;y<h;y++){let s=0;const row=y*w;for(let i=-r;i<=r;i++)s+=a[row+Math.min(w-1,Math.max(0,i))];
+  for(let x=0;x<w;x++){t[row+x]=s/k;s+=a[row+Math.min(w-1,x+r+1)]-a[row+Math.max(0,x-r)];}}
+ for(let x=0;x<w;x++){let s=0;for(let i=-r;i<=r;i++)s+=t[Math.min(h-1,Math.max(0,i))*w+x];
+  for(let y=0;y<h;y++){o[y*w+x]=s/k;s+=t[Math.min(h-1,y+r+1)*w+x]-t[Math.max(0,y-r)*w+x];}}
+ return o;}
+function otsu(v){const n=v.length,hist=new Float64Array(256);for(let i=0;i<n;i++)hist[v[i]]++;let sum=0;for(let i=0;i<256;i++)sum+=i*hist[i];
+ let wB=0,sB=0,best=-1,th=127;for(let t=0;t<256;t++){wB+=hist[t];if(!wB)continue;const wF=n-wB;if(!wF)break;sB+=t*hist[t];
+  const mB=sB/wB,mF=(sum-sB)/wF,q=wB*wF*(mB-mF)*(mB-mF);if(q>best){best=q;th=t;}}return th;}
+function bigBlob(mask,w,h){ // biggest 4-connected blob -> {lab:Uint8Array, n}
+ const seen=new Uint8Array(w*h),st=new Int32Array(w*h);let bestStart=-1,bestN=0;
+ for(let s=0;s<w*h;s++){if(!mask[s]||seen[s])continue;let sp=0,n=0;st[sp++]=s;seen[s]=1;
+  while(sp){const p=st[--sp];n++;const x=p%w,y=(p-x)/w;
+   if(x>0&&mask[p-1]&&!seen[p-1]){seen[p-1]=1;st[sp++]=p-1;}if(x<w-1&&mask[p+1]&&!seen[p+1]){seen[p+1]=1;st[sp++]=p+1;}
+   if(y>0&&mask[p-w]&&!seen[p-w]){seen[p-w]=1;st[sp++]=p-w;}if(y<h-1&&mask[p+w]&&!seen[p+w]){seen[p+w]=1;st[sp++]=p+w;}}
+  if(n>bestN){bestN=n;bestStart=s;}}
+ if(bestStart<0)return null;const lab=new Uint8Array(w*h),st2=[bestStart];lab[bestStart]=1;
+ while(st2.length){const p=st2.pop(),x=p%w,y=(p-x)/w;
+  if(x>0&&mask[p-1]&&!lab[p-1]){lab[p-1]=1;st2.push(p-1);}if(x<w-1&&mask[p+1]&&!lab[p+1]){lab[p+1]=1;st2.push(p+1);}
+  if(y>0&&mask[p-w]&&!lab[p-w]){lab[p-w]=1;st2.push(p-w);}if(y<h-1&&mask[p+w]&&!lab[p+w]){lab[p+w]=1;st2.push(p+w);}}
+ return {lab,n:bestN};}
+function polyArea(q){let a=0;for(let i=0;i<4;i++){const p=q[i],r=q[(i+1)%4];a+=p.x*r.y-r.x*p.y;}return Math.abs(a)/2;}
+function detectLocal(src){ // -> {quad:[TL,TR,BR,BL] in src pixels, found}
+ const W=bw(src),H=bh(src),s=Math.min(1,420/Math.max(W,H)),w=Math.max(8,Math.round(W*s)),h=Math.max(8,Math.round(H*s));
+ const c=document.createElement('canvas');c.width=w;c.height=h;const g=c.getContext('2d',{willReadFrequently:true});g.drawImage(src,0,0,w,h);
+ const d=g.getImageData(0,0,w,h).data,N=w*h,L=new Float32Array(N);
+ for(let i=0;i<N;i++)L[i]=0.299*d[4*i]+0.587*d[4*i+1]+0.114*d[4*i+2];
+ const Lb=blurF(blurF(L,w,h,2),w,h,2),u1=new Uint8Array(N);for(let i=0;i<N;i++)u1[i]=Lb[i];
+ // background colour = the border of the photo
+ let br=0,bg=0,bb=0,bn=0;const m=Math.max(2,Math.round(Math.min(w,h)*0.03));
+ for(let y=0;y<h;y++)for(let x=0;x<w;x++){if(x<m||y<m||x>=w-m||y>=h-m){const i=4*(y*w+x);br+=d[i];bg+=d[i+1];bb+=d[i+2];bn++;}}
+ br/=bn;bg/=bn;bb/=bn;const D=new Float32Array(N);
+ for(let i=0;i<N;i++)D[i]=Math.hypot(d[4*i]-br,d[4*i+1]-bg,d[4*i+2]-bb);
+ const Db=blurF(blurF(D,w,h,2),w,h,2),u2=new Uint8Array(N);for(let i=0;i<N;i++)u2[i]=Math.min(255,Db[i]*1.3);
+ const cands=[];const t1=otsu(u1),t2=otsu(u2);
+ const m1=new Uint8Array(N),m2=new Uint8Array(N),m3=new Uint8Array(N);
+ for(let i=0;i<N;i++){m1[i]=u1[i]>t1?1:0;m2[i]=u2[i]>t2?1:0;m3[i]=(u1[i]>t1&&u2[i]>t2*0.7)?1:0;}
+ let best=null;
+ for(const mk of [m2,m3,m1]){
+  let a=new Float32Array(N);for(let i=0;i<N;i++)a[i]=mk[i];
+  a=blurF(a,w,h,3);const c1=new Uint8Array(N);for(let i=0;i<N;i++)c1[i]=a[i]>0.4?1:0;       // close small gaps (printed text)
+  a=new Float32Array(N);for(let i=0;i<N;i++)a[i]=c1[i];a=blurF(a,w,h,3);const c2=new Uint8Array(N);for(let i=0;i<N;i++)c2[i]=a[i]>0.6?1:0;
+  const bl=bigBlob(c2,w,h);if(!bl)continue;const frac=bl.n/N;if(frac<0.1||frac>0.985)continue;
+  let tl=null,tr=null,br2=null,bl2=null,mn1=1e9,mx1=-1e9,mn2=1e9,mx2=-1e9,cx=0,cy=0;
+  for(let y=0;y<h;y++)for(let x=0;x<w;x++){const p=y*w+x;if(!bl.lab[p])continue;cx+=x;cy+=y;
+   const edge=x===0||y===0||x===w-1||y===h-1||!bl.lab[p-1]||!bl.lab[p+1]||!bl.lab[p-w]||!bl.lab[p+w];if(!edge)continue;
+   const a1=x+y,a2=x-y;if(a1<mn1){mn1=a1;tl={x,y};}if(a1>mx1){mx1=a1;br2={x,y};}if(a2>mx2){mx2=a2;tr={x,y};}if(a2<mn2){mn2=a2;bl2={x,y};}}
+  if(!tl||!tr||!br2||!bl2)continue;const q=[tl,tr,br2,bl2],fill=bl.n/Math.max(1,polyArea(q));cx/=bl.n;cy/=bl.n;
+  const centre=1-0.5*Math.hypot(cx-w/2,cy-h/2)/Math.hypot(w/2,h/2),score=Math.min(1,fill)*Math.sqrt(frac)*centre;
+  if(fill<0.7)continue;if(!best||score>best.score)best={score,q,fill,frac};}
+ const k=1/s;
+ if(!best){const mm=0.04;return {quad:[[mm,mm],[1-mm,mm],[1-mm,1-mm],[mm,1-mm]].map(p=>({x:p[0]*W,y:p[1]*H})),found:false};}
+ // pull the corners a hair outwards: the blob is slightly smaller than the sheet
+ const cx=best.q.reduce((a,p)=>a+p.x,0)/4,cy=best.q.reduce((a,p)=>a+p.y,0)/4;
+ const quad=best.q.map(p=>({x:Math.max(0,Math.min(W,(p.x+(p.x-cx)*0.004)*k)),y:Math.max(0,Math.min(H,(p.y+(p.y-cy)*0.004)*k))}));
+ return {quad,found:best.fill>0.82&&best.frac>0.15};}
+
+function warpLocal(src,quad,maxSide){ // cut the quad out of src and remove the camera angle -> canvas
+ const [p0,p1,p2,p3]=quad,dist=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y);
+ let w=Math.max(dist(p0,p1),dist(p3,p2)),h=Math.max(dist(p0,p3),dist(p1,p2));const k=Math.min(1,maxSide/Math.max(w,h));
+ w=Math.max(8,Math.round(w*k));h=Math.max(8,Math.round(h*k));
+ const sw=bw(src),sh=bh(src),sc=document.createElement('canvas');sc.width=sw;sc.height=sh;const sg=sc.getContext('2d',{willReadFrequently:true});sg.drawImage(src,0,0);
+ const S=sg.getImageData(0,0,sw,sh).data,out=document.createElement('canvas');out.width=w;out.height=h;const og=out.getContext('2d'),O=og.createImageData(w,h),D=O.data;
+ const sx=p0.x-p1.x+p2.x-p3.x,sy=p0.y-p1.y+p2.y-p3.y;let a,b,c,d,e,f,gg=0,hh=0;
+ if(Math.abs(sx)<1e-9&&Math.abs(sy)<1e-9){a=p1.x-p0.x;b=p3.x-p0.x;c=p0.x;d=p1.y-p0.y;e=p3.y-p0.y;f=p0.y;}
+ else{const dx1=p1.x-p2.x,dx2=p3.x-p2.x,dy1=p1.y-p2.y,dy2=p3.y-p2.y,det=dx1*dy2-dx2*dy1;
+  gg=(sx*dy2-dx2*sy)/det;hh=(dx1*sy-sx*dy1)/det;a=p1.x-p0.x+gg*p1.x;b=p3.x-p0.x+hh*p3.x;c=p0.x;d=p1.y-p0.y+gg*p1.y;e=p3.y-p0.y+hh*p3.y;f=p0.y;}
+ const mx=sw-1.001,my=sh-1.001;let o=0;
+ for(let y=0;y<h;y++){const v=(y+0.5)/h;for(let x=0;x<w;x++){const u=(x+0.5)/w,z=gg*u+hh*v+1;
+  let X=(a*u+b*v+c)/z,Y=(d*u+e*v+f)/z;X=X<0?0:X>mx?mx:X;Y=Y<0?0:Y>my?my:Y;
+  const x0=X|0,y0=Y|0,fx=X-x0,fy=Y-y0,i=4*(y0*sw+x0),j=i+4*sw,w00=(1-fx)*(1-fy),w10=fx*(1-fy),w01=(1-fx)*fy,w11=fx*fy;
+  D[o]=S[i]*w00+S[i+4]*w10+S[j]*w01+S[j+4]*w11;D[o+1]=S[i+1]*w00+S[i+5]*w10+S[j+1]*w01+S[j+5]*w11;D[o+2]=S[i+2]*w00+S[i+6]*w10+S[j+2]*w01+S[j+6]*w11;D[o+3]=255;o+=4;}}
+ og.putImageData(O,0,0);return out;}
+
+function lookLocal(src,look){ // 'clean' = white paper + even light (colour kept), 'gray', 'bw'
+ if(look==='orig')return src;const w=src.width,h=src.height,g=src.getContext('2d'),I=g.getImageData(0,0,w,h),D=I.data;
+ const f=8,sw=Math.max(4,Math.ceil(w/f)),sh=Math.max(4,Math.ceil(h/f)),sm=document.createElement('canvas');sm.width=sw;sm.height=sh;
+ const sg=sm.getContext('2d',{willReadFrequently:true});sg.imageSmoothingQuality='high';sg.drawImage(src,0,0,sw,sh);const sd=sg.getImageData(0,0,sw,sh).data;
+ let L=new Float32Array(sw*sh);for(let i=0;i<sw*sh;i++)L[i]=0.299*sd[4*i]+0.587*sd[4*i+1]+0.114*sd[4*i+2];
+ const R=Math.max(2,Math.round(Math.min(sw,sh)*0.035)),M=new Float32Array(sw*sh);          // paper brightness = the brightest nearby (text is darker)
+ const T=new Float32Array(sw*sh);for(let y=0;y<sh;y++)for(let x=0;x<sw;x++){let m=0;for(let i=Math.max(0,x-R);i<=Math.min(sw-1,x+R);i++){const v=L[y*sw+i];if(v>m)m=v;}T[y*sw+x]=m;}
+ for(let y=0;y<sh;y++)for(let x=0;x<sw;x++){let m=0;for(let i=Math.max(0,y-R);i<=Math.min(sh-1,y+R);i++){const v=T[i*sw+x];if(v>m)m=v;}M[y*sw+x]=m;}
+ const B=blurF(blurF(M,sw,sh,R),sw,sh,R);
+ for(let y=0;y<h;y++){const fy=Math.min(sh-1.001,Math.max(0,y/f-0.5)),y0=fy|0,ty=fy-y0;
+  for(let x=0;x<w;x++){const fx=Math.min(sw-1.001,Math.max(0,x/f-0.5)),x0=fx|0,tx=fx-x0,i0=y0*sw+x0;
+   const bg=(B[i0]*(1-tx)+B[i0+1]*tx)*(1-ty)+(B[i0+sw]*(1-tx)+B[i0+sw+1]*tx)*ty,k=255/Math.max(bg,70),o=4*(y*w+x);
+   let r=D[o]*k,gn=D[o+1]*k,b=D[o+2]*k;
+   if(look==='bw'){const l=0.299*r+0.587*gn+0.114*b;let t=(l-150)/45;t=t<0?0:t>1?1:t;t=t*t*(3-2*t)*255;r=gn=b=t;}
+   else{r=(r-22)*1.12;gn=(gn-22)*1.12;b=(b-22)*1.12;if(look==='gray'){const l=0.299*r+0.587*gn+0.114*b;r=gn=b=l;}}
+   D[o]=r;D[o+1]=gn;D[o+2]=b;}}
+ const out=document.createElement('canvas');out.width=w;out.height=h;out.getContext('2d').putImageData(I,0,0);return out;}
+
+// ---------- cut out + review: all on the phone
 const rcv=$('rcv'),rx=rcv.getContext('2d');
-function warpUrl(look){const q=cur.quad.map(p=>p.x.toFixed(1)+','+p.y.toFixed(1)).join(',');return '/api/warp?id='+cur.id+'&sr='+cur.sr+'&q='+q+'&look='+look;}
-async function fetchLook(look){
- let r=await api(warpUrl(look),{method:'POST'});
- if(r.status===410){await detect();r=await api(warpUrl(look),{method:'POST'});}   // the computer forgot the photo: it is sent again, once
- if(!r.ok)throw new Error('warp');ok();const b=await r.blob();return {blob:b,bmp:await decode(b)};}
-function paintReview(){if(!cur||!cur.res)return;const src=cur.res.bmp,t=cur.rot,w=t%2?bh(src):bw(src),h=t%2?bw(src):bh(src);
+function paintReview(){if(!cur||!cur.res)return;const src=cur.res,t=cur.rot,w=t%2?bh(src):bw(src),h=t%2?bw(src):bh(src);
  fit(rcv,w,h,rcv.parentNode);rx.imageSmoothingQuality='high';rx.save();rx.translate(rcv.width/2,rcv.height/2);rx.rotate(t*Math.PI/2);
  const dw=(t%2?rcv.height:rcv.width),dh=(t%2?rcv.width:rcv.height);rx.drawImage(src,-dw/2,-dh/2,dw,dh);rx.restore();}
 function markLook(){for(const b of document.querySelectorAll('#looks button'))b.classList.toggle('on',b.dataset.l===cur.look);}
-async function setLook(look,first){
- const my=++cur.lseq||(cur.lseq=1);cur.look=look;markLook();
- if(cur.cache[look]){cur.res=cur.cache[look];paintReview();$('rWait').classList.remove('on');return;}
- try{
-  if(look!=='orig'&&!cur.cache.orig){            // quick look first: only the cut-out, no cleaning yet
-   cur.cache.orig=await fetchLook('orig');if(my!==cur.lseq)return;cur.res=cur.cache.orig;paintReview();}
-  $('rWait').classList.toggle('on',look!=='orig');
-  if(look!=='orig'){const res=await fetchLook(look);cur.cache[look]=res;if(my!==cur.lseq)return;cur.res=res;paintReview();}
-  else{cur.cache.orig=cur.cache.orig||await fetchLook('orig');if(my===cur.lseq){cur.res=cur.cache.orig;paintReview();}}
- }catch(e){toast('Could not cut out the page. Try again.',true);}
- if(my===cur.lseq)$('rWait').classList.remove('on');}
+async function setLook(look){
+ cur.look=look;markLook();const my=cur;
+ if(look!=='orig'){$('rWait').classList.add('on');await raf();await raf();if(cur!==my)return;}
+ try{my.res=lookLocal(my.warp,look);if(cur===my)paintReview();}catch(e){toast('Could not clean the page.',true);}
+ $('rWait').classList.remove('on');}
 async function crop(){ // from the corners screen
- cur.cache={};cur.res=null;cur.rot=0;cur.lseq=0;show('review');await raf();
- rx.clearRect(0,0,rcv.width,rcv.height);fit(rcv,cur.w,cur.h,rcv.parentNode);
- await setLook(cur.look,true);}
-$('eOk').onclick=()=>{if(!cur||!cur.quad||!cur.id){toast('Wait: the computer is still looking at the photo.',false);return;}crop();};
-for(const b of document.querySelectorAll('#looks button'))b.onclick=()=>{if(cur.look===b.dataset.l)return;buzz();setLook(b.dataset.l);};
+ cur.rot=0;cur.res=null;cur.warp=null;show('review');$('rWait').classList.add('on');await raf();await raf();
+ try{cur.warp=warpLocal(cur.view,cur.quad,OUTSIDE);}catch(e){toast('Could not cut out the page. Try again.',true);$('rWait').classList.remove('on');return;}
+ cur.res=cur.warp;paintReview();await setLook(cur.look);}
+$('eOk').onclick=()=>{if(cur&&cur.quad)crop();};
+for(const b of document.querySelectorAll('#looks button'))b.onclick=()=>{if(cur.look===b.dataset.l||!cur.warp)return;buzz();setLook(b.dataset.l);};
 $('rRotL').onclick=()=>{cur.rot=(cur.rot+3)%4;paintReview();buzz();};$('rRotR').onclick=()=>{cur.rot=(cur.rot+1)%4;paintReview();buzz();};
-$('rAdj').onclick=()=>{cur.lseq++;startEdit();};
+$('rAdj').onclick=()=>{startEdit();};
 const autoOn=()=>{try{return localStorage.getItem('auto')==='1';}catch(e){return false;}};
 $('auto').classList.toggle('on',autoOn());
 $('autoRow').onclick=()=>{const v=!autoOn();try{localStorage.setItem('auto',v?'1':'0');}catch(e){}$('auto').classList.toggle('on',v);};
-$('rUse').onclick=async()=>{
- if(!cur.res)return;buzz();cur.lseq++;const p=cur;let blob=p.res.blob;
- const t=p.rot;p.th=thumb(turned(p.res.bmp,t),200);               // small picture for the list: cheap
- p.final=t?null:blob;p.pending=t?(async()=>{p.final=await toBlob(turned(p.res.bmp,t),0.92);})():null;   // a turned page is encoded in the background
- p.cache=null;p.res=null;p.base=null;p.view=null;               // free the big pictures; the page keeps only the small ones
+$('rUse').onclick=()=>{
+ if(!cur.res)return;buzz();const p=cur,bm=p.res,t=p.rot;
+ p.th=thumb(t?turned(bm,t):bm,200);                                 // small picture for the list: cheap
+ p.final=null;p.pending=(async()=>{await raf();p.final=await toBlob(t?turned(bm,t):bm,0.92);})();     // the JPEG is made in the background
+ p.res=null;p.warp=null;p.base=null;p.view=null;                    // free the big pictures; the page keeps only the small ones
  if(retake>=0)pages[retake]=p;else pages.push(p);
  const again=retake<0&&autoOn();retake=-1;cur=null;renderList();if(again)openCam();};
 
@@ -703,7 +872,7 @@ function renderList(){show('list');$('lt').textContent=pages.length+' page'+(pag
   const mk=(k,fn,c)=>{const b=document.createElement('button');if(c)b.className=c;b.innerHTML=ic[k];b.onclick=ev=>{ev.stopPropagation();fn();};ab.appendChild(b);};
   mk('u',()=>{if(i>0){[pages[i-1],pages[i]]=[pages[i],pages[i-1]];renderList();}});
   mk('dn',()=>{if(i<pages.length-1){[pages[i+1],pages[i]]=[pages[i],pages[i+1]];renderList();}});
-  mk('ed',async()=>{cur=p;retake=i;cur.cache={};try{cur.base=await decode(cur.blob);}catch(e){toast('Could not open the page.',true);return;}cur.view=turned(cur.base,cur.sr);cur.w=bw(cur.view);cur.h=bh(cur.view);startEdit();});
+  mk('ed',async()=>{cur=p;retake=i;cur.cache={};try{cur.blob=cur.blob||await cur.blobP;cur.base=await decode(cur.blob);}catch(e){toast('Could not open the page.',true);return;}cur.view=turned(cur.base,cur.sr);cur.w=bw(cur.view);cur.h=bh(cur.view);startEdit();});
   mk('x',()=>{pages.splice(i,1);pages.length?renderList():home();},'red');
   d.querySelector('img').onclick=async()=>{if(p.pending)await p.pending;if(!p.final)return;if(p.vurl)URL.revokeObjectURL(p.vurl);p.vurl=URL.createObjectURL(p.final);$('vimg').src=p.vurl;$('viewer').classList.add('on');};
   box.appendChild(d);});

@@ -410,7 +410,7 @@ class PhoneDialog(QFrame):
             return
         self.win.phone_tunnel = phone.Tunnel(srv.port)
         self.btnNet.hide()
-        self.lblNet.setText("Connecting ... (can take up to 30 seconds)")
+        self.lblNet.setText(self.win.phone_tunnel.status_text)
         self.timer.start()
 
     def _stop_net(self):
@@ -439,8 +439,10 @@ class PhoneDialog(QFrame):
         tun = self.win.phone_tunnel
         if tun is not None:
             if tun.error or tun.timed_out():
-                self.lblNet.setText(tun.error or "Could not open the internet link (no answer after 30 seconds).")
+                self.lblNet.setText(tun.error or "Could not open the internet link (no answer after 60 seconds).")
                 self._stop_net_keep_message()
+            elif not tun.url:
+                self.lblNet.setText(tun.status_text)
             elif tun.url:
                 nu = srv.link_for(tun.url)
                 if nu != self._net_url:
