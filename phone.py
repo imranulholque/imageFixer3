@@ -260,6 +260,7 @@ class Tunnel:
     Windows 10 / 11) to give this computer a public https address. Nothing is installed.
     Only this program's phone page is reachable, and only with the secret code in the link."""
     URL = re.compile(r"https://[A-Za-z0-9.-]+\.(?:lhr\.life|localhost\.run)")
+    NOT_TUNNEL = ("admin", "docs", "www", "status", "support", "blog")
 
     def __init__(self, port):
         self.port = port
@@ -291,9 +292,13 @@ class Tunnel:
         try:
             for raw in self.proc.stdout:
                 line = raw.decode("utf-8", "replace")
-                m = self.URL.search(line)
-                if m and self.url is None:
-                    self.url = m.group(0)
+                if self.url is None:
+                    for m in self.URL.finditer(line):
+                        host = m.group(0).split("//", 1)[1].lower()
+                        if host.split(".")[0] in self.NOT_TUNNEL or host in ("localhost.run", "lhr.life"):
+                            continue                    # the service's own pages (sign-in / docs), not our address
+                        self.url = m.group(0)
+                        break
         except Exception:
             pass
         if self.url is None and self.error is None:
