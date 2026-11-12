@@ -56,6 +56,17 @@ def _components(mask):
     return lab
 
 
+def _order(pts):
+    """The 4 corners as top-left, top-right, bottom-right, bottom-left (clockwise, starting at the corner nearest the picture's
+    top-left).  Walks round the middle, so a very tilted or skewed page never gets a twisted (bow-tie) order."""
+    p = [(float(x), float(y)) for x, y in pts]
+    cx = sum(a for a, _ in p) / len(p)
+    cy = sum(b for _, b in p) / len(p)
+    p.sort(key=lambda v: math.atan2(v[1] - cy, v[0] - cx))
+    i = min(range(len(p)), key=lambda k: p[k][0] + p[k][1])
+    return p[i:] + p[:i]
+
+
 def _hull(points):
     pts = sorted(set(points))
     if len(pts) < 3:
@@ -91,6 +102,40 @@ def _simplify_to_quad(hull):
             if ar < best:
                 best, bi = ar, i
         p.pop(bi)
+    return p
+
+
+def _simplify_enclosing(hull):
+    """Reduce a convex outline to 4 corners by EXTENDING the neighbouring sides (never cutting a corner off), always removing
+    the side whose removal adds the least area.  Gives the tight quadrilateral around the shape - a cut corner (a fold, a
+    finger, a bent card corner) does not skew the sheet like dropping a vertex does."""
+    p = [tuple(map(float, v)) for v in hull]
+    if len(p) < 4:
+        return p
+    while len(p) > 4:
+        n = len(p)
+        best, bi, bx = 1e18, None, None
+        for i in range(n):
+            a, b = p[i], p[(i + 1) % n]
+            pa, nb = p[i - 1], p[(i + 2) % n]
+            d1 = (a[0] - pa[0], a[1] - pa[1])
+            d2 = (b[0] - nb[0], b[1] - nb[1])
+            den = d1[0] * d2[1] - d1[1] * d2[0]
+            if abs(den) < 1e-9:
+                continue
+            t = ((nb[0] - pa[0]) * d2[1] - (nb[1] - pa[1]) * d2[0]) / den
+            X = (pa[0] + t * d1[0], pa[1] + t * d1[1])
+            if t < 1.0:                                           # the sides diverge on this side: cannot close it
+                continue
+            ar = abs((a[0] - X[0]) * (b[1] - X[1]) - (b[0] - X[0]) * (a[1] - X[1])) / 2.0
+            if ar < best:
+                best, bi, bx = ar, i, X
+        if bi is None:
+            return _simplify_to_quad(hull)
+        n = len(p)
+        j = (bi + 1) % n
+        p[bi] = bx
+        p.pop(j)
     return p
 
 
@@ -350,7 +395,7 @@ def _candidates(mask, h, w, out, tag):
     if counts.max() == 0:
         return
     for cid in np.argsort(counts)[::-1][:3]:
-        if counts[cid] < 0.06 * h * w:
+        if counts[cid] < 0.015 * h * w:
             break
         comp = lab == cid
         sides = int(comp[0].any()) + int(comp[-1].any()) + int(comp[:, 0].any()) + int(comp[:, -1].any())
@@ -366,19 +411,25 @@ def _candidates(mask, h, w, out, tag):
         ha = _poly_area(hull)
         fa = _filled_area(comp)
         solidity = min(1.0, fa / max(ha, 1.0))
-        if ha < 0.08 * h * w or ha > 0.985 * h * w:
+        if ha < 0.02 * h * w or ha > 0.985 * h * w:
             continue
-        quad = _simplify_to_quad(hull)
-        if len(quad) != 4:
-            continue
-        quad = core.order_quad(quad)
-        try:
-            q2 = _refine_quad(quad, pts)
-            if len(q2) == 4 and 0.85 < _poly_area(q2) / max(_poly_area(quad), 1.0) < 1.2:
-                quad = core.order_quad(q2)
-        except Exception:
-            pass
-        out.append({"quad": quad, "solid": solidity, "sides": sides, "area": _poly_area(quad) / float(h * w), "tag": tag})
+        for simp in (_simplify_enclosing, _simplify_to_quad):
+            quad = simp(hull)
+            if len(quad) != 4:
+                continue
+            quad = _order(quad)
+            if not _is_convex(quad):
+                continue
+            qa = _poly_area(quad)
+            if qa > 1.35 * ha or qa < 0.9 * ha:                 # the quad must really hug the shape
+                continue
+            try:
+                q2 = _refine_quad(quad, pts)
+                if len(q2) == 4 and 0.85 < _poly_area(q2) / max(_poly_area(quad), 1.0) < 1.2:
+                    quad = _order(q2)
+            except Exception:
+                pass
+            out.append({"quad": quad, "solid": solidity, "sides": sides, "area": _poly_area(quad) / float(h * w), "tag": tag})
 
 
 def _poly_overlap(q1, q2):
@@ -446,7 +497,7 @@ def _refine_on_edges(quad, G, search):
             return quad
         t = np.linalg.solve(M, c2 - c1)
         out.append(tuple(c1 + t[0] * d1))
-    out = core.order_quad(out)
+    out = _order(out)
     old = np.asarray(quad, np.float64)
     if (not _is_convex(out) or np.abs(np.asarray(out) - old).max() > 2.5 * search
             or not (0.88 < _poly_area(out) / max(_poly_area(quad), 1.0) < 1.12)):
@@ -582,7 +633,7 @@ def _expand_to_paper(lab, quad, max_grow=0.17, chunks=12):
             return quad, 0
         t = np.linalg.solve(M, c2 - c1)
         out.append(tuple(c1 + t[0] * d1))
-    out = core.order_quad(out)
+    out = _order(out)
     ratio = _poly_area(out) / max(_poly_area(q), 1.0)
     if (not _is_convex(out) or not (0.9 < ratio < 2.6)
             or np.abs(np.asarray(out) - q).max() > 0.24 * max(h, w)):
@@ -646,25 +697,70 @@ def detect_document(img, return_score=False):
         _smooth_candidates(lum, h, w, cands)
     except Exception:                                   # the extra ways are a bonus: never break the main one
         pass
-    scored = []
-    ring = max(5, int(0.03 * max(h, w)))
+    # ---- judge every outline with the common judge, slide the best few onto the page, snap them on the real edges
+    ge_x, ge_y, ge_m = gx, gy, gm
+    gm2, ang2, nms2 = _edge_maps(rgbf)
+    J = _Judge(rgbf, gm2, nms2, ang2)
+    pool = []
     for c in cands:
         q = c["quad"]
-        if not _is_convex(q):
+        if not _quad_ok(q, h, w):
             continue
-        edge, per = _edge_support(q, gx, gy, gm, gscale, 3)
-        con, signed = _contrast(q, G, ring)
-        a = c["area"]
-        sz = min(1.0, a / 0.20) ** 0.6 * (1.0 - max(0.0, a - 0.92) * 4)
-        sc = (min(1.0, c["solid"]) ** 3) * (0.12 + edge) ** 1.3 * (0.10 + min(1.0, con * 4.0)) ** 0.45 * sz * (1.0 - 0.10 * c["sides"])
+        v, j = _quad_value(J, q)
         if _DEBUG is not None:
-            _DEBUG.append((sc, c["tag"], q, edge, con, c["solid"], a))
-        scored.append((sc, q, edge, con))
-    scored.sort(key=lambda r: -r[0])
+            _DEBUG.append((v, c["tag"], q, j["edge_mean"], j["split_mean"], c["solid"], c["area"]))
+        pool.append((v, q))
+    try:                                                # outlines made of straight lines that really run along edges
+        ln = _hough_lines(gm2, ang2, nms2, max_lines=24)
+        for q, ar, vt in _line_quads(ln, h, w, limit=500):
+            if not _quad_ok(q, h, w):
+                continue
+            v, j = _quad_value(J, q)
+            if _DEBUG is not None:
+                _DEBUG.append((v, "lines", q, j["edge_mean"], j["split_mean"], 1.0, ar))
+            pool.append((v, q))
+    except Exception:
+        pass
+    pool.sort(key=lambda r: -r[0])
+    starts = []
+    for v, q in pool:
+        if any(_poly_overlap(q, o) > 0.85 for o in starts):
+            continue
+        starts.append(q)
+        if len(starts) >= 10:
+            break
+    coarse = []
+    for q in starts:                                    # first a rough slide for many outlines ...
+        q1, v1, j1 = _climb(J, q, steps=(9.0, 4.5), rounds=2)
+        coarse.append((v1 * _purity_factor(J, q1), q1))
+    coarse.sort(key=lambda r: -r[0])
+    climbed = []
+    for v0, q in coarse[:6]:                            # ... then the exact slide for the best few
+        q1, v1, j1 = _climb(J, q, steps=(2.2, 1.0), rounds=3)
+        climbed.append((v1 * _purity_factor(J, q1), q1, j1))
+    climbed.sort(key=lambda r: -r[0])
+    if len(climbed) > 1:
+        # a fold, a printed frame or a header inside the page also has strong edges: when a bigger outline that holds the best
+        # one comes close in value, it is the whole sheet - take it
+        b0 = climbed[0]
+        a0 = _poly_area(b0[1])
+        pick = b0
+        m0 = _poly_mask(b0[1], (h, w))
+        wholes = []
+        for c in climbed[1:]:
+            ac = _poly_area(c[1])
+            if ac < 1.25 * a0 or ac > 4.5 * a0 or c[0] < 0.8 * b0[0]:
+                continue
+            mc = _poly_mask(c[1], (h, w))
+            if (m0 & mc).sum() >= 0.8 * m0.sum():
+                wholes.append(c)
+        if wholes:
+            pick = max(wholes, key=lambda r: r[0])
+        if pick is not b0:
+            climbed.remove(pick)
+            climbed.insert(0, pick)
     best = None
-    if scored and scored[0][0] > 0.25 and scored[0][2] > 0.18:
-        # the best few outlines are snapped onto the real edges (in a larger picture) and judged AGAIN on the snapped
-        # sides, so a shape that is a bit too big / too small (shadow, hand, table edge) loses to the one that is exact
+    if climbed and climbed[0][0] > 0.07:
         s2 = min(2.5, 900.0 / float(max(W, H)) / s) if s * max(W, H) < 900 else 1.0
         if s2 > 1.2:
             big = img.convert("L").resize((max(8, round(W * s * s2)), max(8, round(H * s * s2))), Image.Resampling.BOX)
@@ -672,35 +768,32 @@ def detect_document(img, return_score=False):
             s2 = 1.0
             big = img.convert("L").resize((sw, sh), Image.Resampling.BOX)
         Gb = np.asarray(big, np.float32)
-        bx, by, bm = _grad(Gb)
-        bscale = float(np.percentile(bm, 94)) + 1e-3
-        seen = []
-        for sc, q, edge, con in scored[:12]:
-            if sc < 0.25 or edge < 0.18:
-                break
-            if any(_poly_overlap(q, o) > 0.985 for o in seen):
-                continue
-            seen.append(q)
-            qb = [(x * s2, y * s2) for x, y in q]
-            q1 = _refine_on_edges(qb, Gb, search=max(4.0, 0.025 * max(Gb.shape[:2])))
-            q1 = _refine_on_edges(q1, Gb, search=max(2.5, 0.008 * max(Gb.shape[:2])))       # second, finer pass
-            e1, _ = _edge_support(q1, bx, by, bm, bscale, 2)
-            fin = sc * (0.25 + e1)
-            if best is None or fin > best[0]:
-                best = (fin, [(x / s2, y / s2) for x, y in q1], e1, con, sc)
-            if len(seen) >= 4:
-                break
+        for v1, q1, j1 in climbed[:1]:
+            qb = [(x * s2, y * s2) for x, y in q1]
+            qs = _refine_on_edges(qb, Gb, search=max(3.0, 0.012 * max(Gb.shape[:2])))
+            qs = [(x / s2, y / s2) for x, y in qs]
+            if _quad_ok(qs, h, w):
+                v2, j2 = _quad_value(J, qs)
+                if v2 >= 0.97 * v1:
+                    q1, v1, j1 = qs, v2, j2
+            if best is None or v1 > best[0]:
+                best = (v1, q1, j1["edge_mean"], j1["split_mean"], v1)
     if best is not None:
-        pts = core.order_quad(best[1])
+        # a picture that is edges everywhere (noise, fine texture) has no sheet: its sides must stand out from the general edge level
+        base = float(J.Estack.max(0).mean())
+        if best[2] < 1.12 * base:
+            best = None
+    if best is not None:
+        pts = _order(best[1])
         try:                                           # page edge that is nearly the table's colour: find it by colour
             labs = core.rgb_to_lab(np.asarray(img.convert("RGB").resize(big.size, Image.Resampling.BOX)))
             ex, n_moved = _expand_to_paper(labs, [(x * s2, y * s2) for x, y in pts])
             if n_moved:
-                pts = core.order_quad([(x / s2, y / s2) for x, y in ex])
+                pts = _order([(x / s2, y / s2) for x, y in ex])
         except Exception:
             pass
         res = [(x / s, y / s) for x, y in pts]
-        info = {"score": best[4], "edge": best[2], "contrast": best[3]}
+        info = {"score": min(1.2, best[4] / 0.28), "edge": best[2], "contrast": best[3]}
         return (res, True, info) if return_score else (res, True)
     mx_, my_ = 0.04 * W, 0.04 * H
     res = [(mx_, my_), (W - mx_, my_), (W - mx_, H - my_), (mx_, H - my_)]
@@ -742,7 +835,7 @@ def aspect_ratio(quad, size):
 
 def straighten(img, quad):
     """Crop the paper out and remove the perspective. Keeps the sheet's real proportions (A4, A5, Letter, ID card ...)."""
-    tl, tr, br, bl = core.order_quad(quad)
+    tl, tr, br, bl = _order(quad)
     dist = lambda a, b: math.hypot(a[0] - b[0], a[1] - b[1])
     ratio = aspect_ratio((tl, tr, br, bl), img.size)
     w0 = max(dist(tl, tr), dist(bl, br))
@@ -778,3 +871,422 @@ def enhance(img, look):
         opts.update(mode="gray" if look == "gray" else "color", white=60, ink=55, clean=40)
     out = core.remove_shadow(img.convert("RGB"), 1.0, None, opts)
     return out.convert("RGB") if out.mode != "RGB" else out
+
+
+# ======================================================================= v4: straight-line (Hough) candidates + one common judge
+def _lab_small(rgbf):
+    return core.rgb_to_lab(np.clip(rgbf, 0, 255).astype(np.uint8))
+
+
+def _edge_maps(rgbf, sigma=1.0):
+    """Colour edge map of a small picture: strength (0..1 after scaling), gradient angle, thinned (non-maximum suppressed)
+    strength per orientation bin (4 bins, slightly spread so a side that is 1 px off still hits)."""
+    h, w = rgbf.shape[:2]
+    b = _blur_rgb(rgbf, sigma)
+    gx = np.zeros_like(b)
+    gy = np.zeros_like(b)
+    gx[:, 1:-1] = (b[:, 2:] - b[:, :-2]) * 0.5
+    gy[1:-1] = (b[2:] - b[:-2]) * 0.5
+    jxx, jyy, jxy = (gx * gx).sum(2), (gy * gy).sum(2), (gx * gy).sum(2)
+    tr = jxx + jyy
+    disc = np.sqrt(np.maximum((jxx - jyy) ** 2 + 4 * jxy * jxy, 0.0))
+    lam = 0.5 * (tr + disc)
+    gm = np.sqrt(np.maximum(lam, 0.0)) / 1.7320508                       # ~ per-channel step per pixel
+    ang = 0.5 * np.arctan2(2 * jxy, jxx - jyy)                          # direction of the steepest change, mod pi
+    ang = np.where(ang < 0, ang + np.pi, ang)
+    q = (np.rint(ang / (np.pi / 4)).astype(int)) % 4
+    nms = np.zeros_like(gm, bool)
+    offs = {0: (0, 1), 1: (1, 1), 2: (1, 0), 3: (1, -1)}                  # (dy, dx) of the neighbours along the gradient
+    gp = np.pad(gm, 1, mode="constant")
+    for k, (dy, dx) in offs.items():
+        a = gp[1 + dy:1 + dy + h, 1 + dx:1 + dx + w]
+        c = gp[1 - dy:1 - dy + h, 1 - dx:1 - dx + w]
+        nms |= (q == k) & (gm >= a) & (gm >= c)
+    return gm, ang, nms & (gm > 0)
+
+
+def _hough_lines(gm, ang, nms, max_lines=36):
+    """The strongest straight lines of the picture: every thinned edge pixel votes for the lines through it that are
+    perpendicular to its own gradient (so only lines that really run ALONG edges collect votes).
+    Returns [(phi, rho, votes)]: points with x*cos(phi) + y*sin(phi) = rho, phi in [0, pi)."""
+    h, w = gm.shape
+    cap = float(np.percentile(gm[nms], 90)) if nms.any() else 1.0
+    thr = max(1.5, 0.12 * float(np.percentile(gm, 99.5)))
+    ys, xs = np.nonzero(nms & (gm > thr))
+    if len(xs) < 20:
+        return []
+    wgt = np.minimum(1.0, gm[ys, xs] / max(cap, 1e-3)).astype(np.float32)
+    phi = np.rad2deg(ang[ys, xs])                                          # 0..180
+    diag = int(math.ceil(math.hypot(h, w))) + 2
+    R = 2 * diag + 1
+    A = np.zeros(180 * R, np.float32)
+    k0 = np.rint(phi).astype(int)
+    for dk in range(-9, 10):                                                # the measured angle of a thin edge is noisy: vote on a fan of angles
+        f = 1.0 - abs(dk) / 10.0
+        k = k0 + dk
+        rho = xs * np.cos(np.deg2rad(k)) + ys * np.sin(np.deg2rad(k))
+        neg = (k < 0) | (k >= 180)
+        rho = np.where(neg, -rho, rho)
+        kk = k % 180
+        ri = np.rint(rho).astype(int) + diag
+        A += np.bincount(kk * R + ri, weights=wgt * f, minlength=180 * R).astype(np.float32)
+    A = A.reshape(180, R)
+    As = A.copy()
+    for s in (1, -1):                                                      # 3-wide smoothing along rho
+        As[:, 1:-1] += 0.5 * np.roll(A, s, 1)[:, 1:-1]
+    lines = []
+    minv = 0.10 * min(h, w)
+    for _ in range(max_lines):
+        i = int(np.argmax(As))
+        k, ri = divmod(i, R)
+        v = float(As[k, ri])
+        if v < minv:
+            break
+        lines.append((math.radians(k), float(ri - diag), v))
+        for dk in range(-5, 6):                                            # suppress the neighbourhood (wraps with a sign flip)
+            kk = k + dk
+            lo, hi = ri - 7, ri + 8
+            if kk < 0:
+                kk += 180
+                lo, hi = 2 * diag - (ri + 7), 2 * diag - (ri - 8) + 1
+            elif kk >= 180:
+                kk -= 180
+                lo, hi = 2 * diag - (ri + 7), 2 * diag - (ri - 8) + 1
+            As[kk, max(0, lo):max(0, hi)] = 0
+    return lines
+
+
+def _line_pts(l):
+    phi, rho, _ = l
+    n = np.array([math.cos(phi), math.sin(phi)])
+    return n * rho, np.array([-n[1], n[0]])                                # a point on the line, its direction
+
+
+def _meet(l1, l2):
+    p1, d1 = _line_pts(l1)
+    p2, d2 = _line_pts(l2)
+    M = np.array([d1, -d2]).T
+    det = np.linalg.det(M)
+    if abs(det) < 0.12:                                                    # nearly parallel (< ~7 deg)
+        return None
+    t = np.linalg.solve(M, p2 - p1)
+    return p1 + t[0] * d1
+
+
+def _line_quads(lines, h, w, limit=1500):
+    """Every four-sided shape made of two 'opposite' pairs of lines that is a plausible sheet."""
+    n = len(lines)
+    if n < 4:
+        return []
+    ph = np.array([l[0] for l in lines])
+    rh = np.array([l[1] for l in lines])
+    nx, ny = np.cos(ph), np.sin(ph)
+    mn = min(h, w)
+    pairs = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            da = abs(((ph[i] - ph[j]) + np.pi / 2) % np.pi - np.pi / 2)
+            if da > math.radians(28):
+                continue
+            # distance between the two lines, measured on the average normal
+            m = 0.5 * (np.array([nx[i], ny[i]]) + np.sign(nx[i] * nx[j] + ny[i] * ny[j]) * np.array([nx[j], ny[j]]))
+            m /= (np.hypot(*m) + 1e-9)
+            pi, _ = _line_pts(lines[i])
+            pj, _ = _line_pts(lines[j])
+            sep = abs(float((pj - pi) @ m))
+            if sep < 0.09 * mn:
+                continue
+            pairs.append((i, j, 0.5 * (ph[i] + ph[j]) if da < np.pi / 2 else ph[i], sep))
+    out = []
+    lo_x, hi_x, lo_y, hi_y = -0.05 * w, 1.05 * w, -0.05 * h, 1.05 * h
+    P = len(pairs)
+    for a in range(P):
+        ia, ja, pa, _ = pairs[a]
+        for b in range(a + 1, P):
+            ib, jb, pb, _ = pairs[b]
+            if len({ia, ja, ib, jb}) < 4:
+                continue
+            ang = abs(((pa - pb) + np.pi / 2) % np.pi - np.pi / 2)      # 0 = same direction, 90 deg = square
+            if np.pi / 2 - ang > math.radians(52):                      # the two directions must be clearly different
+                continue
+            c = [_meet(lines[ia], lines[ib]), _meet(lines[ib], lines[ja]), _meet(lines[ja], lines[jb]), _meet(lines[jb], lines[ia])]
+            if any(p is None for p in c):
+                continue
+            if any(not (lo_x <= p[0] <= hi_x and lo_y <= p[1] <= hi_y) for p in c):
+                continue
+            q = [tuple(p) for p in c]
+            if not _is_convex(q):
+                continue
+            ar = _poly_area(q) / float(h * w)
+            if ar < 0.025 or ar > 0.985:
+                continue
+            sd = [math.hypot(q[i][0] - q[(i + 1) % 4][0], q[i][1] - q[(i + 1) % 4][1]) for i in range(4)]
+            if min(sd) < 0.09 * mn or max(sd) / max(min(sd), 1e-6) > 8:
+                continue
+            out.append((_order(q), ar, lines[ia][2] + lines[ib][2] + lines[ja][2] + lines[jb][2]))
+    out.sort(key=lambda r: -r[2])
+    return out[:limit]
+
+
+def _bil(arr, xx, yy, sel=None):
+    """Bilinear lookup of arr (h, w[, c]) at float positions (clamped to the picture); sel picks a map of a stack per row."""
+    h, w = arr.shape[-3:-1] if arr.ndim == 4 or (arr.ndim == 3 and sel is None) else arr.shape[-2:]
+    x = np.clip(xx, 0, w - 1.001)
+    y = np.clip(yy, 0, h - 1.001)
+    x0 = x.astype(int)
+    y0 = y.astype(int)
+    fx = x - x0
+    fy = y - y0
+    if sel is None:
+        g = lambda yi, xi: arr[yi, xi]
+    else:
+        g = lambda yi, xi: arr[sel, yi, xi]
+    a = g(y0, x0)
+    b = g(y0, x0 + 1)
+    c = g(y0 + 1, x0)
+    d = g(y0 + 1, x0 + 1)
+    if a.ndim == 3:
+        fx = fx[..., None]
+        fy = fy[..., None]
+    return (a * (1 - fx) + b * fx) * (1 - fy) + (c * (1 - fx) + d * fx) * fy
+
+
+class _Judge:
+    """One common judge for every candidate outline (from brightness, colour, texture, edges or straight lines):
+      edge  - how much of the four sides lies on a real, thin edge running along the side
+      split - how different the colour just inside each side is from the colour just outside it (a real sheet differs from
+              the table on ALL four sides; the printed area of a page, a pattern line on a cloth or a tile edge does not)
+      flat  - the inside is one paper (little colour change between the four inner strips)."""
+
+    def __init__(self, rgbf, gm, nms, ang):
+        self.h, self.w = rgbf.shape[:2]
+        self.lab = _lab_blur(_lab_small(rgbf), 1)
+        try:
+            self.bg = _bg_distance(rgbf)
+        except Exception:
+            self.bg = None
+        cap = float(np.percentile(gm[nms], 92)) if nms.any() else 1.0
+        self.cap = max(cap, 1e-3)
+        q = (np.rint(ang / (np.pi / 4)).astype(int)) % 4
+        E = np.where(nms, np.minimum(1.0, gm / self.cap), 0.0).astype(np.float32)
+        self.E = []
+        for k in range(4):                                                 # orientation bin k also accepts its two neighbours
+            m = np.where((q == k) | (q == (k + 1) % 4) | (q == (k - 1) % 4), E, 0.0)
+            mm = np.where(q == k, E, 0.0)
+            # 3x3 spread: the side may be a pixel off
+            e = np.maximum(mm, 0.8 * m)
+            pe = np.pad(e, 1)
+            sp = np.max([pe[1 + dy:1 + dy + self.h, 1 + dx:1 + dx + self.w] for dy in (-1, 0, 1) for dx in (-1, 0, 1)], 0)
+            self.E.append(sp)
+        self.Estack = np.stack(self.E, 0)
+
+    def judge(self, q, S=36):
+        h, w = self.h, self.w
+        Q = np.asarray(q, np.float64)
+        cen = Q.mean(0)
+        A, B = Q, np.roll(Q, -1, 0)
+        Dv = B - A
+        Ls = np.maximum(np.hypot(Dv[:, 0], Dv[:, 1]), 1e-6)
+        N = np.stack([Dv[:, 1], -Dv[:, 0]], 1) / Ls[:, None]
+        flip = ((N * ((A + B) / 2 - cen)).sum(1) < 0)
+        N = np.where(flip[:, None], -N, N)
+        t = np.linspace(0.07, 0.93, S)
+        X = A[:, 0:1] + t[None] * Dv[:, 0:1]                                # (4, S)
+        Y = A[:, 1:2] + t[None] * Dv[:, 1:2]
+        d_in = max(3.0, 0.016 * max(h, w))
+        ok = (X >= 0) & (X <= w - 1) & (Y >= 0) & (Y <= h - 1)
+        m_ = 0.012 * max(h, w) + 1.5
+        near_rim = ((X < m_) | (X > w - 1 - m_) | (Y < m_) | (Y > h - 1 - m_))
+        EX, EY = X + N[:, 0:1] * 2.2 * d_in, Y + N[:, 1:2] * 2.2 * d_in
+        out_of = (EX < 0) | (EX > w - 1) | (EY < 0) | (EY > h - 1)
+        on_rim = (near_rim.mean(1) > 0.8) | ((~ok).mean(1) > 0.5) | (out_of.mean(1) > 0.6)
+
+        def ix(xx, yy):
+            return np.clip(np.rint(yy).astype(int), 0, h - 1), np.clip(np.rint(xx).astype(int), 0, w - 1)
+        kb = (np.rint((np.arctan2(N[:, 1], N[:, 0]) % np.pi) / (np.pi / 4)).astype(int)) % 4
+        iy, ixx = ix(X, Y)
+        e = np.where(ok, _bil(self.Estack, X, Y, sel=kb[:, None]), 0.0)
+        e.sort(1)
+        sup_all = e[:, int(0.15 * S):].mean(1)
+        def lab_at(o):
+            return _bil(self.lab, X + N[:, 0:1] * o, Y + N[:, 1:2] * o)       # (4, S, 3)
+        i1 = (lab_at(-d_in) + lab_at(-2.2 * d_in)) / 2
+        u = (lab_at(d_in) + lab_at(2.2 * d_in)) / 2
+        de_all = np.sqrt(((i1 - u) ** 2).sum(2))
+        if self.bg is not None:
+            bi_all = _bil(self.bg, X - N[:, 0:1] * 1.6 * d_in, Y - N[:, 1:2] * 1.6 * d_in)
+            ox, oy = X + N[:, 0:1] * 1.6 * d_in, Y + N[:, 1:2] * 1.6 * d_in
+            bo_all = _bil(self.bg, ox, oy)
+            near_edge = np.minimum(np.minimum(ox, w - 1 - ox), np.minimum(oy, h - 1 - oy))
+        ringw = max(3, int(0.045 * min(h, w))) * 1.3
+        sup, spl, bgs, inn = [], [], [], []
+        rim = 0
+        for i in range(4):
+            if on_rim[i]:                                                    # the sheet runs on beyond the photo: this side is the photo's edge
+                rim += 1
+                sup.append(0.6); spl.append(0.5); bgs.append(0.5)
+                inn.append(np.median(i1[i], 0))
+                continue
+            if ok[i].sum() < 6:
+                sup.append(0.0); spl.append(0.0); bgs.append(0.0); inn.append(None)
+                continue
+            sup.append(float(sup_all[i]))
+            good = ok[i] & ~out_of[i]
+            if not good.any():
+                spl.append(0.6)
+            else:
+                spl.append(float(np.median(de_all[i][good])) / 9.0)
+            inn.append(np.median(i1[i][ok[i]], 0))
+            if self.bg is None or not good.any():
+                bgs.append(0.6)
+            elif float(np.median(near_edge[i])) < ringw:                     # this strip lies in the frame the colours were learned from: no evidence
+                bgs.append(0.5)
+            else:
+                bgs.append(float(np.clip((np.median(bi_all[i][good]) - np.median(bo_all[i][good])) / 3.0, 0.0, 1.0)))
+        iv = [v for v in inn if v is not None]
+        flat = 0.0
+        if len(iv) >= 3:
+            flat = max(float(np.sqrt(((iv[a] - iv[b]) ** 2).sum())) for a in range(len(iv)) for b in range(a + 1, len(iv)))
+        sup = np.array(sup)
+        spl = np.clip(np.array(spl), 0.0, 1.0)
+        return {"edge_mean": float(sup.mean()), "edge_min": float(sup.min()), "split_mean": float(spl.mean()),
+                "split_min": float(spl.min()), "flat": flat, "sup": sup, "spl": spl,
+                "bg_mean": float(np.mean(bgs)), "bg_min": float(np.min(bgs)), "rim": rim}
+
+
+def _judged_score(j, area):
+    """One number for a judged candidate."""
+    edge = 0.5 * j["edge_mean"] + 0.5 * j["edge_min"]
+    split = 0.5 * j["split_mean"] + 0.5 * j["split_min"]
+    sz = min(1.0, area / 0.16) ** 0.55 * (min(1.0, area / 0.9) ** 0.3) * (1.0 - max(0.0, area - 0.93) * 6)
+    flat = 1.0 / (1.0 + max(0.0, j["flat"] - 18.0) / 28.0)
+    bg = 0.5 * j["bg_mean"] + 0.5 * j["bg_min"]
+    return (0.10 + edge) ** 1.3 * (0.07 + split) ** 0.9 * sz * (0.5 + 0.5 * flat) * (0.30 + 0.70 * bg) * (1.0, 0.92, 0.72, 0.36, 0.12)[min(4, j["rim"])]
+
+
+def _quad_ok(q, h, w):
+    if not _is_convex(q):
+        return False
+    a = _poly_area(q) / float(h * w)
+    if a < 0.012 or a > 0.985:
+        return False
+    sd = [math.hypot(q[i][0] - q[(i + 1) % 4][0], q[i][1] - q[(i + 1) % 4][1]) for i in range(4)]
+    thick = _poly_area(q) / max(max(sd), 1e-6)                    # area / longest side: a sliver has no thickness
+    return min(sd) > 0.06 * min(h, w) and max(sd) / max(min(sd), 1e-6) < 9 and thick > 0.07 * min(h, w)
+
+
+def _quad_value(J, q):
+    a = _poly_area(q) / float(J.h * J.w)
+    j = J.judge(q)
+    return _judged_score(j, a), j
+
+
+def _extend_to_rim(a, b, w, h):
+    """The point where the line a->b, carried on past b, leaves the picture (None if b is already on the rim)."""
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    L = math.hypot(dx, dy)
+    if L < 1e-6:
+        return None
+    dx, dy = dx / L, dy / L
+    t = 1e9
+    if dx > 1e-6:
+        t = min(t, ((w - 1) - b[0]) / dx)
+    elif dx < -1e-6:
+        t = min(t, (0 - b[0]) / dx)
+    if dy > 1e-6:
+        t = min(t, ((h - 1) - b[1]) / dy)
+    elif dy < -1e-6:
+        t = min(t, (0 - b[1]) / dy)
+    if t < 2.0 or t > 1e8:
+        return None
+    return (b[0] + dx * t, b[1] + dy * t)
+
+
+def _climb(J, q, steps=(9.0, 4.5, 2.2, 1.0), rounds=3):
+    """Slide the four corners of an outline around (big steps first, then small) while the judge likes the result more:
+    a corner that sits a bit inside the page, on a fold or on a finger walks onto the real corner."""
+    h, w = J.h, J.w
+    q = [tuple(map(float, p)) for p in q]
+    best, bj = _quad_value(J, q)
+    dirs = [(1, 0), (-1, 0), (0, 1), (0, -1), (0.7, 0.7), (-0.7, 0.7), (0.7, -0.7), (-0.7, -0.7)]
+    k = max(h, w) / 280.0
+    for st in steps:
+        st *= k
+        for _ in range(rounds):
+            moved = False
+            for i in range(4):
+                cand_best, cq = best, None
+                moves = [(q[i][0] + dx * st, q[i][1] + dy * st) for dx, dy in dirs]
+                if st >= 4.0 * k:                                         # also: run the corner on along a side until the photo's edge
+                    for nb in (q[i - 1], q[(i + 1) % 4]):
+                        ex = _extend_to_rim(nb, q[i], w, h)
+                        if ex is not None:
+                            moves.append(ex)
+                for mv in moves:
+                    n = list(q)
+                    n[i] = mv
+                    if not (-0.04 * w <= n[i][0] <= 1.04 * w and -0.04 * h <= n[i][1] <= 1.04 * h):
+                        continue
+                    if not _quad_ok(n, h, w):
+                        continue
+                    v, j = _quad_value(J, n)
+                    if v > cand_best * 1.003:
+                        cand_best, cq, cj = v, n, j
+                if cq is not None:
+                    q, best, bj, moved = cq, cand_best, cj, True
+            if not moved:
+                break
+    return q, best, bj
+
+
+def _bg_distance(rgbf):
+    """How far every pixel is from the colours of the picture's frame (table / wall / cloth), in units of how much the frame
+    itself varies.  About 0..1.5 = looks like the surroundings, 3 and more = something else (a sheet, a card)."""
+    h, w = rgbf.shape[:2]
+    lum = rgbf[..., 0] * 0.299 + rgbf[..., 1] * 0.587 + rgbf[..., 2] * 0.114
+    b = max(3, int(0.045 * min(h, w)))
+    ring = np.zeros((h, w), bool)
+    ring[:b] = ring[-b:] = True
+    ring[:, :b] = ring[:, -b:] = True
+    feat = np.stack([lum / 255.0, (rgbf[..., 0] - rgbf[..., 1]) / 128.0, (rgbf[..., 1] - rgbf[..., 2]) / 128.0], -1)
+    feat = feat * np.array([1.0, 1.6, 1.6], np.float32)
+    bp = feat[ring]
+    if len(bp) < 50:
+        return None
+    cen = [np.median(bp, 0)]
+    for _ in range(2):
+        d = np.min([((bp - c) ** 2).sum(1) for c in cen], 0)
+        far = bp[d > np.percentile(d, 85)]
+        if len(far) < 30:
+            break
+        cen.append(np.median(far, 0))
+    for _ in range(4):
+        dd = np.stack([((bp - c) ** 2).sum(1) for c in cen], 1)
+        lab = dd.argmin(1)
+        cen = [bp[lab == i].mean(0) if (lab == i).sum() > 20 else cen[i] for i in range(len(cen))]
+    dd = np.stack([((bp - c) ** 2).sum(1) for c in cen], 1)
+    lab = dd.argmin(1)
+    sp = []
+    for i in range(len(cen)):
+        di = np.sqrt(dd[lab == i, i]) if (lab == i).sum() > 20 else np.array([0.05])
+        sp.append(max(0.035, float(np.percentile(di, 92))))
+    fl = feat.reshape(-1, 3)
+    dist = np.min([np.sqrt(((fl - c) ** 2).sum(1)) / sp[i] for i, c in enumerate(cen)], 0).reshape(h, w)
+    return _blur_u8(np.clip(dist * 20.0, 0, 255), 1.2) / 20.0
+
+
+def _purity_factor(J, q):
+    """A sheet is mostly ONE colour (paper) with some print on it; a rectangle that follows a tablecloth's pattern or that holds
+    half the table is a mixture of colours.  1.0 = clearly one dominant colour, down to 0.55 for a patchwork."""
+    try:
+        m = _poly_mask(q, (J.h, J.w))
+        px = J.lab[m]
+        if len(px) < 30:
+            return 1.0
+        if len(px) > 4000:
+            px = px[:: len(px) // 4000 + 1]
+        ref = np.median(px, 0)
+        dom = float((np.sqrt(((px - ref) ** 2).sum(1)) < 12.0).mean())
+        return 0.55 + 0.45 * float(np.clip((dom - 0.35) / 0.4, 0.0, 1.0))
+    except Exception:
+        return 1.0
