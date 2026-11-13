@@ -233,3 +233,15 @@ NEW (less memory): old Undo / Redo steps live on the disk
   the stamp", "Near the click" (+ its size), "Snap to edges", Tolerance / Fuzziness, the fill color, and everything in the Picture tab
   (Remove background, Remove more, Keep faint strokes, Remove specks, Edge softness, Opacity, Uneven paper, Ink color - these are also
   the start values of every new picture you add).
+
+NEW (phone scanner round 7)
+- The phone's paper finder was rewritten: it now fits 4 straight lines on the real page edges (many samples + robust line fit) and the
+  corners are where the lines meet, so the sides are straight and the perspective is no longer crooked. The page keeps its real
+  proportions (A4 stays A4) like the computer's Auto crop. When the computer is reachable its finder still replaces the phone's guess.
+- The round magnifier with the + while dragging a corner is gone. The + in the middle of the live camera is gone too.
+- After the cut-out, Original / Clean / Gray / B&W are shown as small preview pictures of YOUR page; tap one to choose it.
+- Live camera: the outline of the paper is drawn live (needs a secure link: the Internet link, or Android Chrome flag
+  chrome://flags/#unsafely-treat-insecure-origin-as-secure with the computer's address). New "Auto capture" switch.
+- Everything up to "Send" runs on the phone (find paper, cut, clean). Finished pages are kept on the phone (IndexedDB), also after a
+  reload or lost connection; the page itself is cached by a service worker (secure link only), so it opens again offline.
+  Only "Send to computer" needs the connection.
