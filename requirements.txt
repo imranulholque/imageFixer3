@@ -6,3 +6,4 @@ segno
 pyinstaller
 pypdfium2
 opencv-python-headless
+cryptography
