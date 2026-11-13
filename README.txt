@@ -245,3 +245,6 @@ NEW (phone scanner round 7)
 - Everything up to "Send" runs on the phone (find paper, cut, clean). Finished pages are kept on the phone (IndexedDB), also after a
   reload or lost connection; the page itself is cached by a service worker (secure link only), so it opens again offline.
   Only "Send to computer" needs the connection.
+- Phone, same Wi-Fi: the QR code is now an https link (self-signed certificate made once, kept in %APPDATA%\ImageFixer; needs the
+  'cryptography' package, in requirements.txt). The phone's browser shows a one-time warning: tap Advanced > Proceed. After that the page is
+  "secure" and the live camera with the paper outline works. The plain http door stays open for the internet tunnel.
