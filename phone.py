@@ -159,7 +159,10 @@ class _Handler(BaseHTTPRequestHandler):
             self._json({"ok": False, "gone": True, "error": "send the photo again"}, 410)
             return
         im = ent.view(int(q.get("sr", ["0"])[0]))
-        quad, found = scanner.detect_document(im)
+        quad, found = scanner.detect_document(im)           # the very same finder the PC's Auto crop uses
+        cx = sum(p[0] for p in quad) / 4.0                  # + the same hair-inset as the PC (no sliver of table at the edge)
+        cy = sum(p[1] for p in quad) / 4.0
+        quad = [(cx + (x - cx) * 0.995, cy + (y - cy) * 0.995) for x, y in quad]
         self._json({"ok": True, "id": sid, "w": im.width, "h": im.height, "found": found,
                     "quad": [[x, y] for x, y in quad]})
 
@@ -573,6 +576,14 @@ svg{width:26px;height:26px;fill:none;stroke:currentColor;stroke-width:2;stroke-l
 #toast.on{display:block}#toast.err{background:#3a1b22;border-color:#5a2630;color:#ffb4bd}
 #banner{position:fixed;left:12px;right:12px;top:calc(62px + env(safe-area-inset-top));z-index:44;background:#3a1b22;border:1px solid #5a2630;color:#ffb4bd;padding:10px 14px;border-radius:14px;font-size:13.5px;text-align:center;display:none}
 #banner.on{display:block}
+#camWrap{position:relative;border-radius:12px;overflow:hidden;background:#000}
+#camV{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+#camO{position:absolute;inset:0;width:100%;height:100%;touch-action:none;max-width:none;max-height:none;border-radius:0;background:none}
+#camMsg{position:absolute;left:10px;right:10px;bottom:10px;padding:9px 12px;border-radius:12px;background:#000b;font-size:14.5px;font-weight:600;text-align:center;line-height:1.3;pointer-events:none;transition:background .15s}
+#camMsg small{display:block;font-weight:500;font-size:12.5px;opacity:.9;margin-top:2px}
+#camMsg.ok{background:#1b7f4bee}#camMsg.warn{background:#8a5600ee}
+#camShot{flex:none;width:74px;height:74px;border-radius:50%;background:#fff;border:5px solid var(--bg);box-shadow:0 0 0 3px #fff;margin:0 8px;transition:transform .08s}
+#camShot:active{transform:scale(.9)}
 .hide{display:none!important}
 </style></head><body>
 <div id="bar"><i></i></div>
@@ -586,6 +597,7 @@ svg{width:26px;height:26px;fill:none;stroke:currentColor;stroke-width:2;stroke-l
    <button class="tile" id="bGal"><span class="ic"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><circle cx="9" cy="10" r="1.6"/><path d="m21 16-5-5-8 8"/></svg></span><span><b>Scan a photo</b><small>Pick a saved photo and cut the page out.</small></span></button>
    <button class="tile" id="bChoose"><span class="ic"><svg viewBox="0 0 24 24"><path d="M12 16V4M7 9l5-5 5 5M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg></span><span><b>Send pictures</b><small>Send photos as they are.</small></span></button>
   </div>
+  <div class="hint" id="liveHint"></div>
   <div class="sent" id="sent"></div>
  </div>
 </section>
@@ -595,6 +607,12 @@ svg{width:26px;height:26px;fill:none;stroke:currentColor;stroke-width:2;stroke-l
  <div class="stage"><canvas id="cv"></canvas><div class="wait" id="eWait"><div><div class="spin"></div>Finding the paper</div></div></div>
  <div class="hint" id="tip" style="padding:4px 16px"></div>
  <div class="dock"><div class="row"><button class="btn" id="eRetake">Retake</button><button class="btn pri" id="eOk" style="flex:2">Cut out</button></div></div>
+</section>
+
+<section class="scr" id="cam">
+ <div class="stage" id="camStage"><div id="camWrap"><video id="camV" playsinline muted autoplay></video><canvas id="camO"></canvas><div id="camMsg">Starting the camera ...</div></div></div>
+ <div class="dock"><div class="row" style="align-items:center"><button class="btn" id="camBack">Back</button><button id="camShot" aria-label="Take the photo"></button><button class="btn" id="camTorch">Light</button></div>
+  <button class="btn" id="camNative" style="min-height:38px;font-size:13.5px;color:var(--mut)">Use the phone's own camera app instead</button></div>
 </section>
 
 <section class="scr" id="review">
@@ -627,7 +645,7 @@ const LOOKNAME={orig:'Original',clean:'Clean',gray:'Gray',bw:'Black & white'};
 const api=async(p,opt,tries)=>{active++;prog(true);try{for(let k=0;;k++){try{const r=await fetch(base+p,opt);lastOk=Date.now();return r;}
   catch(e){if(k>=(tries==null?2:tries))throw e;await new Promise(r=>setTimeout(r,500*(k+1)));}}}   // a dropped connection is tried again
  finally{active--;prog(active>0);}};
-function show(id){for(const s of ['home','edit','review','list'])$(s).classList.toggle('on',s===id);}
+function show(id){if(id!=='cam')stopCam();for(const s of ['home','edit','review','list','cam'])$(s).classList.toggle('on',s===id);}
 function toast(t,err,ms){clearTimeout(tt);const e=$('toast');if(!t){e.classList.remove('on');return;}e.textContent=t;e.className='on'+(err?' err':'');tt=setTimeout(()=>e.classList.remove('on'),ms||(err?5000:2200));}
 function prog(on){$('bar').classList.toggle('on',!!on);}
 function buzz(){try{navigator.vibrate&&navigator.vibrate(15);}catch(e){}}
@@ -678,7 +696,8 @@ function logSent(t){const d=new Date();sentLog.unshift('<b>&#10003;</b> '+t+' se
  sentLog=sentLog.slice(0,4);$('sent').innerHTML=sentLog.map(x=>'<div>'+x+'</div>').join('');}
 
 // ---------- scan
-function openCam(){$('fCam').value='';$('fCam').click();}
+function nativeCam(){$('fCam').value='';$('fCam').click();}
+function openCam(){if(LIVE())openLive();else nativeCam();}
 $('bScan').onclick=()=>{retake=-1;openCam();};
 $('bGal').onclick=()=>{retake=-1;$('fGal').value='';$('fGal').click();};
 $('fCam').onchange=e=>gotPhoto(e.target.files[0]);$('fGal').onchange=e=>gotPhoto(e.target.files[0]);
@@ -697,9 +716,9 @@ async function gotPhoto(f){if(!f)return;
   findHere();                                                         // the paper is found right here on the phone: no waiting
  }catch(err){prog(false);toast('Could not open this photo.',true);}}
 function findHere(){const r=detectLocal(cur.view);cur.quad=r.quad;cur.touched=false;setTip(r.found);draw();refine();}
-async function refine(){ // LAN only: the computer's finer finder may improve the outline a moment later (if the corners were not touched)
- if(TUN)return;const me=cur,sr=cur.sr;
- try{const j=await detect();if(cur!==me||me.sr!==sr||me.touched||!j.found)return;me.quad=j.quad.map(p=>({x:p[0],y:p[1]}));setTip(true);draw();}catch(e){}}
+async function refine(){ // the computer's finder (same as PC Auto crop) replaces the quick local guess when it arrives (if the corners were not touched)
+ const me=cur,sr=cur.sr;   // the computer's finder (same as the PC's Auto crop) is the main answer, on Wi-Fi AND over the internet link; the quick local guess above only shows until it arrives
+ try{const j=await detect();if(cur!==me||me.sr!==sr||me.touched)return;me.quad=j.quad.map(p=>({x:p[0],y:p[1]}));setTip(j.found);draw();}catch(e){}}
 function setTip(found){$('tip').textContent=found?'Paper found. Drag a round corner or a square side if the outline is not exact.':'Paper not found. Drag the corners onto the paper, or tap "Whole photo".';}
 $('eAuto').onclick=()=>{buzz();findHere();};
 $('eFull').onclick=()=>{const m=0.01,w=cur.w,h=cur.h;cur.quad=[{x:w*m,y:h*m},{x:w*(1-m),y:h*m},{x:w*(1-m),y:h*(1-m)},{x:w*m,y:h*(1-m)}];draw();};
@@ -861,6 +880,85 @@ $('rUse').onclick=()=>{
  p.res=null;p.warp=null;p.base=null;p.view=null;                    // free the big pictures; the page keeps only the small ones
  if(retake>=0)pages[retake]=p;else pages.push(p);
  const again=retake<0&&autoOn();retake=-1;cur=null;renderList();if(again)openCam();};
+
+
+// ---------- live camera guide: a + in the middle of the view, the paper outline drawn live, plain instructions, tap = focus there
+const LIVE=()=>!!(window.isSecureContext&&navigator.mediaDevices&&navigator.mediaDevices.getUserMedia);
+let camS=null,camT=null,camIC=null,camTimer=0,camQ=null,camMiss=0,camStable=0,camBusy=false,camTap=null,camTorchOn=false,camSay='',camVib=false,camGrab=null,camGood=false;
+if(!LIVE())$('liveHint').textContent='Live camera guide (the + and the paper outline) needs the Internet link - the phone blocks the camera on plain Wi-Fi links. Here the phone\'s own camera app opens.';
+function stopCam(){clearTimeout(camTimer);camTimer=0;if(camS){try{camS.getTracks().forEach(t=>t.stop());}catch(e){}}
+ camS=camT=camIC=null;camQ=null;camStable=0;camBusy=false;camTorchOn=false;const v=$('camV');if(v){try{v.srcObject=null;}catch(e){}}}
+async function openLive(){
+ let st;
+ try{st=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:4096},height:{ideal:3072}},audio:false});}
+ catch(e){toast('The camera is blocked here. Opening the phone\'s camera app.',true);nativeCam();return;}
+ show('cam');camS=st;camT=st.getVideoTracks()[0];camQ=null;camMiss=0;camStable=0;camBusy=false;camTap=null;camTorchOn=false;camVib=false;
+ const v=$('camV');v.srcObject=st;try{await v.play();}catch(e){}
+ for(let i=0;i<40&&!v.videoWidth;i++)await new Promise(r=>setTimeout(r,50));
+ if(!v.videoWidth||camS!==st){stopCam();toast('Could not start the camera.',true);nativeCam();return;}
+ let caps={};try{caps=camT.getCapabilities?camT.getCapabilities():{};}catch(e){}
+ try{if((caps.focusMode||[]).includes('continuous'))await camT.applyConstraints({advanced:[{focusMode:'continuous'}]});}catch(e){}
+ $('camTorch').style.visibility=caps.torch?'visible':'hidden';$('camTorch').textContent='Light';
+ camIC=window.ImageCapture?new ImageCapture(camT):null;
+ camLayout();camSet('','Starting ...');camTick();}
+function camLayout(){const v=$('camV');if(!v.videoWidth)return;const r=$('camStage').getBoundingClientRect(),k=Math.min((r.width-24)/v.videoWidth,(r.height-8)/v.videoHeight),d=DPR();
+ const w=Math.max(80,Math.floor(v.videoWidth*k)),h=Math.max(80,Math.floor(v.videoHeight*k)),W=$('camWrap'),o=$('camO');
+ W.style.width=w+'px';W.style.height=h+'px';o.width=Math.round(w*d);o.height=Math.round(h*d);}
+addEventListener('resize',()=>{if(camS)camLayout();});
+function camSet(cls,txt,sub){const m=$('camMsg');m.className=cls;const key=cls+'|'+txt+'|'+(sub||'');if(key===camSay)return;camSay=key;
+ m.textContent=txt;if(sub){const s=document.createElement('small');s.textContent=sub;m.appendChild(s);}}
+async function camFocusAt(nx,ny){if(!camT)return;let caps={};try{caps=camT.getCapabilities();}catch(e){}
+ const modes=caps.focusMode||[],mode=modes.includes('continuous')?'continuous':modes.includes('single-shot')?'single-shot':null;
+ try{await camT.applyConstraints({advanced:[mode?{focusMode:mode,pointsOfInterest:[{x:nx,y:ny}]}:{pointsOfInterest:[{x:nx,y:ny}]}]});}catch(e){}}   // best effort: phones that cannot take a focus point just keep their own autofocus
+$('camO').onpointerdown=e=>{const r=$('camO').getBoundingClientRect(),nx=(e.clientX-r.left)/r.width,ny=(e.clientY-r.top)/r.height;
+ camTap={x:nx,y:ny,t:Date.now()};camFocusAt(nx,ny);buzz();};
+$('camTorch').onclick=async()=>{if(!camT)return;camTorchOn=!camTorchOn;try{await camT.applyConstraints({advanced:[{torch:camTorchOn}]});$('camTorch').textContent=camTorchOn?'Light on':'Light';}catch(e){camTorchOn=false;}};
+$('camBack').onclick=()=>{pages.length?renderList():home();};
+$('camNative').onclick=()=>{stopCam();nativeCam();};
+$('camShot').onclick=async()=>{if(camBusy||!camS)return;camBusy=true;buzz();clearTimeout(camTimer);
+ let blob=null;const v=$('camV');
+ if(camIC){try{blob=await Promise.race([camIC.takePhoto(),new Promise((_,no)=>setTimeout(no,4000))]);}catch(e){blob=null;}}   // the camera's full-size photo (sharper, focused)
+ if(!blob){try{const c=document.createElement('canvas');c.width=v.videoWidth;c.height=v.videoHeight;c.getContext('2d').drawImage(v,0,0);blob=await toBlob(c,0.92);}catch(e){}}
+ if(!blob){camBusy=false;toast('Could not take the photo. Try again.',true);camTick();return;}
+ try{v.pause();}catch(e){}gotPhoto(blob);};
+function camTick(){clearTimeout(camTimer);if(!camS||camBusy)return;
+ const v=$('camV');
+ if(v.videoWidth&&v.readyState>=2){
+  try{
+   const m=420,s=Math.min(1,m/Math.max(v.videoWidth,v.videoHeight)),gw=Math.max(8,Math.round(v.videoWidth*s)),gh=Math.max(8,Math.round(v.videoHeight*s));
+   if(!camGrab||camGrab.width!==gw||camGrab.height!==gh){camGrab=document.createElement('canvas');camGrab.width=gw;camGrab.height=gh;}
+   camGrab.getContext('2d',{willReadFrequently:true}).drawImage(v,0,0,gw,gh);
+   const r=detectLocal(camGrab);let q=r.found?r.quad.map(p=>({x:p.x/gw,y:p.y/gh})):null,move=1;
+   if(q){if(camQ){move=q.reduce((a,p,i)=>a+Math.hypot(p.x-camQ[i].x,p.y-camQ[i].y),0)/4;q=q.map((p,i)=>({x:(p.x+camQ[i].x)/2,y:(p.y+camQ[i].y)/2}));}camQ=q;camMiss=0;}
+   else if(++camMiss>2)camQ=null;
+   camStable=(q&&move<0.014)?camStable+1:0;
+   camJudge(v);camDraw();
+  }catch(e){}}
+ camTimer=setTimeout(camTick,150);}
+function camJudge(v){camGood=false;
+ if(!camQ){camSet('warn','Looking for the paper ...','Put it on a plain, darker table. Keep all 4 corners in the view.');return;}
+ const q=camQ,W=v.videoWidth,H=v.videoHeight,area=polyArea(q),pct=Math.round(area*100),sub='The page fills '+pct+'% of the view - the rest is cut away';
+ const cx=q.reduce((a,p)=>a+p.x,0)/4,cy=q.reduce((a,p)=>a+p.y,0)/4,dx=cx-0.5,dy=cy-0.5;
+ const clip=q.some(p=>p.x<0.012||p.x>0.988||p.y<0.012||p.y>0.988);
+ const d=(a,b)=>Math.hypot((a.x-b.x)*W,(a.y-b.y)*H),rt=Math.max(d(q[0],q[1]),d(q[3],q[2]))/Math.max(1,Math.min(d(q[0],q[1]),d(q[3],q[2]))),rl=Math.max(d(q[0],q[3]),d(q[1],q[2]))/Math.max(1,Math.min(d(q[0],q[3]),d(q[1],q[2])));
+ if(clip)return camSet('warn','Move the phone back a little','All 4 corners of the paper must be inside the view.');
+ if(area<0.3)return camSet('warn','Move closer','The paper is small in the view ('+pct+'%).');
+ if(Math.abs(dx)>0.07||Math.abs(dy)>0.07){const h=Math.abs(dx)>=Math.abs(dy)?(dx>0?'right':'left'):(dy>0?'down':'up');
+  return camSet('warn','Move the phone a little '+h,'Put the + on the middle of the paper (the two + meet).');}
+ if(Math.max(rt,rl)>1.28)return camSet('warn','Hold the phone flatter, straight above the paper','The page looks tilted. Less tilt = a better scan.');
+ if(camStable>=4){camGood=true;if(camStable===4){camFocusAt(cx,cy);if(!camVib){camVib=true;buzz();}}return camSet('ok','Good - hold still, tap the round button',sub);}
+ camVib=false;camSet('ok','Almost - hold still ...',sub);}
+function camDraw(){const o=$('camO'),g=o.getContext('2d'),W=o.width,H=o.height,d=DPR();g.clearRect(0,0,W,H);
+ const good=camQ&&camGood;let aligned=false;
+ if(camQ){const q=camQ.map(p=>({x:p.x*W,y:p.y*H}));
+  g.fillStyle='rgba(0,0,0,.5)';g.beginPath();g.rect(0,0,W,H);g.moveTo(q[0].x,q[0].y);for(let i=3;i>=0;i--)g.lineTo(q[i].x,q[i].y);g.closePath();g.fill('evenodd');   // what is NOT paper is darkened = what the crop throws away
+  g.lineWidth=3*d;g.lineJoin='round';g.strokeStyle=good?'#3ddc84':'#ffd166';g.beginPath();g.moveTo(q[0].x,q[0].y);for(let i=1;i<4;i++)g.lineTo(q[i].x,q[i].y);g.closePath();g.stroke();
+  g.fillStyle=g.strokeStyle;for(const p of q){g.beginPath();g.arc(p.x,p.y,6*d,0,7);g.fill();}
+  const cx=q.reduce((a,p)=>a+p.x,0)/4,cy=q.reduce((a,p)=>a+p.y,0)/4;aligned=Math.hypot(cx-W/2,cy-H/2)<0.07*Math.min(W,H);
+  g.strokeStyle=aligned?'#3ddc84':'#ffd166';g.lineWidth=2.5*d;g.beginPath();g.arc(cx,cy,9*d,0,7);g.stroke();}                     // where the middle of the paper is now
+ const X=W/2,Y=H/2,a=22*d;g.lineCap='round';
+ for(const [col,w] of [['rgba(0,0,0,.55)',6*d],[aligned?'#3ddc84':'#ffffff',3*d]]){g.strokeStyle=col;g.lineWidth=w;g.beginPath();g.moveTo(X-a,Y);g.lineTo(X+a,Y);g.moveTo(X,Y-a);g.lineTo(X,Y+a);g.stroke();}   // the + : put it on the middle of the paper
+ if(camTap&&Date.now()-camTap.t<1100){const x=camTap.x*W,y=camTap.y*H,r=30*d;g.strokeStyle='#fff';g.lineWidth=2.5*d;g.strokeRect(x-r,y-r,2*r,2*r);}}
 
 // ---------- page list
 function renderList(){show('list');$('lt').textContent=pages.length+' page'+(pages.length==1?'':'s');const box=$('pages');box.textContent='';
