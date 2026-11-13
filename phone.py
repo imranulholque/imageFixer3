@@ -678,14 +678,43 @@ svg{width:26px;height:26px;fill:none;stroke:currentColor;stroke-width:2;stroke-l
 #toast.on{display:block}#toast.err{background:#3a1b22;border-color:#5a2630;color:#ffb4bd}
 #banner{position:fixed;left:12px;right:12px;top:calc(62px + env(safe-area-inset-top));z-index:44;background:#3a1b22;border:1px solid #5a2630;color:#ffb4bd;padding:10px 14px;border-radius:14px;font-size:13.5px;text-align:center;display:none}
 #banner.on{display:block}
-#camWrap{position:relative;border-radius:12px;overflow:hidden;background:#000}
-#camV{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
-#camO{position:absolute;inset:0;width:100%;height:100%;touch-action:none;max-width:none;max-height:none;border-radius:0;background:none}
-#camMsg{position:absolute;left:10px;right:10px;bottom:10px;padding:9px 12px;border-radius:12px;background:#000b;font-size:14.5px;font-weight:600;text-align:center;line-height:1.3;pointer-events:none;transition:background .15s}
-#camMsg small{display:block;font-weight:500;font-size:12.5px;opacity:.9;margin-top:2px}
-#camMsg.ok{background:#1b7f4bee}#camMsg.warn{background:#8a5600ee}
-#camShot{flex:none;width:74px;height:74px;border-radius:50%;background:#fff;border:5px solid var(--bg);box-shadow:0 0 0 3px #fff;margin:0 8px;transition:transform .08s}
-#camShot:active{transform:scale(.9)}
+/* ---- camera: the whole screen is the camera, glass buttons float on top */
+#cam.on{position:fixed;inset:0;z-index:30;background:#000;display:block;animation:none}
+#camV{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;background:#000}
+#camO{position:absolute;inset:0;width:100%;height:100%;touch-action:none}
+.cTop,.cBot{position:absolute;left:0;right:0;display:flex;align-items:center;pointer-events:none}
+.cTop>*,.cBot>*{pointer-events:auto}
+.cTop{top:0;gap:10px;padding:calc(12px + env(safe-area-inset-top)) 14px 34px;background:linear-gradient(180deg,rgba(0,0,0,.55),rgba(0,0,0,0))}
+.cTop .gap{flex:1}
+.cBot{bottom:0;justify-content:space-between;padding:40px 30px calc(24px + env(safe-area-inset-bottom));background:linear-gradient(0deg,rgba(0,0,0,.6),rgba(0,0,0,0))}
+.gb{position:relative;flex:none;width:46px;height:46px;border-radius:50%;display:grid;place-items:center;background:rgba(24,26,36,.45);border:1px solid rgba(255,255,255,.22);-webkit-backdrop-filter:blur(16px) saturate(1.4);backdrop-filter:blur(16px) saturate(1.4);color:#fff;transition:transform .08s,background .15s,color .15s}
+.gb:active{transform:scale(.9)}
+.gb svg{width:22px;height:22px}
+.gb.on{background:rgba(255,214,102,.95);border-color:transparent;color:#1b1b1b}
+.gb.big{width:56px;height:56px}.gb.big svg{width:26px;height:26px}
+.gb .bd{position:absolute;right:-4px;top:-4px;min-width:21px;height:21px;border-radius:11px;background:var(--ok);color:#fff;font-size:12px;font-weight:700;display:grid;place-items:center;padding:0 5px;border:2px solid #000}
+#camShot{flex:none;width:80px;height:80px;border-radius:50%;border:4px solid #fff;padding:5px;display:grid;place-items:center;background:transparent;box-shadow:0 4px 24px rgba(0,0,0,.4)}
+#camShot::after{content:"";width:100%;height:100%;border-radius:50%;background:#fff;transition:transform .1s,background .25s}
+#camShot:active::after{transform:scale(.86)}
+#camShot.ready{border-color:#3ddc84}#camShot.ready::after{background:#3ddc84}
+#camMsg{position:absolute;left:50%;transform:translateX(-50%);top:calc(68px + env(safe-area-inset-top));width:max-content;max-width:calc(100% - 32px);padding:9px 16px;border-radius:16px;background:rgba(24,26,36,.55);-webkit-backdrop-filter:blur(16px);backdrop-filter:blur(16px);border:1px solid rgba(255,255,255,.16);font-size:14.5px;font-weight:650;text-align:center;line-height:1.3;pointer-events:none;transition:background .2s}
+#camMsg small{display:block;font-weight:500;font-size:12.5px;opacity:.85;margin-top:2px}
+#camMsg.ok{background:rgba(22,130,76,.82)}#camMsg.warn{background:rgba(150,92,0,.82)}
+.incam header,.incam #banner{display:none!important}
+.incam #toast{bottom:auto;top:calc(120px + env(safe-area-inset-top))}
+/* ---- home */
+.hh{padding:6px 2px 2px}.hh h1{margin:0 0 4px;font-size:30px;letter-spacing:-.6px;line-height:1.1}.hh p{margin:0;color:var(--mut);font-size:14.5px;line-height:1.45}
+.hero{position:relative;overflow:hidden;border-radius:26px;padding:22px 20px}
+.hero::after{content:"";position:absolute;right:-30px;top:-40px;width:150px;height:150px;border-radius:50%;background:radial-gradient(circle,#ffffff33,#ffffff00 70%);pointer-events:none}
+.hero .go{flex:none;width:36px;height:36px;border-radius:50%;background:#ffffff2e;display:grid;place-items:center;margin-left:auto}.hero .go svg{width:20px;height:20px}
+.waitc{display:flex;align-items:center;gap:14px;width:100%;padding:14px 16px;border-radius:20px;background:#13261d;border:1px solid #1f4630;text-align:left}
+.waitc:active{transform:scale(.98)}.waitc b{display:block;font-size:15.5px}.waitc small{color:#8fcfae;font-size:12.5px}
+.waitc .wi{flex:none;width:40px;height:40px;border-radius:13px;background:var(--ok);display:grid;place-items:center;font-weight:800;font-size:17px}
+.waitc>svg{margin-left:auto;width:20px;height:20px;color:#8fcfae}
+.conn{display:flex;align-items:center;gap:10px;font-size:13px;color:var(--mut);padding:2px 6px}
+.conn .cd{width:8px;height:8px;border-radius:50%;background:var(--bad);flex:none}.conn.on .cd{background:var(--ok)}
+.note{font-size:12.5px;line-height:1.45;color:#c9b27a;background:#221d10;border:1px solid #3a3118;border-radius:14px;padding:10px 12px}.note:empty{display:none}
+.tile{min-height:104px;border-radius:20px}
 .hide{display:none!important}
 </style></head><body>
 <div id="bar"><i></i></div>
@@ -694,12 +723,15 @@ svg{width:26px;height:26px;fill:none;stroke:currentColor;stroke-width:2;stroke-l
 
 <section class="scr on" id="home">
  <div class="body">
-  <button class="hero" id="bScan"><span class="ic"><svg viewBox="0 0 24 24" style="width:30px;height:30px"><path d="M4 8V6a2 2 0 0 1 2-2h2M16 4h2a2 2 0 0 1 2 2v2M20 16v2a2 2 0 0 1-2 2h-2M8 20H6a2 2 0 0 1-2-2v-2"/><circle cx="12" cy="12" r="3"/></svg></span><span><b>Scan a paper</b><small>Take a photo. The page is found, cut out and straightened for you.</small></span></button>
+  <div class="hh"><h1>Scan documents</h1><p>Point at a paper, tap, send. It is cut out and cleaned right on your phone.</p></div>
+  <button class="hero" id="bScan"><span class="ic"><svg viewBox="0 0 24 24" style="width:30px;height:30px"><path d="M4 8V6a2 2 0 0 1 2-2h2M16 4h2a2 2 0 0 1 2 2v2M20 16v2a2 2 0 0 1-2 2h-2M8 20H6a2 2 0 0 1-2-2v-2"/><circle cx="12" cy="12" r="3"/></svg></span><span><b>Scan a paper</b><small>Live outline, auto crop, works offline</small></span><span class="go"><svg viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></svg></span></button>
+  <button class="waitc hide" id="waitCard"><span class="wi" id="waitN">0</span><span><b id="waitT">Pages ready to send</b><small>Tap to review and send</small></span><svg viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></svg></button>
   <div class="tiles">
    <button class="tile" id="bGal"><span class="ic"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><circle cx="9" cy="10" r="1.6"/><path d="m21 16-5-5-8 8"/></svg></span><span><b>Scan a photo</b><small>Pick a saved photo and cut the page out.</small></span></button>
    <button class="tile" id="bChoose"><span class="ic"><svg viewBox="0 0 24 24"><path d="M12 16V4M7 9l5-5 5 5M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg></span><span><b>Send pictures</b><small>Send photos as they are.</small></span></button>
   </div>
-  <div class="hint" id="liveHint"></div>
+  <div class="conn" id="conn"><span class="cd"></span><span id="connT">Connecting to your computer ...</span></div>
+  <div class="note" id="liveHint"></div>
   <div class="sent" id="sent"></div>
  </div>
 </section>
@@ -712,9 +744,19 @@ svg{width:26px;height:26px;fill:none;stroke:currentColor;stroke-width:2;stroke-l
 </section>
 
 <section class="scr" id="cam">
- <div class="stage" id="camStage"><div id="camWrap"><video id="camV" playsinline muted autoplay></video><canvas id="camO"></canvas><div id="camMsg">Starting the camera ...</div></div></div>
- <div class="dock"><div class="row" style="align-items:center"><button class="btn" id="camBack">Back</button><button id="camShot" aria-label="Take the photo"></button><button class="btn" id="camTorch">Light</button></div>
-  <button class="btn" id="camAuto" style="min-height:38px;font-size:13.5px">Auto capture: off</button><button class="btn" id="camNative" style="min-height:38px;font-size:13.5px;color:var(--mut)">Use the phone's own camera app instead</button></div>
+ <video id="camV" playsinline muted autoplay></video><canvas id="camO"></canvas>
+ <div class="cTop">
+  <button class="gb" id="camBack" aria-label="Back"><svg viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></svg></button><span class="gap"></span>
+  <button class="gb" id="camTorch" aria-label="Light"><svg viewBox="0 0 24 24"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></svg></button>
+  <button class="gb" id="camAuto" aria-label="Auto capture"><svg viewBox="0 0 24 24"><circle cx="12" cy="13.5" r="7.5"/><path d="M12 9.5v4l2.5 2M9.5 2.5h5"/></svg></button>
+  <button class="gb" id="camNative" aria-label="Use the phone's own camera app"><svg viewBox="0 0 24 24"><path d="M4 8h3l2-3h6l2 3h3a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1z"/><circle cx="12" cy="13" r="3.5"/></svg></button>
+ </div>
+ <div id="camMsg">Starting the camera ...</div>
+ <div class="cBot">
+  <button class="gb big" id="camGal" aria-label="Pick a saved photo"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><circle cx="9" cy="10" r="1.6"/><path d="m21 16-5-5-8 8"/></svg></button>
+  <button id="camShot" aria-label="Take the photo"></button>
+  <button class="gb big" id="camDone" aria-label="Review the pages" style="visibility:hidden"><svg viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7"/></svg><i class="bd" id="camN">0</i></button>
+ </div>
 </section>
 
 <section class="scr" id="review">
@@ -747,19 +789,22 @@ const LOOKNAME={orig:'Original',clean:'Clean',gray:'Gray',bw:'Black & white'};
 const api=async(p,opt,tries)=>{active++;prog(true);try{for(let k=0;;k++){try{const r=await fetch(base+p,opt);lastOk=Date.now();return r;}
   catch(e){if(k>=(tries==null?2:tries))throw e;await new Promise(r=>setTimeout(r,500*(k+1)));}}}   // a dropped connection is tried again
  finally{active--;prog(active>0);}};
-function show(id){if(id!=='cam')stopCam();for(const s of ['home','edit','review','list','cam'])$(s).classList.toggle('on',s===id);}
+function show(id){if(id!=='cam')stopCam();document.body.classList.toggle('incam',id==='cam');if(id==='home')homeInfo();for(const s of ['home','edit','review','list','cam'])$(s).classList.toggle('on',s===id);}
 function toast(t,err,ms){clearTimeout(tt);const e=$('toast');if(!t){e.classList.remove('on');return;}e.textContent=t;e.className='on'+(err?' err':'');tt=setTimeout(()=>e.classList.remove('on'),ms||(err?5000:2200));}
 function prog(on){$('bar').classList.toggle('on',!!on);}
 function buzz(){try{navigator.vibrate&&navigator.vibrate(15);}catch(e){}}
 const raf=()=>new Promise(r=>requestAnimationFrame(()=>r()));
 // ---- connection light (pings only when nothing else talked to the computer lately)
 let fails=0;
+function setConn(on){$('conn').classList.toggle('on',on);$('connT').textContent=on?'Connected to your computer':'Offline - scanning still works, pages wait on this phone';}
+function homeInfo(){const n=pages.length,c=$('waitCard');c.classList.toggle('hide',!n);if(n){$('waitN').textContent=n;$('waitT').textContent=n+' page'+(n==1?'':'s')+' ready to send';}}
+$('waitCard').onclick=()=>{if(pages.length)renderList();};
 async function ping(){if(document.hidden||active||Date.now()-lastOk<4000)return;
- try{const r=await fetch(base+'/api/ping');if(!r.ok)throw 0;lastOk=Date.now();fails=0;$('dot').className='on';$('st').textContent='connected to your computer';$('banner').classList.remove('on');}
- catch(e){if(++fails>=3){$('dot').className='';$('st').textContent='offline - scanning still works';$('banner').classList.add('on');}}}
+ try{const r=await fetch(base+'/api/ping');if(!r.ok)throw 0;lastOk=Date.now();fails=0;$('dot').className='on';$('st').textContent='connected to your computer';setConn(true);$('banner').classList.remove('on');}
+ catch(e){if(++fails>=3){$('dot').className='';$('st').textContent='offline - scanning still works';setConn(false);$('banner').classList.add('on');}}}
 setInterval(ping,4000);ping();
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)ping();});
-function ok(){fails=0;$('dot').className='on';$('st').textContent='connected to your computer';$('banner').classList.remove('on');}
+function ok(){fails=0;$('dot').className='on';$('st').textContent='connected to your computer';setConn(true);$('banner').classList.remove('on');}
 
 // ---- images: decode once, rotate on the GPU canvas (no JPEG encode / decode, no computer needed)
 function loadImg(src){return new Promise((res,no)=>{const i=new Image();i.onload=()=>res(i);i.onerror=no;i.src=src;});}
@@ -1110,23 +1155,27 @@ async function openLive(){
  if(!v.videoWidth||camS!==st){stopCam();toast('Could not start the camera.',true);nativeCam();return;}
  let caps={};try{caps=camT.getCapabilities?camT.getCapabilities():{};}catch(e){}
  try{if((caps.focusMode||[]).includes('continuous'))await camT.applyConstraints({advanced:[{focusMode:'continuous'}]});}catch(e){}
- $('camTorch').style.visibility=caps.torch?'visible':'hidden';$('camTorch').textContent='Light';
+ $('camTorch').style.display=caps.torch?'grid':'none';$('camTorch').classList.remove('on');camBadge();
  camIC=window.ImageCapture?new ImageCapture(camT):null;
  camLayout();camSet('','Starting ...');camTick();}
-function camLayout(){const v=$('camV');if(!v.videoWidth)return;const r=$('camStage').getBoundingClientRect(),k=Math.min((r.width-24)/v.videoWidth,(r.height-8)/v.videoHeight),d=DPR();
- const w=Math.max(80,Math.floor(v.videoWidth*k)),h=Math.max(80,Math.floor(v.videoHeight*k)),W=$('camWrap'),o=$('camO');
- W.style.width=w+'px';W.style.height=h+'px';o.width=Math.round(w*d);o.height=Math.round(h*d);}
+function camGeo(){const o=$('camO'),v=$('camV'),W=o.width,H=o.height,vw=v.videoWidth||1,vh=v.videoHeight||1,s=Math.max(W/vw,H/vh);return {W,H,vw,vh,s,ox:(W-vw*s)/2,oy:(H-vh*s)/2};}   // the video fills the screen (cover): video -> screen
+const camScr=(g,p)=>({x:g.ox+p.x*g.vw*g.s,y:g.oy+p.y*g.vh*g.s});
+function camLayout(){const o=$('camO'),r=o.getBoundingClientRect(),d=DPR();o.width=Math.max(80,Math.round(r.width*d));o.height=Math.max(80,Math.round(r.height*d));}
+function camBadge(){const n=pages.length;$('camDone').style.visibility=n?'visible':'hidden';$('camN').textContent=n;}
 addEventListener('resize',()=>{if(camS)camLayout();});
 function camSet(cls,txt,sub){const m=$('camMsg');m.className=cls;const key=cls+'|'+txt+'|'+(sub||'');if(key===camSay)return;camSay=key;
  m.textContent=txt;if(sub){const s=document.createElement('small');s.textContent=sub;m.appendChild(s);}}
 async function camFocusAt(nx,ny){if(!camT)return;let caps={};try{caps=camT.getCapabilities();}catch(e){}
  const modes=caps.focusMode||[],mode=modes.includes('continuous')?'continuous':modes.includes('single-shot')?'single-shot':null;
  try{await camT.applyConstraints({advanced:[mode?{focusMode:mode,pointsOfInterest:[{x:nx,y:ny}]}:{pointsOfInterest:[{x:nx,y:ny}]}]});}catch(e){}}   // best effort: phones that cannot take a focus point just keep their own autofocus
-$('camO').onpointerdown=e=>{const r=$('camO').getBoundingClientRect(),nx=(e.clientX-r.left)/r.width,ny=(e.clientY-r.top)/r.height;
- camTap={x:nx,y:ny,t:Date.now()};camFocusAt(nx,ny);buzz();};
-$('camTorch').onclick=async()=>{if(!camT)return;camTorchOn=!camTorchOn;try{await camT.applyConstraints({advanced:[{torch:camTorchOn}]});$('camTorch').textContent=camTorchOn?'Light on':'Light';}catch(e){camTorchOn=false;}};
+$('camO').onpointerdown=e=>{const o=$('camO'),r=o.getBoundingClientRect(),k=o.width/r.width,px=(e.clientX-r.left)*k,py=(e.clientY-r.top)*k,g=camGeo();
+ const vx=Math.min(1,Math.max(0,(px-g.ox)/(g.vw*g.s))),vy=Math.min(1,Math.max(0,(py-g.oy)/(g.vh*g.s)));
+ camTap={x:px/o.width,y:py/o.height,t:Date.now()};camFocusAt(vx,vy);buzz();};
+$('camTorch').onclick=async()=>{if(!camT)return;camTorchOn=!camTorchOn;try{await camT.applyConstraints({advanced:[{torch:camTorchOn}]});$('camTorch').classList.toggle('on',camTorchOn);}catch(e){camTorchOn=false;}};
 $('camBack').onclick=()=>{pages.length?renderList():home();};
 $('camNative').onclick=()=>{stopCam();nativeCam();};
+$('camGal').onclick=()=>{retake=-1;$('fGal').value='';$('fGal').click();};
+$('camDone').onclick=()=>{if(pages.length)renderList();};
 $('camShot').onclick=async()=>{if(camBusy||!camS)return;camBusy=true;buzz();clearTimeout(camTimer);
  let blob=null;const v=$('camV');
  if(camIC){try{blob=await Promise.race([camIC.takePhoto(),new Promise((_,no)=>setTimeout(no,4000))]);}catch(e){blob=null;}}   // the camera's full-size photo (sharper, focused)
@@ -1149,30 +1198,31 @@ function camTick(){clearTimeout(camTimer);if(!camS||camBusy)return;
  camTimer=setTimeout(camTick,150);}
 function camJudge(v){camGood=false;
  if(!camQ){camSet('warn','Looking for the paper ...','Put it on a plain, darker table. Keep all 4 corners in the view.');return;}
- const q=camQ,W=v.videoWidth,H=v.videoHeight,area=polyArea(q),pct=Math.round(area*100),sub='The page fills '+pct+'% of the view - the rest is cut away';
- const cx=q.reduce((a,p)=>a+p.x,0)/4,cy=q.reduce((a,p)=>a+p.y,0)/4,dx=cx-0.5,dy=cy-0.5;
- const clip=q.some(p=>p.x<0.012||p.x>0.988||p.y<0.012||p.y>0.988);
- const d=(a,b)=>Math.hypot((a.x-b.x)*W,(a.y-b.y)*H),rt=Math.max(d(q[0],q[1]),d(q[3],q[2]))/Math.max(1,Math.min(d(q[0],q[1]),d(q[3],q[2]))),rl=Math.max(d(q[0],q[3]),d(q[1],q[2]))/Math.max(1,Math.min(d(q[0],q[3]),d(q[1],q[2])));
+ const g=camGeo(),qv=camQ,q=qv.map(p=>{const s=camScr(g,p);return {x:s.x/g.W,y:s.y/g.H};}),W=v.videoWidth,H=v.videoHeight,area=polyArea(q),pct=Math.round(area*100),sub='The page fills '+pct+'% of the view - the rest is cut away';
+ const cx=q.reduce((a,p)=>a+p.x,0)/4,cy=q.reduce((a,p)=>a+p.y,0)/4,dx=cx-0.5,dy=cy-0.5,vcx=qv.reduce((a,p)=>a+p.x,0)/4,vcy=qv.reduce((a,p)=>a+p.y,0)/4;
+ const clip=q.some(p=>p.x<0.015||p.x>0.985||p.y<0.015||p.y>0.985);
+ const d=(a,b)=>Math.hypot((a.x-b.x)*W,(a.y-b.y)*H),rt=Math.max(d(qv[0],qv[1]),d(qv[3],qv[2]))/Math.max(1,Math.min(d(qv[0],qv[1]),d(qv[3],qv[2]))),rl=Math.max(d(qv[0],qv[3]),d(qv[1],qv[2]))/Math.max(1,Math.min(d(qv[0],qv[3]),d(qv[1],qv[2])));
  if(clip)return camSet('warn','Move the phone back a little','All 4 corners of the paper must be inside the view.');
  if(area<0.3)return camSet('warn','Move closer','The paper is small in the view ('+pct+'%).');
  if(Math.abs(dx)>0.07||Math.abs(dy)>0.07){const h=Math.abs(dx)>=Math.abs(dy)?(dx>0?'right':'left'):(dy>0?'down':'up');
   return camSet('warn','Move the phone a little '+h,'Keep the whole paper in the middle of the view.');}
  if(Math.max(rt,rl)>1.28)return camSet('warn','Hold the phone flatter, straight above the paper','The page looks tilted. Less tilt = a better scan.');
- if(camStable>=4){camGood=true;if(camAutoOn()&&camStable>=8&&!camBusy){setTimeout(()=>{if(camGood&&!camBusy&&camS)$('camShot').onclick();},0);}if(camStable===4){camFocusAt(cx,cy);if(!camVib){camVib=true;buzz();}}return camSet('ok','Good - hold still, tap the round button',sub);}
+ if(camStable>=4){camGood=true;if(camAutoOn()&&camStable>=8&&!camBusy){setTimeout(()=>{if(camGood&&!camBusy&&camS)$('camShot').onclick();},0);}if(camStable===4){camFocusAt(vcx,vcy);if(!camVib){camVib=true;buzz();}}return camSet('ok','Good - hold still, tap the round button',sub);}
  camVib=false;camSet('ok','Almost - hold still ...',sub);}
-function camDraw(){const o=$('camO'),g=o.getContext('2d'),W=o.width,H=o.height,d=DPR();g.clearRect(0,0,W,H);
- const good=camQ&&camGood;let aligned=false;
- if(camQ){const q=camQ.map(p=>({x:p.x*W,y:p.y*H}));
-  g.fillStyle='rgba(0,0,0,.5)';g.beginPath();g.rect(0,0,W,H);g.moveTo(q[0].x,q[0].y);for(let i=3;i>=0;i--)g.lineTo(q[i].x,q[i].y);g.closePath();g.fill('evenodd');   // what is NOT paper is darkened = what the crop throws away
-  g.lineWidth=3*d;g.lineJoin='round';g.strokeStyle=good?'#3ddc84':'#ffd166';g.beginPath();g.moveTo(q[0].x,q[0].y);for(let i=1;i<4;i++)g.lineTo(q[i].x,q[i].y);g.closePath();g.stroke();
-  g.fillStyle=g.strokeStyle;for(const p of q){g.beginPath();g.arc(p.x,p.y,6*d,0,7);g.fill();}
-  const cx=q.reduce((a,p)=>a+p.x,0)/4,cy=q.reduce((a,p)=>a+p.y,0)/4;aligned=Math.hypot(cx-W/2,cy-H/2)<0.07*Math.min(W,H);
-  g.strokeStyle=aligned?'#3ddc84':'#ffd166';g.lineWidth=2.5*d;g.beginPath();g.arc(cx,cy,9*d,0,7);g.stroke();}                     // where the middle of the paper is now
- if(camTap&&Date.now()-camTap.t<1100){const x=camTap.x*W,y=camTap.y*H,r=30*d;g.strokeStyle='#fff';g.lineWidth=2.5*d;g.strokeRect(x-r,y-r,2*r,2*r);}}
+function camDraw(){const o=$('camO'),g=o.getContext('2d'),W=o.width,H=o.height,d=DPR(),G=camGeo();g.clearRect(0,0,W,H);
+ const good=!!(camQ&&camGood);$('camShot').classList.toggle('ready',good);
+ if(camQ){const q=camQ.map(p=>camScr(G,p)),col=good?'#3ddc84':'#ffd166';
+  g.fillStyle='rgba(0,0,0,.45)';g.beginPath();g.rect(0,0,W,H);g.moveTo(q[0].x,q[0].y);for(let i=3;i>=0;i--)g.lineTo(q[i].x,q[i].y);g.closePath();g.fill('evenodd');   // what is NOT paper is darkened = what the crop throws away
+  g.beginPath();q.forEach((p,i)=>i?g.lineTo(p.x,p.y):g.moveTo(p.x,p.y));g.closePath();g.fillStyle=good?'rgba(61,220,132,.13)':'rgba(255,209,102,.08)';g.fill();
+  g.lineJoin='round';g.lineCap='round';g.strokeStyle=col;g.globalAlpha=.9;g.lineWidth=1.6*d;g.stroke();g.globalAlpha=1;
+  g.lineWidth=5*d;for(let i=0;i<4;i++){const p=q[i],a=q[(i+1)%4],b=q[(i+3)%4],L=Math.min(34*d,0.22*Math.hypot(a.x-p.x,a.y-p.y),0.22*Math.hypot(b.x-p.x,b.y-p.y));   // a bracket on every corner
+   const u=(t)=>{const l=Math.hypot(t.x-p.x,t.y-p.y)||1;return {x:(t.x-p.x)/l*L,y:(t.y-p.y)/l*L};},ua=u(a),ub=u(b);
+   g.beginPath();g.moveTo(p.x+ua.x,p.y+ua.y);g.lineTo(p.x,p.y);g.lineTo(p.x+ub.x,p.y+ub.y);g.stroke();}}
+ if(camTap&&Date.now()-camTap.t<1100){const x=camTap.x*W,y=camTap.y*H,r=32*d;g.strokeStyle='#fff';g.lineWidth=2*d;g.beginPath();g.roundRect?g.roundRect(x-r,y-r,2*r,2*r,10*d):g.rect(x-r,y-r,2*r,2*r);g.stroke();}}
 
 const camAutoOn=()=>{try{return localStorage.getItem('autocap')==='1';}catch(e){return false;}};
-function camAutoUi(){$('camAuto').textContent='Auto capture: '+(camAutoOn()?'on':'off');$('camAuto').style.color=camAutoOn()?'#3ddc84':'';}
-$('camAuto').onclick=()=>{try{localStorage.setItem('autocap',camAutoOn()?'0':'1');}catch(e){}camAutoUi();};camAutoUi();
+function camAutoUi(){$('camAuto').classList.toggle('on',camAutoOn());}
+$('camAuto').onclick=()=>{try{localStorage.setItem('autocap',camAutoOn()?'0':'1');}catch(e){}camAutoUi();toast(camAutoOn()?'Auto capture on: it takes the photo when the page is steady':'Auto capture off',false,1800);};camAutoUi();
 
 // ---------- pages stay on the phone (reload / lost connection safe) and the app shell is cached: only SENDING needs the computer
 const IDBN='if-pages';
