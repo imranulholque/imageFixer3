@@ -8,6 +8,7 @@ import os
 import re
 import secrets
 import socket
+import ssl
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -46,6 +47,38 @@ def local_ip():
         except ValueError:
             pass
     return None
+
+
+def _cert_files(ips):
+    """Self-signed certificate for the local addresses (made once, kept in %APPDATA%\\ImageFixer). Needs the 'cryptography' package.
+    The phone shows a one-time warning for it; after 'Proceed' the browser treats the page as secure, so the live camera works."""
+    import datetime
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+    d = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "ImageFixer")
+    os.makedirs(d, exist_ok=True)
+    crt, key, meta = (os.path.join(d, n) for n in ("phone_cert.pem", "phone_key.pem", "phone_cert.ips"))
+    want = ",".join(sorted(set(ips)))
+    try:
+        if os.path.exists(crt) and os.path.exists(key) and open(meta).read() == want:
+            c = x509.load_pem_x509_certificate(open(crt, "rb").read())
+            if c.not_valid_after > datetime.datetime.utcnow() + datetime.timedelta(days=30):
+                return crt, key
+    except Exception:
+        pass
+    k = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Image Fixer")])
+    san = [x509.DNSName("localhost")] + [x509.IPAddress(ipaddress.ip_address(i)) for i in ips]
+    now = datetime.datetime.utcnow()
+    c = (x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(k.public_key()).serial_number(x509.random_serial_number())
+         .not_valid_before(now - datetime.timedelta(days=1)).not_valid_after(now + datetime.timedelta(days=800))
+         .add_extension(x509.SubjectAlternativeName(san), critical=False).sign(k, hashes.SHA256()))
+    open(key, "wb").write(k.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL, serialization.NoEncryption()))
+    open(crt, "wb").write(c.public_bytes(serialization.Encoding.PEM))
+    open(meta, "w").write(want)
+    return crt, key
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -446,9 +479,43 @@ class PhoneServer(QObject):
         self.httpd.owner = self
         self.port = self.httpd.server_address[1]
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self._start_https()
         return True
 
+    def _start_https(self):
+        """A second, https door on the next port for the QR code: the phone's browser only opens the camera on a secure page.
+        The plain http door stays (the internet tunnel uses it)."""
+        self.sport, self.https = 0, None
+        ip = local_ip()
+        if ip is None:
+            return
+        try:
+            crt, key = _cert_files([ip, "127.0.0.1"])
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(crt, key)
+            for port in (self.port + 1, 0):
+                try:
+                    h = _Server(("0.0.0.0", port), _Handler)
+                    break
+                except OSError:
+                    h = None
+            if h is None:
+                return
+            h.socket = ctx.wrap_socket(h.socket, server_side=True)
+            h.token, h.owner = self.token, self
+            self.https, self.sport = h, h.server_address[1]
+            threading.Thread(target=h.serve_forever, daemon=True).start()
+        except Exception:
+            self.https, self.sport = None, 0                 # no 'cryptography' / no certificate: the plain http link is used
+
     def stop(self):
+        if getattr(self, "https", None) is not None:
+            try:
+                self.https.shutdown()
+                self.https.server_close()
+            except Exception:
+                pass
+            self.https = None
         if self.httpd is not None:
             try:
                 self.httpd.shutdown()
@@ -462,7 +529,11 @@ class PhoneServer(QObject):
 
     def url(self):
         ip = local_ip()
-        return None if ip is None or not self.running() else "http://%s:%d" % (ip, self.port)
+        if ip is None or not self.running():
+            return None
+        if getattr(self, "sport", 0):
+            return "https://%s:%d" % (ip, self.sport)       # secure page: the live camera works
+        return "http://%s:%d" % (ip, self.port)
 
     def link_for(self, base):
         """Same secret link behind another address (the internet tunnel)."""
