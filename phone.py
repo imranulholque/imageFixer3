@@ -152,6 +152,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._json({"ok": True})
         elif route == "/sw.js":                         # keeps the scanner page on the phone: it opens again even without a connection
             self._send(200, SW_JS, "application/javascript; charset=utf-8")
+        elif route == "/engine.js":                     # the scanner engine (runs in a background worker on the phone)
+            self._send(200, ENGINE_JS, "application/javascript; charset=utf-8")
         elif route == "/manifest.webmanifest":
             self._send(200, MANIFEST, "application/manifest+json; charset=utf-8")
         elif route == "/icon.svg":
@@ -575,8 +577,8 @@ class PhoneServer(QObject):
         return {"stored": len(b["files"]), "done": done}
 
 
-SW_JS = r"""const C='if-shell-v1';
-self.addEventListener('install',e=>{self.skipWaiting();e.waitUntil(caches.open(C).then(c=>c.addAll([self.registration.scope,'manifest.webmanifest','icon.svg'])).catch(()=>{}));});
+SW_JS = r"""const C='if-shell-v2';
+self.addEventListener('install',e=>{self.skipWaiting();e.waitUntil(caches.open(C).then(c=>c.addAll([self.registration.scope,'manifest.webmanifest','icon.svg','engine.js'])).catch(()=>{}));});
 self.addEventListener('activate',e=>e.waitUntil(caches.keys().then(k=>Promise.all(k.filter(x=>x!==C).map(x=>caches.delete(x)))).then(()=>self.clients.claim())));
 self.addEventListener('fetch',e=>{const r=e.request,u=new URL(r.url);
  if(r.method!=='GET'||u.origin!==location.origin||u.pathname.indexOf('/api/')>=0)return;
@@ -595,6 +597,240 @@ ICON_SVG = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><defs
             'M362 322v30a20 20 0 0 1-20 20h-30M200 372h-30a20 20 0 0 1-20-20v-30" fill="none" stroke="#fff" stroke-width="28" stroke-linecap="round"/>'
             '<rect x="196" y="204" width="120" height="104" rx="10" fill="#fff"/></svg>')
 
+
+ENGINE_JS = r"""// Image Fixer scanner engine: finds the paper, cuts it out, cleans it.
+// Runs in a background Web Worker (the phone screen never freezes); if the browser cannot, the same code runs on the page.
+(function(G){
+const IS_W=typeof document==='undefined';
+const mkC=()=>IS_W?new OffscreenCanvas(1,1):document.createElement('canvas');
+const bw=b=>b.width||b.naturalWidth, bh=b=>b.height||b.naturalHeight;
+// ======================= finding the paper (pure functions on pixel data: used by the live camera AND by the photo)
+function blurF(a,w,h,r){ // box blur, Float32Array
+ const t=new Float32Array(a.length),o=new Float32Array(a.length),k=2*r+1;
+ for(let y=0;y<h;y++){let s=0;const row=y*w;for(let i=-r;i<=r;i++)s+=a[row+Math.min(w-1,Math.max(0,i))];
+  for(let x=0;x<w;x++){t[row+x]=s/k;s+=a[row+Math.min(w-1,x+r+1)]-a[row+Math.max(0,x-r)];}}
+ for(let x=0;x<w;x++){let s=0;for(let i=-r;i<=r;i++)s+=t[Math.min(h-1,Math.max(0,i))*w+x];
+  for(let y=0;y<h;y++){o[y*w+x]=s/k;s+=t[Math.min(h-1,y+r+1)*w+x]-t[Math.max(0,y-r)*w+x];}}
+ return o;}
+function otsu(v){const n=v.length,hist=new Float64Array(256);for(let i=0;i<n;i++)hist[v[i]]++;let sum=0;for(let i=0;i<256;i++)sum+=i*hist[i];
+ let wB=0,sB=0,best=-1,th=127;for(let t=0;t<256;t++){wB+=hist[t];if(!wB)continue;const wF=n-wB;if(!wF)break;sB+=t*hist[t];
+  const mB=sB/wB,mF=(sum-sB)/wF,q=wB*wF*(mB-mF)*(mB-mF);if(q>best){best=q;th=t;}}return th;}
+function bigBlob(mask,w,h){ // biggest 4-connected blob -> {lab:Uint8Array, n}
+ const seen=new Uint8Array(w*h),st=new Int32Array(w*h);let bestStart=-1,bestN=0;
+ for(let s=0;s<w*h;s++){if(!mask[s]||seen[s])continue;let sp=0,n=0;st[sp++]=s;seen[s]=1;
+  while(sp){const p=st[--sp];n++;const x=p%w,y=(p-x)/w;
+   if(x>0&&mask[p-1]&&!seen[p-1]){seen[p-1]=1;st[sp++]=p-1;}if(x<w-1&&mask[p+1]&&!seen[p+1]){seen[p+1]=1;st[sp++]=p+1;}
+   if(y>0&&mask[p-w]&&!seen[p-w]){seen[p-w]=1;st[sp++]=p-w;}if(y<h-1&&mask[p+w]&&!seen[p+w]){seen[p+w]=1;st[sp++]=p+w;}}
+  if(n>bestN){bestN=n;bestStart=s;}}
+ if(bestStart<0)return null;const lab=new Uint8Array(w*h),st2=[bestStart];lab[bestStart]=1;
+ while(st2.length){const p=st2.pop(),x=p%w,y=(p-x)/w;
+  if(x>0&&mask[p-1]&&!lab[p-1]){lab[p-1]=1;st2.push(p-1);}if(x<w-1&&mask[p+1]&&!lab[p+1]){lab[p+1]=1;st2.push(p+1);}
+  if(y>0&&mask[p-w]&&!lab[p-w]){lab[p-w]=1;st2.push(p-w);}if(y<h-1&&mask[p+w]&&!lab[p+w]){lab[p+w]=1;st2.push(p+w);}}
+ return {lab,n:bestN};}
+function polyArea(q){let a=0;for(let i=0;i<q.length;i++){const p=q[i],r=q[(i+1)%q.length];a+=p.x*r.y-r.x*p.y;}return Math.abs(a)/2;}
+function hullOf(pts){ // convex hull (monotone chain)
+ pts=pts.slice().sort((a,b)=>a.x-b.x||a.y-b.y);const cr=(o,a,b)=>(a.x-o.x)*(b.y-o.y)-(a.y-o.y)*(b.x-o.x);
+ const lo=[];for(const p of pts){while(lo.length>=2&&cr(lo[lo.length-2],lo[lo.length-1],p)<=0)lo.pop();lo.push(p);}
+ const up=[];for(let i=pts.length-1;i>=0;i--){const p=pts[i];while(up.length>=2&&cr(up[up.length-2],up[up.length-1],p)<=0)up.pop();up.push(p);}
+ lo.pop();up.pop();return lo.concat(up);}
+function lineX(p0,p1,p2,p3){ // intersection of line p0p1 with line p2p3 -> {x,y,t,s} (t along p0p1, s along p2p3) or null
+ const d1x=p1.x-p0.x,d1y=p1.y-p0.y,d2x=p3.x-p2.x,d2y=p3.y-p2.y,den=d1x*d2y-d1y*d2x;if(Math.abs(den)<1e-9)return null;
+ const t=((p2.x-p0.x)*d2y-(p2.y-p0.y)*d2x)/den,s=((p2.x-p0.x)*d1y-(p2.y-p0.y)*d1x)/den;return {x:p0.x+t*d1x,y:p0.y+t*d1y,t,s};}
+function quadFromHull(h){ // smallest enclosing 4-gon: drop the hull edge whose removal adds the least area (neighbours are extended)
+ let P=h.slice();
+ while(P.length>4){const n=P.length;let bi=-1,ba=1e30,bx=null;
+  for(let i=0;i<n;i++){const p0=P[(i-1+n)%n],p1=P[i],p2=P[(i+1)%n],p3=P[(i+2)%n],X=lineX(p0,p1,p3,p2);
+   if(!X||X.t<=1||X.s<=1)continue;const a=Math.abs((p1.x-X.x)*(p2.y-X.y)-(p1.y-X.y)*(p2.x-X.x))/2;if(a<ba){ba=a;bi=i;bx={x:X.x,y:X.y};}}
+  if(bi<0){let m=1e30,mi=0;for(let i=0;i<n;i++){const a=polyArea([P[(i-1+n)%n],P[i],P[(i+1)%n]]);if(a<m){m=a;mi=i;}}P.splice(mi,1);continue;}
+  const j=(bi+1)%n;P[bi]=bx;P.splice(j,1);}
+ return P;}
+function orderQuad(q){ // -> TL,TR,BR,BL
+ const s=q.map(p=>p.x+p.y),d=q.map(p=>p.x-p.y);let tl=0,br=0,tr=0,bl=0;
+ for(let i=1;i<4;i++){if(s[i]<s[tl])tl=i;if(s[i]>s[br])br=i;if(d[i]>d[tr])tr=i;if(d[i]<d[bl])bl=i;}
+ const set=new Set([tl,br,tr,bl]);if(set.size<4){const c={x:q.reduce((a,p)=>a+p.x,0)/4,y:q.reduce((a,p)=>a+p.y,0)/4};
+  const o=q.slice().sort((a,b)=>Math.atan2(a.y-c.y,a.x-c.x)-Math.atan2(b.y-c.y,b.x-c.x));let k=0;for(let i=1;i<4;i++)if(o[i].x+o[i].y<o[k].x+o[k].y)k=i;return [o[k],o[(k+1)%4],o[(k+2)%4],o[(k+3)%4]];}
+ return [q[tl],q[tr],q[br],q[bl]];}
+
+// coarse finder: several colour / brightness masks on a small picture -> paper-like blobs -> enclosing 4-gons; the best one is the one
+// whose 4 sides all have a real colour step across them (this is what keeps it away from a printed frame, a red box, a hand ...)
+function sideContrast(chb,w,h,q){
+ const smp=(x,y,c)=>{x=x<0?0:x>w-1.001?w-1.001:x;y=y<0?0:y>h-1.001?h-1.001:y;const x0=x|0,y0=y|0,fx=x-x0,fy=y-y0,i=y0*w+x0,a=chb[c];
+  return (a[i]*(1-fx)+a[i+1]*fx)*(1-fy)+(a[i+w]*(1-fx)+a[i+w+1]*fx)*fy;};
+ const cen={x:q.reduce((a,p)=>a+p.x,0)/4,y:q.reduce((a,p)=>a+p.y,0)/4},sides=[],off=Math.max(2.5,0.009*Math.max(w,h));
+ for(let i=0;i<4;i++){const a=q[i],b=q[(i+1)%4],L=Math.hypot(b.x-a.x,b.y-a.y)||1,ux=(b.x-a.x)/L,uy=(b.y-a.y)/L;let nx=uy,ny=-ux;
+  if(nx*((a.x+b.x)/2-cen.x)+ny*((a.y+b.y)/2-cen.y)<0){nx=-nx;ny=-ny;}
+  const K=24,E=[];for(let k=0;k<K;k++){const s=0.1+0.8*(k+0.5)/K,px=a.x+ux*s*L,py=a.y+uy*s*L;let best=0;
+   for(const sh of [-1.5,0,1.5]){let e=0;for(let c=0;c<3;c++){const df=smp(px+nx*(off+sh),py+ny*(off+sh),c)-smp(px-nx*(off-sh),py-ny*(off-sh),c);e+=df*df;}best=Math.max(best,Math.sqrt(e));}E.push(best);}
+  E.sort((x,y)=>x-y);sides.push(E[E.length>>1]);}
+ return 0.5*(sides.reduce((a,v)=>a+v,0)/4)+0.5*Math.min(...sides);}
+function coarseCands(d,w,h){
+ const N=w*h,L=new Float32Array(N);for(let i=0;i<N;i++)L[i]=0.299*d[4*i]+0.587*d[4*i+1]+0.114*d[4*i+2];
+ const Lb=blurF(blurF(L,w,h,2),w,h,2),u1=new Uint8Array(N);for(let i=0;i<N;i++)u1[i]=Lb[i];
+ const chb=[0,1,2].map(c=>{const a=new Float32Array(N);for(let i=0;i<N;i++)a[i]=d[4*i+c];return blurF(a,w,h,1);});
+ const dist=(cr,cg,cb)=>{const D=new Float32Array(N);for(let i=0;i<N;i++)D[i]=Math.hypot(d[4*i]-cr,d[4*i+1]-cg,d[4*i+2]-cb);
+  const Db=blurF(blurF(D,w,h,2),w,h,2),u=new Uint8Array(N);for(let i=0;i<N;i++)u[i]=Math.min(255,Db[i]*1.3);return u;};
+ let br=0,bg=0,bb=0,bn=0;const m=Math.max(2,Math.round(Math.min(w,h)*0.03));
+ for(let y=0;y<h;y++)for(let x=0;x<w;x++){if(x<m||y<m||x>=w-m||y>=h-m){const i=4*(y*w+x);br+=d[i];bg+=d[i+1];bb+=d[i+2];bn++;}}
+ const u2=dist(br/bn,bg/bn,bb/bn);
+ // the paper's own colour = the middle of the picture (median of a small patch, so a few letters do not matter)
+ const px0=Math.round(w*0.42),px1=Math.round(w*0.58),py0=Math.round(h*0.42),py1=Math.round(h*0.58),R=[],G=[],B=[];
+ for(let y=py0;y<py1;y++)for(let x=px0;x<px1;x++){const i=4*(y*w+x);R.push(d[i]);G.push(d[i+1]);B.push(d[i+2]);}
+ const med=a=>{a.sort((x,y)=>x-y);return a[a.length>>1];};
+ const u4=dist(med(R),med(G),med(B));                       // small = like the paper
+ const t1=otsu(u1),t2=otsu(u2),t4=otsu(u4),masks=[],pm=new Uint8Array(N);
+ const mk=f=>{const a=new Uint8Array(N);for(let i=0;i<N;i++)a[i]=f(i)?1:0;return a;};
+ masks.push(mk(i=>u2[i]>t2),mk(i=>u1[i]>t1&&u2[i]>t2*0.7),mk(i=>u1[i]>t1),mk(i=>u4[i]<t4),mk(i=>u4[i]<t4*0.6));
+ const cands=[];
+ for(const mkm of masks){
+  let a=new Float32Array(N);for(let i=0;i<N;i++)a[i]=mkm[i];
+  a=blurF(a,w,h,3);const c1=new Uint8Array(N);for(let i=0;i<N;i++)c1[i]=a[i]>0.4?1:0;
+  a=new Float32Array(N);for(let i=0;i<N;i++)a[i]=c1[i];a=blurF(a,w,h,3);const c2=new Uint8Array(N);for(let i=0;i<N;i++)c2[i]=a[i]>0.6?1:0;
+  const bl=bigBlob(c2,w,h);if(!bl)continue;const frac=bl.n/N;if(frac<0.08||frac>0.985)continue;
+  const pts=[];let cx=0,cy=0;
+  for(let y=0;y<h;y++)for(let x=0;x<w;x++){const p=y*w+x;if(!bl.lab[p])continue;cx+=x;cy+=y;
+   const edge=x===0||y===0||x===w-1||y===h-1||!bl.lab[p-1]||!bl.lab[p+1]||!bl.lab[p-w]||!bl.lab[p+w];if(edge)pts.push({x:x+0.5,y:y+0.5});}
+  if(pts.length<8)continue;const hull=hullOf(pts);if(hull.length<4)continue;const q=orderQuad(quadFromHull(hull));
+  const area=Math.max(1,polyArea(q)),fill=bl.n/area;cx/=bl.n;cy/=bl.n;if(fill<0.7||fill>1.25)continue;
+  const centre=1-0.5*Math.hypot(cx-w/2,cy-h/2)/Math.hypot(w/2,h/2),con=sideContrast(chb,w,h,q);
+  cands.push({q,fill,frac,score:con*Math.sqrt(frac)*Math.sqrt(centre)*Math.min(1,fill),con});}
+ return cands;}
+function coarseQuad(d,w,h){const c=coarseCands(d,w,h);if(!c.length)return null;c.sort((a,b)=>b.score-a.score);return c[0];}
+
+// straight-edge refinement: every side of the outline is moved onto the real edge in the picture (many samples + a robust line fit),
+// the corners are the meeting points of the 4 fitted lines -> straight sides, exact corners, no wobble.
+function refineQuad(d,w,h,q0,rounds){
+ const N=w*h,ch=[new Float32Array(N),new Float32Array(N),new Float32Array(N)];
+ for(let c=0;c<3;c++){const a=new Float32Array(N);for(let i=0;i<N;i++)a[i]=d[4*i+c];ch[c]=blurF(a,w,h,1);}
+ const smp=(x,y,c)=>{x=x<0?0:x>w-1.001?w-1.001:x;y=y<0?0:y>h-1.001?h-1.001:y;const x0=x|0,y0=y|0,fx=x-x0,fy=y-y0,i=y0*w+x0,a=ch[c];
+  return (a[i]*(1-fx)+a[i+1]*fx)*(1-fy)+(a[i+w]*(1-fx)+a[i+w+1]*fx)*fy;};
+ let q=q0.map(p=>({x:p.x,y:p.y})),band=Math.max(6,0.03*Math.max(w,h)),moved=0;
+ for(let r=0;r<(rounds||2);r++){
+  const cen={x:q.reduce((a,p)=>a+p.x,0)/4,y:q.reduce((a,p)=>a+p.y,0)/4},lines=[];
+  for(let i=0;i<4;i++){
+   const a=q[i],b=q[(i+1)%4],L=Math.hypot(b.x-a.x,b.y-a.y)||1,ux=(b.x-a.x)/L,uy=(b.y-a.y)/L;let nx=uy,ny=-ux;
+   const mx=(a.x+b.x)/2-cen.x,my=(a.y+b.y)/2-cen.y;if(nx*mx+ny*my<0){nx=-nx;ny=-ny;}
+   const K=Math.max(12,Math.min(90,Math.round(L/5))),P=[],E=[];
+   for(let k=0;k<K;k++){const s=0.06+0.88*(k+0.5)/K,px=a.x+ux*s*L,py=a.y+uy*s*L;
+    const prof=[],ts=[];let mxv=0;
+    for(let t=-band;t<=band;t+=0.5){
+     const xa=px+nx*(t+1.5),ya=py+ny*(t+1.5),xb=px+nx*(t-1.5),yb=py+ny*(t-1.5);
+     let e=0;for(let c=0;c<3;c++){const df=smp(xa,ya,c)-smp(xb,yb,c);e+=df*df;}e=Math.sqrt(e);prof.push(e);ts.push(t);if(e>mxv)mxv=e;}
+    // the OUTERMOST strong edge wins (a printed frame / header line inside the page is not the page edge)
+    let bt=0,bi=-1;for(let j=prof.length-2;j>=1;j--){if(prof[j]>=0.55*mxv&&prof[j]>=prof[j-1]&&prof[j]>=prof[j+1]){bi=j;break;}}
+    if(bi<0){let m0=-1;for(let j=0;j<prof.length;j++)if(prof[j]>m0){m0=prof[j];bi=j;}}bt=ts[bi];
+    P.push({x:px+nx*bt,y:py+ny*bt});E.push(mxv);}
+   const sorted=E.slice().sort((x,y)=>x-y),med=sorted[sorted.length>>1];
+   let use=P.filter((p,k)=>E[k]>=Math.max(5,0.5*med));
+   let ln=null;
+   if(use.length>=Math.max(6,K*0.35)){
+    for(let it=0;it<4;it++){
+     let mx2=0,my2=0;for(const p of use){mx2+=p.x;my2+=p.y;}mx2/=use.length;my2/=use.length;
+     let sxx=0,sxy=0,syy=0;for(const p of use){const dx=p.x-mx2,dy=p.y-my2;sxx+=dx*dx;sxy+=dx*dy;syy+=dy*dy;}
+     const th=0.5*Math.atan2(2*sxy,sxx-syy),dx=Math.cos(th),dy=Math.sin(th);
+     const res=use.map(p=>Math.abs((p.x-mx2)*(-dy)+(p.y-my2)*dx)),rs=res.slice().sort((x,y)=>x-y),mr=rs[rs.length>>1];
+     ln={x:mx2,y:my2,dx,dy,n:use.length,res:mr};
+     const lim=Math.max(1.0,2.5*mr),keep=use.filter((p,k)=>res[k]<=lim);if(keep.length<Math.max(6,K*0.3)||keep.length===use.length)break;use=keep;}
+    if(ln.n<Math.max(6,K*0.3))ln=null;}
+   lines.push(ln||{x:a.x,y:a.y,dx:ux,dy:uy,n:0,res:0,weak:true});}
+  const nq=[];let ok=true;
+  for(let i=0;i<4;i++){const l1=lines[(i+3)%4],l2=lines[i],X=lineX({x:l1.x,y:l1.y},{x:l1.x+l1.dx,y:l1.y+l1.dy},{x:l2.x,y:l2.y},{x:l2.x+l2.dx,y:l2.y+l2.dy});
+   if(!X||Math.hypot(X.x-q[i].x,X.y-q[i].y)>band*2.2+0.02*Math.max(w,h)){ok=false;break;}nq.push({x:X.x,y:X.y});}
+  if(!ok||polyArea(nq)<0.6*polyArea(q))break;q=nq;moved++;band=Math.max(2.5,band*0.4);}
+ return {quad:q,moved};}
+
+// d = RGBA of the picture (any size). Returns {quad:[TL,TR,BR,BL] in this picture's pixels, found}
+function findPaper(d,W,H,small,smW,smH,opt){ // small = the same picture scaled down for the coarse step (RGBA, smW x smH)
+ const best=coarseQuad(small,smW,smH),k=W/smW;
+ if(!best){const mm=0.04;return {quad:[[mm,mm],[1-mm,mm],[1-mm,1-mm],[mm,1-mm]].map(p=>({x:p[0]*W,y:p[1]*H})),found:false};}
+ let q=best.q.map(p=>({x:p.x*k,y:p.y*k}));
+ let found=best.fill>0.82&&best.frac>0.15;
+ if(!(opt&&opt.noRefine)){try{const r=refineQuad(d,W,H,q,(opt&&opt.rounds)||3);if(r.moved)q=r.quad;}catch(e){}}
+ q=orderQuad(q).map(p=>({x:Math.max(0,Math.min(W,p.x)),y:Math.max(0,Math.min(H,p.y))}));
+ return {quad:q,found};}
+
+function detectLocal(src,live){ // -> {quad:[TL,TR,BR,BL] in src pixels, found}. live = quick version for the camera view
+ const W=bw(src),H=bh(src),mk=(side)=>{const s=Math.min(1,side/Math.max(W,H)),w=Math.max(8,Math.round(W*s)),h=Math.max(8,Math.round(H*s)),c=mkC();
+  c.width=w;c.height=h;const g=c.getContext('2d',{willReadFrequently:true});g.imageSmoothingQuality='high';g.drawImage(src,0,0,w,h);return {w,h,d:g.getImageData(0,0,w,h).data,s};};
+ const sm=mk(live?320:420);
+ if(live){const r=findPaper(sm.d,sm.w,sm.h,sm.d,sm.w,sm.h,{rounds:2});const k=1/sm.s;return {quad:r.quad.map(p=>({x:p.x*k,y:p.y*k})),found:r.found};}
+ const fn=mk(1000),r=findPaper(fn.d,fn.w,fn.h,sm.d,sm.w,sm.h,{rounds:3}),k=1/fn.s;
+ return {quad:r.quad.map(p=>({x:Math.max(0,Math.min(W,p.x*k)),y:Math.max(0,Math.min(H,p.y*k))})),found:r.found};}
+
+// the real proportions of the sheet from its 4 photographed corners (same maths as the computer's straighten): a tilted A4 stays A4
+function sheetRatio(q,W,H){const u0=W/2,v0=H/2,[tl,tr,br,bl]=q,dist=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y);
+ const simple=(dist(tl,tr)+dist(bl,br))/Math.max(1e-6,dist(tl,bl)+dist(tr,br));
+ try{const m1=[tl.x,tl.y,1],m2=[tr.x,tr.y,1],m3=[bl.x,bl.y,1],m4=[br.x,br.y,1];
+  const cr=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]],dt=(a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+  const k2=dt(cr(m1,m4),m3)/dt(cr(m2,m4),m3),k3=dt(cr(m1,m4),m2)/dt(cr(m3,m4),m2);
+  const n2=m2.map((v,i)=>k2*v-m1[i]),n3=m3.map((v,i)=>k3*v-m1[i]),den=n2[2]*n3[2];if(Math.abs(den)<1e-9)return simple;
+  const f2=-((n2[0]*n3[0]-(n2[0]*n3[2]+n2[2]*n3[0])*u0+n2[2]*n3[2]*u0*u0)+(n2[1]*n3[1]-(n2[1]*n3[2]+n2[2]*n3[1])*v0+n2[2]*n3[2]*v0*v0))/den;
+  if(!isFinite(f2)||f2<=0)return simple;const f=Math.sqrt(f2);
+  // M = Ai^T Ai with A=[[f,0,u0],[0,f,v0],[0,0,1]]  ->  Ai=[[1/f,0,-u0/f],[0,1/f,-v0/f],[0,0,1]]
+  const Ai=[[1/f,0,-u0/f],[0,1/f,-v0/f],[0,0,1]],ap=v=>[Ai[0][0]*v[0]+Ai[0][1]*v[1]+Ai[0][2]*v[2],Ai[1][0]*v[0]+Ai[1][1]*v[1]+Ai[1][2]*v[2],v[2]];
+  const a2=ap(n2),a3=ap(n3),r=Math.sqrt(Math.max(1e-12,dt(a2,a2))/Math.max(1e-12,dt(a3,a3)));
+  if(!isFinite(r)||r<0.2||r>5||Math.abs(Math.log(r/simple))>0.45)return simple;return r;}catch(e){return simple;}}
+
+function warpLocal(src,quad,maxSide){ // cut the quad out of src and remove the camera angle -> canvas
+ const [p0,p1,p2,p3]=quad,dist=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y);
+ const w0=Math.max(dist(p0,p1),dist(p3,p2)),h0=Math.max(dist(p0,p3),dist(p1,p2)),ratio=sheetRatio(quad,bw(src),bh(src));let w,h;
+ if(w0/Math.max(h0,1e-6)>ratio){h=h0;w=h0*ratio;if(w<w0){w=w0;h=w0/ratio;}}else{w=w0;h=w0/ratio;if(h<h0){h=h0;w=h0*ratio;}}
+ const k=Math.min(1,maxSide/Math.max(w,h));
+ w=Math.max(8,Math.round(w*k));h=Math.max(8,Math.round(h*k));
+ const sw=bw(src),sh=bh(src),sc=mkC();sc.width=sw;sc.height=sh;const sg=sc.getContext('2d',{willReadFrequently:true});sg.drawImage(src,0,0);
+ const S=sg.getImageData(0,0,sw,sh).data,out=mkC();out.width=w;out.height=h;const og=out.getContext('2d'),O=og.createImageData(w,h),D=O.data;
+ const sx=p0.x-p1.x+p2.x-p3.x,sy=p0.y-p1.y+p2.y-p3.y;let a,b,c,d,e,f,gg=0,hh=0;
+ if(Math.abs(sx)<1e-9&&Math.abs(sy)<1e-9){a=p1.x-p0.x;b=p3.x-p0.x;c=p0.x;d=p1.y-p0.y;e=p3.y-p0.y;f=p0.y;}
+ else{const dx1=p1.x-p2.x,dx2=p3.x-p2.x,dy1=p1.y-p2.y,dy2=p3.y-p2.y,det=dx1*dy2-dx2*dy1;
+  gg=(sx*dy2-dx2*sy)/det;hh=(dx1*sy-sx*dy1)/det;a=p1.x-p0.x+gg*p1.x;b=p3.x-p0.x+hh*p3.x;c=p0.x;d=p1.y-p0.y+gg*p1.y;e=p3.y-p0.y+hh*p3.y;f=p0.y;}
+ const mx=sw-1.001,my=sh-1.001;let o=0;
+ for(let y=0;y<h;y++){const v=(y+0.5)/h;for(let x=0;x<w;x++){const u=(x+0.5)/w,z=gg*u+hh*v+1;
+  let X=(a*u+b*v+c)/z,Y=(d*u+e*v+f)/z;X=X<0?0:X>mx?mx:X;Y=Y<0?0:Y>my?my:Y;
+  const x0=X|0,y0=Y|0,fx=X-x0,fy=Y-y0,i=4*(y0*sw+x0),j=i+4*sw,w00=(1-fx)*(1-fy),w10=fx*(1-fy),w01=(1-fx)*fy,w11=fx*fy;
+  D[o]=S[i]*w00+S[i+4]*w10+S[j]*w01+S[j+4]*w11;D[o+1]=S[i+1]*w00+S[i+5]*w10+S[j+1]*w01+S[j+5]*w11;D[o+2]=S[i+2]*w00+S[i+6]*w10+S[j+2]*w01+S[j+6]*w11;D[o+3]=255;o+=4;}}
+ og.putImageData(O,0,0);return out;}
+
+function lookLocal(src,look){ // 'clean' = white paper + even light (colour kept), 'gray', 'bw'
+ if(look==='orig')return src;const w=src.width,h=src.height,g=src.getContext('2d'),I=g.getImageData(0,0,w,h),D=I.data;
+ const f=8,sw=Math.max(4,Math.ceil(w/f)),sh=Math.max(4,Math.ceil(h/f)),sm=mkC();sm.width=sw;sm.height=sh;
+ const sg=sm.getContext('2d',{willReadFrequently:true});sg.imageSmoothingQuality='high';sg.drawImage(src,0,0,sw,sh);const sd=sg.getImageData(0,0,sw,sh).data;
+ let L=new Float32Array(sw*sh);for(let i=0;i<sw*sh;i++)L[i]=0.299*sd[4*i]+0.587*sd[4*i+1]+0.114*sd[4*i+2];
+ const R=Math.max(2,Math.round(Math.min(sw,sh)*0.035)),M=new Float32Array(sw*sh);          // paper brightness = the brightest nearby (text is darker)
+ const T=new Float32Array(sw*sh);for(let y=0;y<sh;y++)for(let x=0;x<sw;x++){let m=0;for(let i=Math.max(0,x-R);i<=Math.min(sw-1,x+R);i++){const v=L[y*sw+i];if(v>m)m=v;}T[y*sw+x]=m;}
+ for(let y=0;y<sh;y++)for(let x=0;x<sw;x++){let m=0;for(let i=Math.max(0,y-R);i<=Math.min(sh-1,y+R);i++){const v=T[i*sw+x];if(v>m)m=v;}M[y*sw+x]=m;}
+ const B=blurF(blurF(M,sw,sh,R),sw,sh,R);
+ for(let y=0;y<h;y++){const fy=Math.min(sh-1.001,Math.max(0,y/f-0.5)),y0=fy|0,ty=fy-y0;
+  for(let x=0;x<w;x++){const fx=Math.min(sw-1.001,Math.max(0,x/f-0.5)),x0=fx|0,tx=fx-x0,i0=y0*sw+x0;
+   const bg=(B[i0]*(1-tx)+B[i0+1]*tx)*(1-ty)+(B[i0+sw]*(1-tx)+B[i0+sw+1]*tx)*ty,k=255/Math.max(bg,70),o=4*(y*w+x);
+   let r=D[o]*k,gn=D[o+1]*k,b=D[o+2]*k;
+   if(look==='bw'){const l=0.299*r+0.587*gn+0.114*b;let t=(l-150)/45;t=t<0?0:t>1?1:t;t=t*t*(3-2*t)*255;r=gn=b=t;}
+   else{r=(r-22)*1.12;gn=(gn-22)*1.12;b=(b-22)*1.12;if(look==='gray'){const l=0.299*r+0.587*gn+0.114*b;r=gn=b=l;}}
+   D[o]=r;D[o+1]=gn;D[o+2]=b;}}
+ const out=mkC();out.width=w;out.height=h;out.getContext('2d').putImageData(I,0,0);return out;}
+
+
+let WARP=null;
+const toBm=c=>IS_W?createImageBitmap(c):Promise.resolve(c);
+const LOOKS=['orig','clean','gray','bw'];
+const IFE={
+ async live(m){const r=detectLocal(m.bmp,true);if(IS_W&&m.bmp.close)m.bmp.close();return {quad:r.quad,found:r.found};},
+ async find(m){const r=detectLocal(m.bmp);if(IS_W&&m.bmp.close)m.bmp.close();return {quad:r.quad,found:r.found};},
+ async cut(m){ // cut the page out of the photo, keep it here, give back the chosen look + 4 small previews
+  WARP=null;const w=warpLocal(m.bmp,m.quad,m.maxSide);WARP=w;const prevs={};
+  try{const sm=warpLocal(m.bmp,m.quad,170);for(const l of LOOKS)prevs[l]=await toBm(lookLocal(sm,l));}catch(e){}
+  if(IS_W&&m.bmp.close)m.bmp.close();
+  return {res:await toBm(lookLocal(w,m.look)),prevs,w:w.width,h:w.height};},
+ async look(m){if(!WARP)throw new Error('no page');return {res:await toBm(lookLocal(WARP,m.look))};}
+};
+if(IS_W){let ok2d=null;
+ self.onmessage=async e=>{const m=e.data;
+  try{if(ok2d===null)ok2d=!!(new OffscreenCanvas(1,1).getContext('2d'));
+   if(!ok2d){self.postMessage({id:m.id,err:'NOSUP',nosup:true});return;}
+   const r=await IFE[m.op](m),x=[];if(r.res&&r.res.close)x.push(r.res);if(r.prevs)for(const k in r.prevs)if(r.prevs[k]&&r.prevs[k].close)x.push(r.prevs[k]);
+   r.id=m.id;self.postMessage(r,x);}
+  catch(err){self.postMessage({id:m.id,err:String(err&&err.message||err)});}};}
+else G.IFE=IFE;
+})(self);
+"""
 
 PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
@@ -782,7 +1018,7 @@ svg{width:26px;height:26px;fill:none;stroke:currentColor;stroke-width:2;stroke-l
 <div id="viewer"><img id="vimg"></div>
 <script>
 const $=id=>document.getElementById(id), base=location.pathname.replace(/\/$/,'');
-const TUN=/^\/s\//.test(location.pathname), MAXSIDE=TUN?2400:3000, OUTSIDE=TUN?2000:2600, JQ=0.9;   // the page that is sent is a bit smaller over the internet link
+const TUN=/^\/s\//.test(location.pathname), MAXSIDE=TUN?2000:2400, OUTSIDE=TUN?1800:2200, JQ=0.88;   // the page that is sent is a bit smaller over the internet link
 let pages=[], retake=-1, cur=null, busy=false, sentLog=[], tt=0, seq=0, lastOk=Date.now(), active=0;
 const DPR=()=>Math.min(window.devicePixelRatio||1,2.5);
 const LOOKNAME={orig:'Original',clean:'Clean',gray:'Gray',bw:'Black & white'};
@@ -808,7 +1044,8 @@ function ok(){fails=0;$('dot').className='on';$('st').textContent='connected to 
 
 // ---- images: decode once, rotate on the GPU canvas (no JPEG encode / decode, no computer needed)
 function loadImg(src){return new Promise((res,no)=>{const i=new Image();i.onload=()=>res(i);i.onerror=no;i.src=src;});}
-const toBlob=(c,q)=>new Promise(r=>c.toBlob(r,'image/jpeg',q||0.92));
+const toBlob=(c,q)=>new Promise(r=>{if(c.toBlob){c.toBlob(r,'image/jpeg',q||0.92);return;}   // an ImageBitmap (from the worker) goes through a canvas
+ const k=document.createElement('canvas');k.width=bw(c);k.height=bh(c);k.getContext('2d').drawImage(c,0,0);k.toBlob(r,'image/jpeg',q||0.92);});
 async function decode(blobOrFile){
  try{return await createImageBitmap(blobOrFile,{imageOrientation:'from-image'});}catch(e){}
  const u=URL.createObjectURL(blobOrFile);try{return await loadImg(u);}finally{setTimeout(()=>URL.revokeObjectURL(u),3000);}}
@@ -848,28 +1085,34 @@ function openCam(){if(LIVE())openLive();else nativeCam();}
 $('bScan').onclick=()=>{retake=-1;openCam();};
 $('bGal').onclick=()=>{retake=-1;$('fGal').value='';$('fGal').click();};
 $('fCam').onchange=e=>gotPhoto(e.target.files[0]);$('fGal').onchange=e=>gotPhoto(e.target.files[0]);
-// the photo goes to the computer ONCE (it keeps it, tagged with an id); after that only a few numbers travel
-async function getBlob(){if(!cur.blob)cur.blob=await cur.blobP;return cur.blob;}
-async function detect(){
- const url='/api/detect?sr='+cur.sr+(cur.id?'&id='+cur.id:'');
- let r=await api(url,{method:'POST',body:cur.id?undefined:await getBlob()});
- if(r.status===410){cur.id=null;r=await api('/api/detect?sr='+cur.sr,{method:'POST',body:await getBlob()});}
- const j=await r.json();if(!j.ok)throw new Error(j.error);cur.id=j.id;ok();return j;}
+// the computer gets only a SMALL copy of the photo (1400 px is plenty for its finder) and only once; after that just an id
+function detSrc(o){const s=Math.min(1,1400/Math.max(o.w,o.h)),c=smallCanvas(o.view,Math.round(o.w*s),Math.round(o.h*s));return toBlob(c,0.85).then(b=>({b,w:c.width}));}
+async function detect(me){
+ const d=await(me.dp||(me.dp=detSrc(me)));
+ let r=await api('/api/detect?sr=0'+(me.id?'&id='+me.id:''),{method:'POST',body:me.id?undefined:d.b});
+ if(r.status===410){me.id=null;r=await api('/api/detect?sr=0',{method:'POST',body:d.b});}
+ const j=await r.json();if(!j.ok)throw new Error(j.error);me.id=j.id;ok();return j;}
 async function gotPhoto(f){if(!f)return;
- const my=++seq;toast('Opening the photo ...',false,60000);prog(true);
- try{const s=await shrink(f,MAXSIDE),o={blob:null,base:s.bmp,sr:0,view:s.bmp,w:bw(s.bmp),h:bh(s.bmp),quad:null,id:null,look:'clean',rot:0,res:null};
+ toast('Opening the photo ...',false,60000);prog(true);
+ try{const s=await shrink(f,MAXSIDE),o={blob:null,base:s.bmp,sr:0,view:s.bmp,w:bw(s.bmp),h:bh(s.bmp),quad:null,id:null,dp:null,look:'clean',rot:0,res:null,warp:false};
   o.blobP=toBlob(s.bmp,JQ);cur=o;toast('');prog(false);
-  show('edit');$('tip').textContent='';await raf();layout();           // the photo is on screen first, the computer looks for the paper after
-  findHere();                                                         // the paper is found right here on the phone: no waiting
+  show('edit');$('tip').textContent='';await raf();layout();           // the photo is on screen first, then the paper is looked for
+  findHere();
  }catch(err){prog(false);toast('Could not open this photo.',true);}}
-function findHere(){const r=detectLocal(cur.view);cur.quad=r.quad;cur.touched=false;setTip(r.found);draw();refine();}
-async function refine(){ // the computer's finder (same as PC Auto crop) replaces the quick local guess when it arrives (if the corners were not touched)
- const me=cur,sr=cur.sr;   // the computer's finder (same as the PC's Auto crop) is the main answer, on Wi-Fi AND over the internet link; the quick local guess above only shows until it arrives
- try{const j=await detect();if(cur!==me||me.sr!==sr||me.touched)return;me.quad=j.quad.map(p=>({x:p[0],y:p[1]}));setTip(j.found);draw();}catch(e){}}
+function findHere(){const me=cur,sr=me.sr,w=me.w,h=me.h,s=Math.min(1,1000/Math.max(w,h));me.touched=false;
+ if(!me.quad){const m=0.04;me.quad=[{x:w*m,y:h*m},{x:w*(1-m),y:h*m},{x:w*(1-m),y:h*(1-m)},{x:w*m,y:h*(1-m)}];}
+ draw();$('eWait').classList.add('on');
+ heavy('find',asW=>asPic(smallCanvas(me.view,Math.max(8,Math.round(w*s)),Math.max(8,Math.round(h*s))),asW))
+ .then(r=>{if(cur!==me||me.sr!==sr||me.touched)return;me.quad=r.quad.map(p=>({x:p.x/s,y:p.y/s}));setTip(r.found);draw();refine();})
+ .catch(()=>{if(cur===me)setTip(false);})
+ .then(()=>{if(cur===me)$('eWait').classList.remove('on');});}
+async function refine(){ // the computer's finder (OpenCV, same as the PC's Auto crop) refines the quick guess when it arrives (if the corners were not touched)
+ const me=cur,sr=cur.sr;
+ try{const j=await detect(me);if(cur!==me||me.sr!==sr||me.touched)return;const k=me.w/j.w;me.quad=j.quad.map(p=>({x:p[0]*k,y:p[1]*k}));setTip(j.found);draw();}catch(e){}}
 function setTip(found){$('tip').textContent=found?'Paper found. Drag a round corner or a square side if the outline is not exact.':'Paper not found. Drag the corners onto the paper, or tap "Whole photo".';}
 $('eAuto').onclick=()=>{buzz();findHere();};
 $('eFull').onclick=()=>{const m=0.01,w=cur.w,h=cur.h;cur.quad=[{x:w*m,y:h*m},{x:w*(1-m),y:h*m},{x:w*(1-m),y:h*(1-m)},{x:w*m,y:h*(1-m)}];draw();};
-function turnSrc(cw){cur.touched=true;cur.quad=rotQuad(cur.quad,cur.w,cur.h,cw);cur.sr=(cur.sr+(cw?1:3))%4;cur.view=turned(cur.base,cur.sr);cur.w=bw(cur.view);cur.h=bh(cur.view);layout();draw();buzz();}
+function turnSrc(cw){cur.touched=true;cur.id=null;cur.dp=null;cur.quad=rotQuad(cur.quad,cur.w,cur.h,cw);cur.sr=(cur.sr+(cw?1:3))%4;cur.view=turned(cur.base,cur.sr);cur.w=bw(cur.view);cur.h=bh(cur.view);layout();draw();buzz();}
 $('eRotL').onclick=()=>turnSrc(false);$('eRotR').onclick=()=>turnSrc(true);
 
 const cv=$('cv'),cx=cv.getContext('2d');let drag=null,scale=1;
@@ -901,208 +1144,30 @@ addEventListener('resize',()=>{if($('edit').classList.contains('on')&&cur&&cur.v
 $('eRetake').onclick=()=>openCam();
 
 // ---------- the scanner on the phone itself: finds the paper, cuts it out, cleans it. Nothing but the final picture goes to the computer.
-// ======================= finding the paper (pure functions on pixel data: used by the live camera AND by the photo)
-function blurF(a,w,h,r){ // box blur, Float32Array
- const t=new Float32Array(a.length),o=new Float32Array(a.length),k=2*r+1;
- for(let y=0;y<h;y++){let s=0;const row=y*w;for(let i=-r;i<=r;i++)s+=a[row+Math.min(w-1,Math.max(0,i))];
-  for(let x=0;x<w;x++){t[row+x]=s/k;s+=a[row+Math.min(w-1,x+r+1)]-a[row+Math.max(0,x-r)];}}
- for(let x=0;x<w;x++){let s=0;for(let i=-r;i<=r;i++)s+=t[Math.min(h-1,Math.max(0,i))*w+x];
-  for(let y=0;y<h;y++){o[y*w+x]=s/k;s+=t[Math.min(h-1,y+r+1)*w+x]-t[Math.max(0,y-r)*w+x];}}
- return o;}
-function otsu(v){const n=v.length,hist=new Float64Array(256);for(let i=0;i<n;i++)hist[v[i]]++;let sum=0;for(let i=0;i<256;i++)sum+=i*hist[i];
- let wB=0,sB=0,best=-1,th=127;for(let t=0;t<256;t++){wB+=hist[t];if(!wB)continue;const wF=n-wB;if(!wF)break;sB+=t*hist[t];
-  const mB=sB/wB,mF=(sum-sB)/wF,q=wB*wF*(mB-mF)*(mB-mF);if(q>best){best=q;th=t;}}return th;}
-function bigBlob(mask,w,h){ // biggest 4-connected blob -> {lab:Uint8Array, n}
- const seen=new Uint8Array(w*h),st=new Int32Array(w*h);let bestStart=-1,bestN=0;
- for(let s=0;s<w*h;s++){if(!mask[s]||seen[s])continue;let sp=0,n=0;st[sp++]=s;seen[s]=1;
-  while(sp){const p=st[--sp];n++;const x=p%w,y=(p-x)/w;
-   if(x>0&&mask[p-1]&&!seen[p-1]){seen[p-1]=1;st[sp++]=p-1;}if(x<w-1&&mask[p+1]&&!seen[p+1]){seen[p+1]=1;st[sp++]=p+1;}
-   if(y>0&&mask[p-w]&&!seen[p-w]){seen[p-w]=1;st[sp++]=p-w;}if(y<h-1&&mask[p+w]&&!seen[p+w]){seen[p+w]=1;st[sp++]=p+w;}}
-  if(n>bestN){bestN=n;bestStart=s;}}
- if(bestStart<0)return null;const lab=new Uint8Array(w*h),st2=[bestStart];lab[bestStart]=1;
- while(st2.length){const p=st2.pop(),x=p%w,y=(p-x)/w;
-  if(x>0&&mask[p-1]&&!lab[p-1]){lab[p-1]=1;st2.push(p-1);}if(x<w-1&&mask[p+1]&&!lab[p+1]){lab[p+1]=1;st2.push(p+1);}
-  if(y>0&&mask[p-w]&&!lab[p-w]){lab[p-w]=1;st2.push(p-w);}if(y<h-1&&mask[p+w]&&!lab[p+w]){lab[p+w]=1;st2.push(p+w);}}
- return {lab,n:bestN};}
 function polyArea(q){let a=0;for(let i=0;i<q.length;i++){const p=q[i],r=q[(i+1)%q.length];a+=p.x*r.y-r.x*p.y;}return Math.abs(a)/2;}
-function hullOf(pts){ // convex hull (monotone chain)
- pts=pts.slice().sort((a,b)=>a.x-b.x||a.y-b.y);const cr=(o,a,b)=>(a.x-o.x)*(b.y-o.y)-(a.y-o.y)*(b.x-o.x);
- const lo=[];for(const p of pts){while(lo.length>=2&&cr(lo[lo.length-2],lo[lo.length-1],p)<=0)lo.pop();lo.push(p);}
- const up=[];for(let i=pts.length-1;i>=0;i--){const p=pts[i];while(up.length>=2&&cr(up[up.length-2],up[up.length-1],p)<=0)up.pop();up.push(p);}
- lo.pop();up.pop();return lo.concat(up);}
-function lineX(p0,p1,p2,p3){ // intersection of line p0p1 with line p2p3 -> {x,y,t,s} (t along p0p1, s along p2p3) or null
- const d1x=p1.x-p0.x,d1y=p1.y-p0.y,d2x=p3.x-p2.x,d2y=p3.y-p2.y,den=d1x*d2y-d1y*d2x;if(Math.abs(den)<1e-9)return null;
- const t=((p2.x-p0.x)*d2y-(p2.y-p0.y)*d2x)/den,s=((p2.x-p0.x)*d1y-(p2.y-p0.y)*d1x)/den;return {x:p0.x+t*d1x,y:p0.y+t*d1y,t,s};}
-function quadFromHull(h){ // smallest enclosing 4-gon: drop the hull edge whose removal adds the least area (neighbours are extended)
- let P=h.slice();
- while(P.length>4){const n=P.length;let bi=-1,ba=1e30,bx=null;
-  for(let i=0;i<n;i++){const p0=P[(i-1+n)%n],p1=P[i],p2=P[(i+1)%n],p3=P[(i+2)%n],X=lineX(p0,p1,p3,p2);
-   if(!X||X.t<=1||X.s<=1)continue;const a=Math.abs((p1.x-X.x)*(p2.y-X.y)-(p1.y-X.y)*(p2.x-X.x))/2;if(a<ba){ba=a;bi=i;bx={x:X.x,y:X.y};}}
-  if(bi<0){let m=1e30,mi=0;for(let i=0;i<n;i++){const a=polyArea([P[(i-1+n)%n],P[i],P[(i+1)%n]]);if(a<m){m=a;mi=i;}}P.splice(mi,1);continue;}
-  const j=(bi+1)%n;P[bi]=bx;P.splice(j,1);}
- return P;}
-function orderQuad(q){ // -> TL,TR,BR,BL
- const s=q.map(p=>p.x+p.y),d=q.map(p=>p.x-p.y);let tl=0,br=0,tr=0,bl=0;
- for(let i=1;i<4;i++){if(s[i]<s[tl])tl=i;if(s[i]>s[br])br=i;if(d[i]>d[tr])tr=i;if(d[i]<d[bl])bl=i;}
- const set=new Set([tl,br,tr,bl]);if(set.size<4){const c={x:q.reduce((a,p)=>a+p.x,0)/4,y:q.reduce((a,p)=>a+p.y,0)/4};
-  const o=q.slice().sort((a,b)=>Math.atan2(a.y-c.y,a.x-c.x)-Math.atan2(b.y-c.y,b.x-c.x));let k=0;for(let i=1;i<4;i++)if(o[i].x+o[i].y<o[k].x+o[k].y)k=i;return [o[k],o[(k+1)%4],o[(k+2)%4],o[(k+3)%4]];}
- return [q[tl],q[tr],q[br],q[bl]];}
-
-// coarse finder: several colour / brightness masks on a small picture -> paper-like blobs -> enclosing 4-gons; the best one is the one
-// whose 4 sides all have a real colour step across them (this is what keeps it away from a printed frame, a red box, a hand ...)
-function sideContrast(chb,w,h,q){
- const smp=(x,y,c)=>{x=x<0?0:x>w-1.001?w-1.001:x;y=y<0?0:y>h-1.001?h-1.001:y;const x0=x|0,y0=y|0,fx=x-x0,fy=y-y0,i=y0*w+x0,a=chb[c];
-  return (a[i]*(1-fx)+a[i+1]*fx)*(1-fy)+(a[i+w]*(1-fx)+a[i+w+1]*fx)*fy;};
- const cen={x:q.reduce((a,p)=>a+p.x,0)/4,y:q.reduce((a,p)=>a+p.y,0)/4},sides=[],off=Math.max(2.5,0.009*Math.max(w,h));
- for(let i=0;i<4;i++){const a=q[i],b=q[(i+1)%4],L=Math.hypot(b.x-a.x,b.y-a.y)||1,ux=(b.x-a.x)/L,uy=(b.y-a.y)/L;let nx=uy,ny=-ux;
-  if(nx*((a.x+b.x)/2-cen.x)+ny*((a.y+b.y)/2-cen.y)<0){nx=-nx;ny=-ny;}
-  const K=24,E=[];for(let k=0;k<K;k++){const s=0.1+0.8*(k+0.5)/K,px=a.x+ux*s*L,py=a.y+uy*s*L;let best=0;
-   for(const sh of [-1.5,0,1.5]){let e=0;for(let c=0;c<3;c++){const df=smp(px+nx*(off+sh),py+ny*(off+sh),c)-smp(px-nx*(off-sh),py-ny*(off-sh),c);e+=df*df;}best=Math.max(best,Math.sqrt(e));}E.push(best);}
-  E.sort((x,y)=>x-y);sides.push(E[E.length>>1]);}
- return 0.5*(sides.reduce((a,v)=>a+v,0)/4)+0.5*Math.min(...sides);}
-function coarseCands(d,w,h){
- const N=w*h,L=new Float32Array(N);for(let i=0;i<N;i++)L[i]=0.299*d[4*i]+0.587*d[4*i+1]+0.114*d[4*i+2];
- const Lb=blurF(blurF(L,w,h,2),w,h,2),u1=new Uint8Array(N);for(let i=0;i<N;i++)u1[i]=Lb[i];
- const chb=[0,1,2].map(c=>{const a=new Float32Array(N);for(let i=0;i<N;i++)a[i]=d[4*i+c];return blurF(a,w,h,1);});
- const dist=(cr,cg,cb)=>{const D=new Float32Array(N);for(let i=0;i<N;i++)D[i]=Math.hypot(d[4*i]-cr,d[4*i+1]-cg,d[4*i+2]-cb);
-  const Db=blurF(blurF(D,w,h,2),w,h,2),u=new Uint8Array(N);for(let i=0;i<N;i++)u[i]=Math.min(255,Db[i]*1.3);return u;};
- let br=0,bg=0,bb=0,bn=0;const m=Math.max(2,Math.round(Math.min(w,h)*0.03));
- for(let y=0;y<h;y++)for(let x=0;x<w;x++){if(x<m||y<m||x>=w-m||y>=h-m){const i=4*(y*w+x);br+=d[i];bg+=d[i+1];bb+=d[i+2];bn++;}}
- const u2=dist(br/bn,bg/bn,bb/bn);
- // the paper's own colour = the middle of the picture (median of a small patch, so a few letters do not matter)
- const px0=Math.round(w*0.42),px1=Math.round(w*0.58),py0=Math.round(h*0.42),py1=Math.round(h*0.58),R=[],G=[],B=[];
- for(let y=py0;y<py1;y++)for(let x=px0;x<px1;x++){const i=4*(y*w+x);R.push(d[i]);G.push(d[i+1]);B.push(d[i+2]);}
- const med=a=>{a.sort((x,y)=>x-y);return a[a.length>>1];};
- const u4=dist(med(R),med(G),med(B));                       // small = like the paper
- const t1=otsu(u1),t2=otsu(u2),t4=otsu(u4),masks=[],pm=new Uint8Array(N);
- const mk=f=>{const a=new Uint8Array(N);for(let i=0;i<N;i++)a[i]=f(i)?1:0;return a;};
- masks.push(mk(i=>u2[i]>t2),mk(i=>u1[i]>t1&&u2[i]>t2*0.7),mk(i=>u1[i]>t1),mk(i=>u4[i]<t4),mk(i=>u4[i]<t4*0.6));
- const cands=[];
- for(const mkm of masks){
-  let a=new Float32Array(N);for(let i=0;i<N;i++)a[i]=mkm[i];
-  a=blurF(a,w,h,3);const c1=new Uint8Array(N);for(let i=0;i<N;i++)c1[i]=a[i]>0.4?1:0;
-  a=new Float32Array(N);for(let i=0;i<N;i++)a[i]=c1[i];a=blurF(a,w,h,3);const c2=new Uint8Array(N);for(let i=0;i<N;i++)c2[i]=a[i]>0.6?1:0;
-  const bl=bigBlob(c2,w,h);if(!bl)continue;const frac=bl.n/N;if(frac<0.08||frac>0.985)continue;
-  const pts=[];let cx=0,cy=0;
-  for(let y=0;y<h;y++)for(let x=0;x<w;x++){const p=y*w+x;if(!bl.lab[p])continue;cx+=x;cy+=y;
-   const edge=x===0||y===0||x===w-1||y===h-1||!bl.lab[p-1]||!bl.lab[p+1]||!bl.lab[p-w]||!bl.lab[p+w];if(edge)pts.push({x:x+0.5,y:y+0.5});}
-  if(pts.length<8)continue;const hull=hullOf(pts);if(hull.length<4)continue;const q=orderQuad(quadFromHull(hull));
-  const area=Math.max(1,polyArea(q)),fill=bl.n/area;cx/=bl.n;cy/=bl.n;if(fill<0.7||fill>1.25)continue;
-  const centre=1-0.5*Math.hypot(cx-w/2,cy-h/2)/Math.hypot(w/2,h/2),con=sideContrast(chb,w,h,q);
-  cands.push({q,fill,frac,score:con*Math.sqrt(frac)*Math.sqrt(centre)*Math.min(1,fill),con});}
- return cands;}
-function coarseQuad(d,w,h){const c=coarseCands(d,w,h);if(!c.length)return null;c.sort((a,b)=>b.score-a.score);return c[0];}
-
-// straight-edge refinement: every side of the outline is moved onto the real edge in the picture (many samples + a robust line fit),
-// the corners are the meeting points of the 4 fitted lines -> straight sides, exact corners, no wobble.
-function refineQuad(d,w,h,q0,rounds){
- const N=w*h,ch=[new Float32Array(N),new Float32Array(N),new Float32Array(N)];
- for(let c=0;c<3;c++){const a=new Float32Array(N);for(let i=0;i<N;i++)a[i]=d[4*i+c];ch[c]=blurF(a,w,h,1);}
- const smp=(x,y,c)=>{x=x<0?0:x>w-1.001?w-1.001:x;y=y<0?0:y>h-1.001?h-1.001:y;const x0=x|0,y0=y|0,fx=x-x0,fy=y-y0,i=y0*w+x0,a=ch[c];
-  return (a[i]*(1-fx)+a[i+1]*fx)*(1-fy)+(a[i+w]*(1-fx)+a[i+w+1]*fx)*fy;};
- let q=q0.map(p=>({x:p.x,y:p.y})),band=Math.max(6,0.03*Math.max(w,h)),moved=0;
- for(let r=0;r<(rounds||2);r++){
-  const cen={x:q.reduce((a,p)=>a+p.x,0)/4,y:q.reduce((a,p)=>a+p.y,0)/4},lines=[];
-  for(let i=0;i<4;i++){
-   const a=q[i],b=q[(i+1)%4],L=Math.hypot(b.x-a.x,b.y-a.y)||1,ux=(b.x-a.x)/L,uy=(b.y-a.y)/L;let nx=uy,ny=-ux;
-   const mx=(a.x+b.x)/2-cen.x,my=(a.y+b.y)/2-cen.y;if(nx*mx+ny*my<0){nx=-nx;ny=-ny;}
-   const K=Math.max(12,Math.min(90,Math.round(L/5))),P=[],E=[];
-   for(let k=0;k<K;k++){const s=0.06+0.88*(k+0.5)/K,px=a.x+ux*s*L,py=a.y+uy*s*L;
-    const prof=[],ts=[];let mxv=0;
-    for(let t=-band;t<=band;t+=0.5){
-     const xa=px+nx*(t+1.5),ya=py+ny*(t+1.5),xb=px+nx*(t-1.5),yb=py+ny*(t-1.5);
-     let e=0;for(let c=0;c<3;c++){const df=smp(xa,ya,c)-smp(xb,yb,c);e+=df*df;}e=Math.sqrt(e);prof.push(e);ts.push(t);if(e>mxv)mxv=e;}
-    // the OUTERMOST strong edge wins (a printed frame / header line inside the page is not the page edge)
-    let bt=0,bi=-1;for(let j=prof.length-2;j>=1;j--){if(prof[j]>=0.55*mxv&&prof[j]>=prof[j-1]&&prof[j]>=prof[j+1]){bi=j;break;}}
-    if(bi<0){let m0=-1;for(let j=0;j<prof.length;j++)if(prof[j]>m0){m0=prof[j];bi=j;}}bt=ts[bi];
-    P.push({x:px+nx*bt,y:py+ny*bt});E.push(mxv);}
-   const sorted=E.slice().sort((x,y)=>x-y),med=sorted[sorted.length>>1];
-   let use=P.filter((p,k)=>E[k]>=Math.max(5,0.5*med));
-   let ln=null;
-   if(use.length>=Math.max(6,K*0.35)){
-    for(let it=0;it<4;it++){
-     let mx2=0,my2=0;for(const p of use){mx2+=p.x;my2+=p.y;}mx2/=use.length;my2/=use.length;
-     let sxx=0,sxy=0,syy=0;for(const p of use){const dx=p.x-mx2,dy=p.y-my2;sxx+=dx*dx;sxy+=dx*dy;syy+=dy*dy;}
-     const th=0.5*Math.atan2(2*sxy,sxx-syy),dx=Math.cos(th),dy=Math.sin(th);
-     const res=use.map(p=>Math.abs((p.x-mx2)*(-dy)+(p.y-my2)*dx)),rs=res.slice().sort((x,y)=>x-y),mr=rs[rs.length>>1];
-     ln={x:mx2,y:my2,dx,dy,n:use.length,res:mr};
-     const lim=Math.max(1.0,2.5*mr),keep=use.filter((p,k)=>res[k]<=lim);if(keep.length<Math.max(6,K*0.3)||keep.length===use.length)break;use=keep;}
-    if(ln.n<Math.max(6,K*0.3))ln=null;}
-   lines.push(ln||{x:a.x,y:a.y,dx:ux,dy:uy,n:0,res:0,weak:true});}
-  const nq=[];let ok=true;
-  for(let i=0;i<4;i++){const l1=lines[(i+3)%4],l2=lines[i],X=lineX({x:l1.x,y:l1.y},{x:l1.x+l1.dx,y:l1.y+l1.dy},{x:l2.x,y:l2.y},{x:l2.x+l2.dx,y:l2.y+l2.dy});
-   if(!X||Math.hypot(X.x-q[i].x,X.y-q[i].y)>band*2.2+0.02*Math.max(w,h)){ok=false;break;}nq.push({x:X.x,y:X.y});}
-  if(!ok||polyArea(nq)<0.6*polyArea(q))break;q=nq;moved++;band=Math.max(2.5,band*0.4);}
- return {quad:q,moved};}
-
-// d = RGBA of the picture (any size). Returns {quad:[TL,TR,BR,BL] in this picture's pixels, found}
-function findPaper(d,W,H,small,smW,smH,opt){ // small = the same picture scaled down for the coarse step (RGBA, smW x smH)
- const best=coarseQuad(small,smW,smH),k=W/smW;
- if(!best){const mm=0.04;return {quad:[[mm,mm],[1-mm,mm],[1-mm,1-mm],[mm,1-mm]].map(p=>({x:p[0]*W,y:p[1]*H})),found:false};}
- let q=best.q.map(p=>({x:p.x*k,y:p.y*k}));
- let found=best.fill>0.82&&best.frac>0.15;
- if(!(opt&&opt.noRefine)){try{const r=refineQuad(d,W,H,q,(opt&&opt.rounds)||3);if(r.moved)q=r.quad;}catch(e){}}
- q=orderQuad(q).map(p=>({x:Math.max(0,Math.min(W,p.x)),y:Math.max(0,Math.min(H,p.y))}));
- return {quad:q,found};}
-
-function detectLocal(src,live){ // -> {quad:[TL,TR,BR,BL] in src pixels, found}. live = quick version for the camera view
- const W=bw(src),H=bh(src),mk=(side)=>{const s=Math.min(1,side/Math.max(W,H)),w=Math.max(8,Math.round(W*s)),h=Math.max(8,Math.round(H*s)),c=document.createElement('canvas');
-  c.width=w;c.height=h;const g=c.getContext('2d',{willReadFrequently:true});g.imageSmoothingQuality='high';g.drawImage(src,0,0,w,h);return {w,h,d:g.getImageData(0,0,w,h).data,s};};
- const sm=mk(live?320:420);
- if(live){const r=findPaper(sm.d,sm.w,sm.h,sm.d,sm.w,sm.h,{rounds:2});const k=1/sm.s;return {quad:r.quad.map(p=>({x:p.x*k,y:p.y*k})),found:r.found};}
- const fn=mk(1000),r=findPaper(fn.d,fn.w,fn.h,sm.d,sm.w,sm.h,{rounds:3}),k=1/fn.s;
- return {quad:r.quad.map(p=>({x:Math.max(0,Math.min(W,p.x*k)),y:Math.max(0,Math.min(H,p.y*k))})),found:r.found};}
-
-// the real proportions of the sheet from its 4 photographed corners (same maths as the computer's straighten): a tilted A4 stays A4
-function sheetRatio(q,W,H){const u0=W/2,v0=H/2,[tl,tr,br,bl]=q,dist=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y);
- const simple=(dist(tl,tr)+dist(bl,br))/Math.max(1e-6,dist(tl,bl)+dist(tr,br));
- try{const m1=[tl.x,tl.y,1],m2=[tr.x,tr.y,1],m3=[bl.x,bl.y,1],m4=[br.x,br.y,1];
-  const cr=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]],dt=(a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
-  const k2=dt(cr(m1,m4),m3)/dt(cr(m2,m4),m3),k3=dt(cr(m1,m4),m2)/dt(cr(m3,m4),m2);
-  const n2=m2.map((v,i)=>k2*v-m1[i]),n3=m3.map((v,i)=>k3*v-m1[i]),den=n2[2]*n3[2];if(Math.abs(den)<1e-9)return simple;
-  const f2=-((n2[0]*n3[0]-(n2[0]*n3[2]+n2[2]*n3[0])*u0+n2[2]*n3[2]*u0*u0)+(n2[1]*n3[1]-(n2[1]*n3[2]+n2[2]*n3[1])*v0+n2[2]*n3[2]*v0*v0))/den;
-  if(!isFinite(f2)||f2<=0)return simple;const f=Math.sqrt(f2);
-  // M = Ai^T Ai with A=[[f,0,u0],[0,f,v0],[0,0,1]]  ->  Ai=[[1/f,0,-u0/f],[0,1/f,-v0/f],[0,0,1]]
-  const Ai=[[1/f,0,-u0/f],[0,1/f,-v0/f],[0,0,1]],ap=v=>[Ai[0][0]*v[0]+Ai[0][1]*v[1]+Ai[0][2]*v[2],Ai[1][0]*v[0]+Ai[1][1]*v[1]+Ai[1][2]*v[2],v[2]];
-  const a2=ap(n2),a3=ap(n3),r=Math.sqrt(Math.max(1e-12,dt(a2,a2))/Math.max(1e-12,dt(a3,a3)));
-  if(!isFinite(r)||r<0.2||r>5||Math.abs(Math.log(r/simple))>0.45)return simple;return r;}catch(e){return simple;}}
-
-function warpLocal(src,quad,maxSide){ // cut the quad out of src and remove the camera angle -> canvas
- const [p0,p1,p2,p3]=quad,dist=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y);
- const w0=Math.max(dist(p0,p1),dist(p3,p2)),h0=Math.max(dist(p0,p3),dist(p1,p2)),ratio=sheetRatio(quad,bw(src),bh(src));let w,h;
- if(w0/Math.max(h0,1e-6)>ratio){h=h0;w=h0*ratio;if(w<w0){w=w0;h=w0/ratio;}}else{w=w0;h=w0/ratio;if(h<h0){h=h0;w=h0*ratio;}}
- const k=Math.min(1,maxSide/Math.max(w,h));
- w=Math.max(8,Math.round(w*k));h=Math.max(8,Math.round(h*k));
- const sw=bw(src),sh=bh(src),sc=document.createElement('canvas');sc.width=sw;sc.height=sh;const sg=sc.getContext('2d',{willReadFrequently:true});sg.drawImage(src,0,0);
- const S=sg.getImageData(0,0,sw,sh).data,out=document.createElement('canvas');out.width=w;out.height=h;const og=out.getContext('2d'),O=og.createImageData(w,h),D=O.data;
- const sx=p0.x-p1.x+p2.x-p3.x,sy=p0.y-p1.y+p2.y-p3.y;let a,b,c,d,e,f,gg=0,hh=0;
- if(Math.abs(sx)<1e-9&&Math.abs(sy)<1e-9){a=p1.x-p0.x;b=p3.x-p0.x;c=p0.x;d=p1.y-p0.y;e=p3.y-p0.y;f=p0.y;}
- else{const dx1=p1.x-p2.x,dx2=p3.x-p2.x,dy1=p1.y-p2.y,dy2=p3.y-p2.y,det=dx1*dy2-dx2*dy1;
-  gg=(sx*dy2-dx2*sy)/det;hh=(dx1*sy-sx*dy1)/det;a=p1.x-p0.x+gg*p1.x;b=p3.x-p0.x+hh*p3.x;c=p0.x;d=p1.y-p0.y+gg*p1.y;e=p3.y-p0.y+hh*p3.y;f=p0.y;}
- const mx=sw-1.001,my=sh-1.001;let o=0;
- for(let y=0;y<h;y++){const v=(y+0.5)/h;for(let x=0;x<w;x++){const u=(x+0.5)/w,z=gg*u+hh*v+1;
-  let X=(a*u+b*v+c)/z,Y=(d*u+e*v+f)/z;X=X<0?0:X>mx?mx:X;Y=Y<0?0:Y>my?my:Y;
-  const x0=X|0,y0=Y|0,fx=X-x0,fy=Y-y0,i=4*(y0*sw+x0),j=i+4*sw,w00=(1-fx)*(1-fy),w10=fx*(1-fy),w01=(1-fx)*fy,w11=fx*fy;
-  D[o]=S[i]*w00+S[i+4]*w10+S[j]*w01+S[j+4]*w11;D[o+1]=S[i+1]*w00+S[i+5]*w10+S[j+1]*w01+S[j+5]*w11;D[o+2]=S[i+2]*w00+S[i+6]*w10+S[j+2]*w01+S[j+6]*w11;D[o+3]=255;o+=4;}}
- og.putImageData(O,0,0);return out;}
-
-function lookLocal(src,look){ // 'clean' = white paper + even light (colour kept), 'gray', 'bw'
- if(look==='orig')return src;const w=src.width,h=src.height,g=src.getContext('2d'),I=g.getImageData(0,0,w,h),D=I.data;
- const f=8,sw=Math.max(4,Math.ceil(w/f)),sh=Math.max(4,Math.ceil(h/f)),sm=document.createElement('canvas');sm.width=sw;sm.height=sh;
- const sg=sm.getContext('2d',{willReadFrequently:true});sg.imageSmoothingQuality='high';sg.drawImage(src,0,0,sw,sh);const sd=sg.getImageData(0,0,sw,sh).data;
- let L=new Float32Array(sw*sh);for(let i=0;i<sw*sh;i++)L[i]=0.299*sd[4*i]+0.587*sd[4*i+1]+0.114*sd[4*i+2];
- const R=Math.max(2,Math.round(Math.min(sw,sh)*0.035)),M=new Float32Array(sw*sh);          // paper brightness = the brightest nearby (text is darker)
- const T=new Float32Array(sw*sh);for(let y=0;y<sh;y++)for(let x=0;x<sw;x++){let m=0;for(let i=Math.max(0,x-R);i<=Math.min(sw-1,x+R);i++){const v=L[y*sw+i];if(v>m)m=v;}T[y*sw+x]=m;}
- for(let y=0;y<sh;y++)for(let x=0;x<sw;x++){let m=0;for(let i=Math.max(0,y-R);i<=Math.min(sh-1,y+R);i++){const v=T[i*sw+x];if(v>m)m=v;}M[y*sw+x]=m;}
- const B=blurF(blurF(M,sw,sh,R),sw,sh,R);
- for(let y=0;y<h;y++){const fy=Math.min(sh-1.001,Math.max(0,y/f-0.5)),y0=fy|0,ty=fy-y0;
-  for(let x=0;x<w;x++){const fx=Math.min(sw-1.001,Math.max(0,x/f-0.5)),x0=fx|0,tx=fx-x0,i0=y0*sw+x0;
-   const bg=(B[i0]*(1-tx)+B[i0+1]*tx)*(1-ty)+(B[i0+sw]*(1-tx)+B[i0+sw+1]*tx)*ty,k=255/Math.max(bg,70),o=4*(y*w+x);
-   let r=D[o]*k,gn=D[o+1]*k,b=D[o+2]*k;
-   if(look==='bw'){const l=0.299*r+0.587*gn+0.114*b;let t=(l-150)/45;t=t<0?0:t>1?1:t;t=t*t*(3-2*t)*255;r=gn=b=t;}
-   else{r=(r-22)*1.12;gn=(gn-22)*1.12;b=(b-22)*1.12;if(look==='gray'){const l=0.299*r+0.587*gn+0.114*b;r=gn=b=l;}}
-   D[o]=r;D[o+1]=gn;D[o+2]=b;}}
- const out=document.createElement('canvas');out.width=w;out.height=h;out.getContext('2d').putImageData(I,0,0);return out;}
+// ---------- the heavy work (find the paper, cut out, clean) runs in a background worker: the screen and the camera never freeze.
+// If this browser cannot run the worker, the very same code (engine.js) runs on the page instead.
+let HW=null,HWfail=false,HWseq=0,engP=null;const HWp=new Map();
+const wfail=()=>Object.assign(new Error('worker'),{worker:true});
+function HWdie(){HWfail=true;try{if(HW)HW.terminate();}catch(e){}HW=null;for(const p of HWp.values())p.no(wfail());HWp.clear();}
+function hwStart(){if(HW||HWfail)return HW;
+ try{if(!window.Worker||typeof OffscreenCanvas==='undefined'||!window.createImageBitmap)throw 0;
+  HW=new Worker(base+'/engine.js');
+  HW.onmessage=e=>{const m=e.data,p=HWp.get(m.id);if(!p)return;HWp.delete(m.id);if(m.nosup){HWdie();p.no(wfail());}else if(m.err)p.no(new Error(m.err));else p.ok(m);};
+  HW.onerror=()=>HWdie();}
+ catch(e){HWfail=true;HW=null;}
+ return HW;}
+const mainEng=()=>engP||(engP=new Promise((res,no)=>{const sc=document.createElement('script');sc.src=base+'/engine.js';sc.onload=()=>res();sc.onerror=()=>{engP=null;no(new Error('engine'));};document.head.appendChild(sc);}));
+async function heavy(op,build){ // build(asBitmap) -> {msg, xfer}: a picture for the worker is an ImageBitmap (moved, not copied), on the page it is the canvas
+ const w=hwStart();
+ if(w){try{const b=await build(true);
+   return await new Promise((res,no)=>{const id=++HWseq;HWp.set(id,{ok:res,no});b.msg.id=id;b.msg.op=op;
+    try{w.postMessage(b.msg,b.xfer||[]);}catch(e){HWp.delete(id);no(wfail());}});}
+  catch(e){if(!e||!e.worker)throw e;}}
+ await mainEng();await raf();const b=await build(false);return IFE[op](b.msg);}
+const smallCanvas=(src,w,h)=>{const c=document.createElement('canvas');c.width=w;c.height=h;const g=c.getContext('2d');g.imageSmoothingQuality='high';g.drawImage(src,0,0,w,h);return c;};
+async function asPic(c,asW){const b=asW?await createImageBitmap(c):c;return {msg:{bmp:b},xfer:asW?[b]:[]};}
+setTimeout(hwStart,400);   // started early so the phone keeps engine.js for offline use
 
 // ---------- cut out + review: all on the phone
 const rcv=$('rcv'),rx=rcv.getContext('2d');
@@ -1110,19 +1175,22 @@ function paintReview(){if(!cur||!cur.res)return;const src=cur.res,t=cur.rot,w=t%
  fit(rcv,w,h,rcv.parentNode);rx.imageSmoothingQuality='high';rx.save();rx.translate(rcv.width/2,rcv.height/2);rx.rotate(t*Math.PI/2);
  const dw=(t%2?rcv.height:rcv.width),dh=(t%2?rcv.width:rcv.height);rx.drawImage(src,-dw/2,-dh/2,dw,dh);rx.restore();}
 function markLook(){for(const b of document.querySelectorAll('#looks button'))b.classList.toggle('on',b.dataset.l===cur.look);}
+function closeRes(o){if(o.res&&o.res.close){try{o.res.close();}catch(e){}}o.res=null;}
 async function setLook(look){
- cur.look=look;markLook();const my=cur;
- if(look!=='orig'){$('rWait').classList.add('on');await raf();await raf();if(cur!==my)return;}
- try{my.res=lookLocal(my.warp,look);if(cur===my)paintReview();}catch(e){toast('Could not clean the page.',true);}
- $('rWait').classList.remove('on');}
-async function crop(){ // from the corners screen
- cur.rot=0;cur.res=null;cur.warp=null;show('review');$('rWait').classList.add('on');await raf();await raf();
- try{cur.warp=warpLocal(cur.view,cur.quad,OUTSIDE);}catch(e){toast('Could not cut out the page. Try again.',true);$('rWait').classList.remove('on');return;}
- cur.res=cur.warp;paintReview();fillLooks(cur);await setLook(cur.look);}
-function fillLooks(p){ // the four looks as small previews, made from a small copy of the cut-out page
- try{const sm=warpLocal(p.view,p.quad,170);
-  for(const b of document.querySelectorAll('#looks button')){const o=lookLocal(sm,b.dataset.l),c=b.querySelector('canvas'),k=Math.min(1,2/1)*1;
-   c.width=o.width;c.height=o.height;c.getContext('2d').drawImage(o,0,0);}}catch(e){}}
+ cur.look=look;markLook();const my=cur;$('rWait').classList.add('on');
+ try{const r=await heavy('look',async()=>({msg:{look}}));if(cur!==my||my.look!==look)return;closeRes(my);my.res=r.res;paintReview();}
+ catch(e){toast('Could not clean the page.',true);}
+ if(cur===my)$('rWait').classList.remove('on');}
+async function crop(){ // from the corners screen: cut + look + previews happen in the background worker
+ const me=cur;me.rot=0;closeRes(me);me.warp=false;show('review');$('rWait').classList.add('on');
+ try{const r=await heavy('cut',async asW=>{const b=asW?await createImageBitmap(me.view):me.view;return {msg:{bmp:b,quad:me.quad.map(p=>({x:p.x,y:p.y})),maxSide:OUTSIDE,look:me.look},xfer:asW?[b]:[]};});
+  if(cur!==me){if(r.res&&r.res.close)r.res.close();return;}
+  me.res=r.res;me.warp=true;paintReview();fillLooks(r.prevs);}
+ catch(e){toast('Could not cut out the page. Try again.',true);}
+ if(cur===me)$('rWait').classList.remove('on');}
+function fillLooks(prevs){ // the four looks as small previews
+ try{for(const b of document.querySelectorAll('#looks button')){const o=prevs&&prevs[b.dataset.l],c=b.querySelector('canvas');if(!o)continue;
+  c.width=bw(o);c.height=bh(o);c.getContext('2d').drawImage(o,0,0);if(o.close)o.close();}}catch(e){}}
 $('eOk').onclick=()=>{if(cur&&cur.quad)crop();};
 for(const b of document.querySelectorAll('#looks button'))b.onclick=()=>{if(cur.look===b.dataset.l||!cur.warp)return;buzz();setLook(b.dataset.l);};
 $('rRotL').onclick=()=>{cur.rot=(cur.rot+3)%4;paintReview();buzz();};$('rRotR').onclick=()=>{cur.rot=(cur.rot+1)%4;paintReview();buzz();};
@@ -1133,8 +1201,8 @@ $('autoRow').onclick=()=>{const v=!autoOn();try{localStorage.setItem('auto',v?'1
 $('rUse').onclick=()=>{
  if(!cur.res)return;buzz();const p=cur,bm=p.res,t=p.rot;
  p.th=thumb(t?turned(bm,t):bm,200);                                 // small picture for the list: cheap
- p.final=null;p.saved=false;p.pending=(async()=>{await raf();p.final=await toBlob(t?turned(bm,t):bm,0.92);persist();})();     // the JPEG is made in the background
- p.res=null;p.warp=null;p.base=null;p.view=null;                    // free the big pictures; the page keeps only the small ones
+ p.final=null;p.saved=false;p.pending=(async()=>{await raf();p.final=await toBlob(t?turned(bm,t):bm,0.92);if(bm.close){try{bm.close();}catch(e){}}persist();})();     // the JPEG is made in the background
+ p.res=null;p.warp=false;p.base=null;p.view=null;                    // free the big pictures; the page keeps only the small ones
  if(retake>=0)pages[retake]=p;else pages.push(p);
  const again=retake<0&&autoOn();retake=-1;cur=null;renderList();if(again)openCam();};
 
@@ -1143,11 +1211,12 @@ $('rUse').onclick=()=>{
 const LIVE=()=>!!(window.isSecureContext&&navigator.mediaDevices&&navigator.mediaDevices.getUserMedia);
 let camS=null,camT=null,camIC=null,camTimer=0,camQ=null,camMiss=0,camStable=0,camBusy=false,camTap=null,camTorchOn=false,camSay='',camVib=false,camGrab=null,camGood=false;
 if(!LIVE())$('liveHint').innerHTML='The live paper outline needs a secure link: use the <b>Internet</b> link of the computer, or on Android Chrome open <b>chrome://flags/#unsafely-treat-insecure-origin-as-secure</b>, add <b>'+location.origin+'</b>, enable it and restart Chrome. Until then the phone\'s own camera app opens.';
-function stopCam(){clearTimeout(camTimer);camTimer=0;if(camS){try{camS.getTracks().forEach(t=>t.stop());}catch(e){}}
+let camLoop=0;
+function stopCam(){clearTimeout(camTimer);camTimer=0;camLoop++;if(camS){try{camS.getTracks().forEach(t=>t.stop());}catch(e){}}
  camS=camT=camIC=null;camQ=null;camStable=0;camBusy=false;camTorchOn=false;const v=$('camV');if(v){try{v.srcObject=null;}catch(e){}}}
 async function openLive(){
  let st;
- try{st=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:4096},height:{ideal:3072}},audio:false});}
+ try{st=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:window.ImageCapture?1920:4096},height:{ideal:window.ImageCapture?1080:3072},frameRate:{ideal:24,max:30}},audio:false});}
  catch(e){toast('The camera is blocked here. Opening the phone\'s camera app.',true);nativeCam();return;}
  show('cam');camS=st;camT=st.getVideoTracks()[0];camQ=null;camMiss=0;camStable=0;camBusy=false;camTap=null;camTorchOn=false;camVib=false;
  const v=$('camV');v.srcObject=st;try{await v.play();}catch(e){}
@@ -1176,26 +1245,35 @@ $('camBack').onclick=()=>{pages.length?renderList():home();};
 $('camNative').onclick=()=>{stopCam();nativeCam();};
 $('camGal').onclick=()=>{retake=-1;$('fGal').value='';$('fGal').click();};
 $('camDone').onclick=()=>{if(pages.length)renderList();};
+async function takeFull(){ // the live picture is only Full HD (light); the saved photo is the camera's real still, capped at ~4096 px
+ let st=null;try{const pc=await camIC.getPhotoCapabilities(),W=pc.imageWidth,H=pc.imageHeight;
+  if(W&&H&&W.max&&H.max){const k=Math.min(1,4096/Math.max(W.max,H.max)),f=(R,v)=>{const step=R.step||1;return Math.max(R.min||0,Math.min(R.max,(R.min||0)+Math.round((v-(R.min||0))/step)*step));};
+   st={imageWidth:f(W,W.max*k),imageHeight:f(H,H.max*k)};}}catch(e){}
+ if(st){try{return await camIC.takePhoto(st);}catch(e){}}
+ return camIC.takePhoto();}
 $('camShot').onclick=async()=>{if(camBusy||!camS)return;camBusy=true;buzz();clearTimeout(camTimer);
  let blob=null;const v=$('camV');
- if(camIC){try{blob=await Promise.race([camIC.takePhoto(),new Promise((_,no)=>setTimeout(no,4000))]);}catch(e){blob=null;}}   // the camera's full-size photo (sharper, focused)
+ if(camIC){try{blob=await Promise.race([takeFull(),new Promise((_,no)=>setTimeout(no,7000))]);}catch(e){blob=null;}}   // the camera's own still photo (sharper, focused), about 12 MP at most: enough for text, light for the phone
  if(!blob){try{const c=document.createElement('canvas');c.width=v.videoWidth;c.height=v.videoHeight;c.getContext('2d').drawImage(v,0,0);blob=await toBlob(c,0.92);}catch(e){}}
  if(!blob){camBusy=false;toast('Could not take the photo. Try again.',true);camTick();return;}
  try{v.pause();}catch(e){}gotPhoto(blob);};
-function camTick(){clearTimeout(camTimer);if(!camS||camBusy)return;
- const v=$('camV');
- if(v.videoWidth&&v.readyState>=2){
+async function camTick(){clearTimeout(camTimer);if(!camS||camBusy)return;
+ const v=$('camV'),t0=performance.now(),st=camS,my=++camLoop;
+ if(v.videoWidth&&v.readyState>=2&&!document.hidden){
   try{
-   const m=420,s=Math.min(1,m/Math.max(v.videoWidth,v.videoHeight)),gw=Math.max(8,Math.round(v.videoWidth*s)),gh=Math.max(8,Math.round(v.videoHeight*s));
+   const m=320,s=Math.min(1,m/Math.max(v.videoWidth,v.videoHeight)),gw=Math.max(8,Math.round(v.videoWidth*s)),gh=Math.max(8,Math.round(v.videoHeight*s));
    if(!camGrab||camGrab.width!==gw||camGrab.height!==gh){camGrab=document.createElement('canvas');camGrab.width=gw;camGrab.height=gh;}
-   camGrab.getContext('2d',{willReadFrequently:true}).drawImage(v,0,0,gw,gh);
-   const r=detectLocal(camGrab,true);let q=r.found?r.quad.map(p=>({x:p.x/gw,y:p.y/gh})):null,move=1;
+   camGrab.getContext('2d').drawImage(v,0,0,gw,gh);
+   const r=await heavy('live',asW=>asPic(camGrab,asW));          // the worker looks at the little frame; the page stays smooth
+   if(camS!==st||my!==camLoop||camBusy)return;
+   let q=r.found?r.quad.map(p=>({x:p.x/gw,y:p.y/gh})):null,move=1;
    if(q){if(camQ){move=q.reduce((a,p,i)=>a+Math.hypot(p.x-camQ[i].x,p.y-camQ[i].y),0)/4;q=q.map((p,i)=>({x:(p.x+camQ[i].x)/2,y:(p.y+camQ[i].y)/2}));}camQ=q;camMiss=0;}
    else if(++camMiss>2)camQ=null;
    camStable=(q&&move<0.014)?camStable+1:0;
    camJudge(v);camDraw();
   }catch(e){}}
- camTimer=setTimeout(camTick,150);}
+ if(camS!==st||my!==camLoop||camBusy)return;
+ camTimer=setTimeout(camTick,Math.max(150,Math.min(600,(performance.now()-t0)*0.8)));}   // the slower the phone, the more it rests between looks
 function camJudge(v){camGood=false;
  if(!camQ){camSet('warn','Looking for the paper ...','Put it on a plain, darker table. Keep all 4 corners in the view.');return;}
  const g=camGeo(),qv=camQ,q=qv.map(p=>{const s=camScr(g,p);return {x:s.x/g.W,y:s.y/g.H};}),W=v.videoWidth,H=v.videoHeight,area=polyArea(q),pct=Math.round(area*100),sub='The page fills '+pct+'% of the view - the rest is cut away';
