@@ -248,3 +248,6 @@ NEW (phone scanner round 7)
 - Phone, same Wi-Fi: the QR code is now an https link (self-signed certificate made once, kept in %APPDATA%\ImageFixer; needs the
   'cryptography' package, in requirements.txt). The phone's browser shows a one-time warning: tap Advanced > Proceed. After that the page is
   "secure" and the live camera with the paper outline works. The plain http door stays open for the internet tunnel.
+- Phone UI: the live camera now fills the whole screen; back / light / auto-capture / phone-camera buttons float on top as round glass buttons,
+  the shutter is at the bottom (turns green when the page is steady), with a gallery button and a "done" button with the page count.
+  The paper outline has corner brackets. The home screen is simpler, shows the connection and a card "N pages ready to send".
