@@ -1297,6 +1297,9 @@ class ImageCanvas(QWidget):
         for q in self._quad:
             w = self.to_wid(q)
             p.drawEllipse(w, 8.0, 8.0)
+        for k in range(4):                                    # a square in the middle of every side: drag it to move the whole side
+            m = lerp(o[k], o[(k + 1) % 4], 0.5)
+            p.drawRect(QRectF(m.x() - 6.0, m.y() - 6.0, 12.0, 12.0))
 
     def _paint_loupe(self, p):
         if self._hover is None or self._src is None:
@@ -1359,7 +1362,19 @@ class ImageCanvas(QWidget):
             w = self.to_wid(q)
             if math.hypot(pos.x() - w.x(), pos.y() - w.y()) <= 16:
                 return i
+        if len(self._quad) == 4:
+            o = [self.to_wid(self._quad[i]) for i in self._persp_order()]
+            for k in range(4):
+                a, b = o[k], o[(k + 1) % 4]
+                if math.hypot(pos.x() - (a.x() + b.x()) / 2, pos.y() - (a.y() + b.y()) / 2) <= 14:
+                    return 4 + k
         return None
+
+    def _persp_order(self):
+        """Indices of self._quad in the order top-left, top-right, bottom-right, bottom-left (same rule as core.order_quad)."""
+        s = [q.x() + q.y() for q in self._quad]
+        d = [q.x() - q.y() for q in self._quad]
+        return [s.index(min(s)), d.index(max(d)), s.index(max(s)), d.index(min(d))]
 
     def mousePressEvent(self, e):
         self.setFocus()
@@ -1412,7 +1427,12 @@ class ImageCanvas(QWidget):
                 self._drag = ("new", ip, None)
         elif self.mode == self.PERSP:
             i = self._persp_hit(pos)
-            if i is not None:
+            if i is not None and i >= 4:
+                idx = self._persp_order()
+                k = i - 4
+                a, b = idx[k], idx[(k + 1) % 4]
+                self._drag = ("side", (a, b), [QPointF(self._quad[a]), QPointF(self._quad[b])], ip)
+            elif i is not None:
                 self._drag = ("pt", i)
         elif self.mode == self.SELECT:
             mods = e.modifiers()
@@ -1474,6 +1494,14 @@ class ImageCanvas(QWidget):
         kind = self._drag[0]
         if kind == "pt":
             self._quad[self._drag[1]] = QPointF(self._cl(ip.x(), 0, iw), self._cl(ip.y(), 0, ih))
+        elif kind == "side":                                   # the whole side moves sideways (along its normal), the corners follow
+            (ia, ib), (pa, pb), p0 = self._drag[1], self._drag[2], self._drag[3]
+            ux, uy = pb.x() - pa.x(), pb.y() - pa.y()
+            L = math.hypot(ux, uy) or 1.0
+            nx, ny = -uy / L, ux / L
+            t = (ip.x() - p0.x()) * nx + (ip.y() - p0.y()) * ny
+            self._quad[ia] = QPointF(self._cl(pa.x() + nx * t, 0, iw), self._cl(pa.y() + ny * t, 0, ih))
+            self._quad[ib] = QPointF(self._cl(pb.x() + nx * t, 0, iw), self._cl(pb.y() + ny * t, 0, ih))
         elif kind == "new":
             a = self._drag[1]
             x0, y0 = self._cl(a.x(), 0, iw), self._cl(a.y(), 0, ih)
