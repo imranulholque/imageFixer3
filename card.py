@@ -1016,7 +1016,9 @@ class Card(QWidget):
             ("Freehand\tL", lambda: T("lasso")), ("Color range\tW", lambda: T("color")),
             ("Deselect brush\tShift+D", lambda: T("deselect")),
             None, ("Select all\tCtrl+A", self.select_all), ("Deselect\tCtrl+D", self.deselect),
-            ("Inverse\tCtrl+Shift+I", self.invert_selection)], "Ways to select a part of the picture")
+            ("Inverse\tCtrl+Shift+I", self.invert_selection), None,
+            ("New layer from selection\tCtrl+J", lambda: self.layer_from_selection(False)),
+            ("Cut selection to a layer\tCtrl+Shift+J", lambda: self.layer_from_selection(True))], "Ways to select a part of the picture")
         self.menuMove = self._menu_button("Move", [
             ("Move\tV", lambda: T("move")), ("Copy\tShift+V", lambda: T("copy")),
             ("Transform\tCtrl+T", self.start_transform)], "Move, copy or resize the selection")
@@ -1052,6 +1054,10 @@ class Card(QWidget):
         r2.addWidget(self._sep())
         for w in (self.menuSelect, self.menuMove, self.btnPick, self.btnPaint, self.menuErase, self.menuCrop):
             r2.addWidget(w)
+        self.btnLayerTop = QPushButton("\u29c9  Layer")
+        self.btnLayerTop.setToolTip("Selected area becomes a layer (Ctrl+J).  Then click it in the Layers tab to work on it alone.")
+        self.btnLayerTop.clicked.connect(lambda: self.layer_from_selection(False))
+        r2.addWidget(self.btnLayerTop)
         self.btnText = QPushButton("T  Text box")
         self.btnText.setToolTip("Text box (T): write Bangla / English on the page. Click it any time to move, resize, rotate, Alt + drag = copy, double click = edit.")
         r2.addWidget(self.btnText)
@@ -1773,30 +1779,48 @@ class Card(QWidget):
         # ---------------- Layers: every picture and text box on the page, drag to change the order
         pg, lay = self._page()
         g, gl = self._group_box("Layers", collapsible=False)
-        hint = QLabel("Drag a layer up or down.  The top of the list is the front.  The tick shows / hides it.")
+        hint = QLabel("Select an area, then press Ctrl+J (copy) or Ctrl+Shift+J (cut) = it becomes a layer.  "
+                      "Click a layer = work on it alone.  Drag a row up / down = change the order.  The tick shows / hides it.")
         hint.setObjectName("hint")
         hint.setWordWrap(True)
         gl.addWidget(hint)
+        nrow = QHBoxLayout()
+        nrow.setSpacing(4)
+        self.btnNewLayer = QPushButton("\uff0b  New layer  (Ctrl+J)")
+        self.btnNewLayer.setProperty("accent", True)
+        self.btnNewLayer.setToolTip("The selected area becomes a layer (the page stays as it is).  Nothing selected = copy of the selected layer.")
+        self.btnCutLayer = QPushButton("\u2702  Cut to layer")
+        self.btnCutLayer.setToolTip("The selected area becomes a layer and is removed from the page  (Ctrl+Shift+J)")
+        for b_ in (self.btnNewLayer, self.btnCutLayer):
+            b_.setMinimumWidth(0)
+            nrow.addWidget(b_, 1)
+        gl.addLayout(nrow)
+        self.btnNewLayer.clicked.connect(lambda: self.layer_from_selection(False))
+        self.btnCutLayer.clicked.connect(lambda: self.layer_from_selection(True))
         self.layerList = LayerList()
         self.layerList.setObjectName("layers")
-        self.layerList.setIconSize(QSize(40, 40))
-        self.layerList.setMinimumHeight(240)
+        self.layerList.setIconSize(QSize(52, 52))
+        self.layerList.setMinimumHeight(260)
         gl.addWidget(self.layerList)
-        self.lblMainPic = QLabel("\u25bc  Main picture  (always at the bottom)")
-        self.lblMainPic.setObjectName("muted")
-        gl.addWidget(self.lblMainPic)
+        self.btnMainPic = QPushButton("\u25bc  Main picture  (always at the bottom) - click to work on it")
+        self.btnMainPic.setToolTip("Go back to the whole page: all tools work on the main picture again")
+        self.btnMainPic.clicked.connect(self._select_main)
+        gl.addWidget(self.btnMainPic)
         lrow = QHBoxLayout()
         lrow.setSpacing(4)
         self.btnLayerEdit = QPushButton("Edit")
+        self.btnLayerMove = QPushButton("\u2725  Move")
         self.btnLayerCopy = QPushButton("\u29c9  Copy")
         self.btnLayerDel = QPushButton("\u2715  Remove")
+        self.btnLayerMove.setToolTip("Move / resize / rotate the selected layer on the page")
         self.btnLayerCopy.setToolTip("Duplicate the selected layer  (Alt + drag on the page copies too)")
         self.btnLayerDel.setToolTip("Remove the selected layer  (Delete key)")
-        for b_ in (self.btnLayerEdit, self.btnLayerCopy, self.btnLayerDel):
+        for b_ in (self.btnLayerEdit, self.btnLayerMove, self.btnLayerCopy, self.btnLayerDel):
             b_.setMinimumWidth(0)
             lrow.addWidget(b_, 1)
         gl.addLayout(lrow)
         self.btnLayerEdit.clicked.connect(lambda: self.sel_layer is not None and self.edit_layer(self.sel_layer))
+        self.btnLayerMove.clicked.connect(lambda: self.sel_layer is not None and self.place_layer_tool(self.sel_layer))
         self.btnLayerCopy.clicked.connect(lambda: self.sel_layer is not None and self.duplicate_layer(self.sel_layer))
         self.btnLayerDel.clicked.connect(lambda: self.sel_layer is not None and self.delete_layer(self.sel_layer))
         self.layerList.itemClicked.connect(self._layer_list_clicked)
@@ -3223,6 +3247,106 @@ class Card(QWidget):
             self.canvas.fx.done("layer", "Picture added", "drag to move, corners resize, round handle rotates")
         self._job("Adding picture", work, done)
 
+    def _select_main(self):
+        """The 'Main picture' button: leave the layer, all tools work on the page again."""
+        def done():
+            self.sel_layer = None
+            self._refresh_layers_ui()
+        if self._tool == "transform" and self._place_id is not None:
+            self._end_layer_session()
+        self.leave_layer(done)
+
+    def layer_from_selection(self, cut=False):
+        """Ctrl+J: the selected area becomes a layer of its own (Ctrl+Shift+J = cut it out of the page as well).
+        Nothing selected = a copy of the selected layer.  The new layer opens at once: every tool works on it alone."""
+        if not self._loaded:
+            return
+        if self._tool == "transform" and self._place_id is not None:
+            self._end_layer_session()
+        if self.sel is None:
+            if self.sel_layer is not None and self._layer(self.sel_layer) is not None and not cut:
+                self.duplicate_layer(self.sel_layer)
+            else:
+                self._warn("Nothing is selected. Select an area first (Select menu), then press Ctrl+J to make it a layer.")
+            return
+        inlayer = self.ctx is not None
+        parent = self._layer(self.ctx) if inlayer else None
+        if inlayer and (parent is None or parent["n"] != 1):
+            self._warn("This layer is bent (Warp). Go back to the main picture, then make the layer.")
+            return
+        sel, base, adjs, look, ink = self.sel, self.base, copy.deepcopy(self.adjs), dict(self.look), self.keep_ink
+        alpha = self.alpha
+        W, H = base.size
+        label = "Cutting to a layer" if cut else "Making a layer"
+
+        def work(progress):
+            mask = self._mask_img(sel, base.size)
+            bb = mask.point(lambda v: 255 if v > 8 else 0).getbbox()
+            if bb is None:
+                return None
+            progress(0.2, "")
+            shown = core.render_full(base, adjs, look, sel)            # what you SEE is what the layer gets
+            rgb = shown.crop(bb)
+            a = mask.crop(bb)
+            if alpha is not None:
+                a = ImageChops.multiply(a, alpha.crop(bb))
+            if a.getextrema()[1] < 8:
+                return None
+            newbase = None
+            if cut and not inlayer:
+                newbase = core.erase_region(base, mask, None, 2.0, ink)
+            progress(0.8, "")
+            return rgb, a, bb, mask, newbase
+
+        def done(r):
+            if r is None:
+                self._warn("The selected area is empty (or fully transparent).")
+                return
+            rgb, a, bb, mask, newbase = r
+            x0, y0, x1, y1 = bb
+            if inlayer:                                   # the corners follow the parent layer on the page
+                tl, tr, bl, br = parent["grid"]
+
+                def pt(u, v):
+                    top = (tl[0] + (tr[0] - tl[0]) * u, tl[1] + (tr[1] - tl[1]) * u)
+                    bot = (bl[0] + (br[0] - bl[0]) * u, bl[1] + (br[1] - bl[1]) * u)
+                    return (top[0] + (bot[0] - top[0]) * v, top[1] + (bot[1] - top[1]) * v)
+                grid = [pt(x0 / W, y0 / H), pt(x1 / W, y0 / H), pt(x0 / W, y1 / H), pt(x1 / W, y1 / H)]
+            else:
+                grid = [(x0 / W, y0 / H), (x1 / W, y0 / H), (x0 / W, y1 / H), (x1 / W, y1 / H)]
+            self._layer_seq += 1
+            nums = [int(l["name"][6:]) for l in self.layers if l["name"].startswith("Layer ") and l["name"][6:].isdigit()]
+            bg = dict(self.BG_DEFAULT, remove=False, opacity=100)
+            layer = {"id": self._layer_seq, "name": "Layer %d" % (max(nums, default=0) + 1),
+                     "rgb": rgb, "a": a, "src": rgb, "sa": a, "bg": bg, "grid": grid, "n": 1,
+                     "opacity": 100, "visible": True}
+            lid = layer["id"]
+            self._checkpoint("Layer")
+            i = len(self.layers)
+            if inlayer:
+                i = next((k for k, l in enumerate(self.layers) if l["id"] == self.ctx), len(self.layers) - 1) + 1
+            self.layers = self.layers[:i] + [layer] + self.layers[i:]
+            self.ops += 1
+            self.sel_layer = lid
+
+            def open_it():
+                self.show_tab(self.TAB_LAYERS)
+                self._refresh_layers_ui()
+                self.edit_layer(lid)
+            if cut:
+                if inlayer:
+                    pa = self.alpha
+                    self._edit_base("Cutting", lambda progress: self.base, checkpoint=False, after=open_it,
+                                    alpha_make=lambda progress: self._alpha_minus(pa, mask))
+                else:
+                    self._edit_base("Cutting", lambda progress: newbase, checkpoint=False, after=open_it)
+            else:
+                self._touch()
+                self._timer.start()
+                open_it()
+            self.canvas.fx.done("layer", "Layer made", "click a layer in the Layers tab to work on it alone")
+        self._job(label, work, done)
+
     def select_layer(self, lid):
         self.sel_layer = lid
         self._refresh_layers_ui()
@@ -3610,21 +3734,36 @@ class Card(QWidget):
         self._icon_cache = keep
         if self.sel_layer is None or self._layer(self.sel_layer) is None:
             lw.clearSelection()
-        lw.setEnabled(self.ctx is None)
+        lw.setEnabled(True)
         lw.blockSignals(False)
         l = None if self.sel_layer is None else self._layer(self.sel_layer)
-        on = l is not None and self.ctx is None
+        on = l is not None
         is_text = l is not None and l.get("text") is not None
         self.btnLayerEdit.setText("Aa  Edit text" if is_text else "Edit picture")
-        for b_ in (self.btnLayerEdit, self.btnLayerCopy, self.btnLayerDel):
+        for b_ in (self.btnLayerEdit, self.btnLayerMove, self.btnLayerCopy, self.btnLayerDel):
             b_.setEnabled(on)
+        main_on = self.ctx is None and not on
+        self.btnMainPic.setProperty("accent", bool(main_on))
+        self.btnMainPic.style().unpolish(self.btnMainPic)
+        self.btnMainPic.style().polish(self.btnMainPic)
+        self.btnMainPic.setText(("\u25bc  Main picture  \u2714  (working here)" if main_on
+                                 else "\u25bc  Main picture  (always at the bottom) - click to work on it"))
 
     def _layer_list_clicked(self, it):
         if self._skip_click:                                      # it was a click on the tick box: only show / hide
             self._skip_click = False
             return
         lid = it.data(Qt.ItemDataRole.UserRole)
-        QTimer.singleShot(0, lambda: self._layer(lid) is not None and self.place_layer_tool(lid))
+
+        def go():
+            l = self._layer(lid)
+            if l is None:
+                return
+            if l.get("text") is not None:
+                self.place_layer_tool(lid)               # a text box: move / resize it (Aa tab for the text)
+            else:
+                self.edit_layer(lid)                     # a picture layer: every tool works on it alone
+        QTimer.singleShot(0, go)
 
     def _layer_list_checked(self, it):
         self._skip_click = True

@@ -460,6 +460,8 @@ SHORTCUT_GROUPS = (
         ("Ctrl+A", "Select all"),
         ("Ctrl+D", "Deselect"),
         ("Ctrl+Shift+I", "Inverse selection"),
+        ("Ctrl+J", "New layer from the selection (nothing selected = copy of the selected layer)"),
+        ("Ctrl+Shift+J", "Cut the selection to a new layer (the place is filled from the paper around it)"),
         ("Shift + select", "Add to selection"),
         ("Alt + select", "Subtract from selection"),
         ("Delete / Backspace", "Delete the selection (filled from the paper around it)"))),
@@ -1007,6 +1009,8 @@ class MainWindow(QMainWindow):
         sc("Ctrl+A", cur(lambda c: c.select_all()), "Select all")
         sc("Ctrl+D", cur(lambda c: c.deselect()), "Deselect")
         sc("Ctrl+Shift+I", cur(lambda c: c.invert_selection()), "Invert selection")
+        sc("Ctrl+J", cur(lambda c: c.layer_from_selection(False)), "New layer from selection")
+        sc("Ctrl+Shift+J", cur(lambda c: c.layer_from_selection(True)), "Cut selection to a layer")
         sc("Ctrl+T", cur(lambda c: c.start_transform()), "Transform")
         del_label = lambda: "Delete selection" if (self.carousel.current() is not None and self.carousel.current().sel is not None) else None
         sc("Delete", cur(lambda c: c.delete_selection()), del_label)

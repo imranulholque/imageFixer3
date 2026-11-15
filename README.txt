@@ -251,3 +251,12 @@ NEW (phone scanner round 7)
 - Phone UI: the live camera now fills the whole screen; back / light / auto-capture / phone-camera buttons float on top as round glass buttons,
   the shutter is at the bottom (turns green when the page is steady), with a gallery button and a "done" button with the page count.
   The paper outline has corner brackets. The home screen is simpler, shows the connection and a card "N pages ready to send".
+
+NEW (layers from a selection, like Picsart)
+- Select an area (any Select tool, Color range ...), then press Ctrl+J (or the "Layer" button in the top bar, or the Layers tab "New layer")
+  = the area becomes a layer, exactly in the same place.  Ctrl+Shift+J = "Cut to layer": the area is also removed from the page.
+  Nothing selected + a layer selected: Ctrl+J copies that layer.
+- Layers tab: small picture of every layer.  CLICK a layer = every tool (Select, Color range, Adjust, Shadow, Erase, Crop ...) works on
+  that layer ONLY, and the main screen shows that layer.  Click "Main picture" (bottom of the list) to work on the whole page again.
+  Drag a row up / down = order.  The tick = hide / show.  Buttons: Edit, Move (move / resize / rotate on the page), Copy, Remove.
+- Inside a layer you can make a selection and press Ctrl+J again (layer in a layer).  Not for a bent (Warp) layer.
