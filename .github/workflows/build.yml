@@ -23,7 +23,7 @@ jobs:
       - name: Stamp build info
         shell: python
         run: |
-          open("buildinfo.py", "w").write('BUILD = ${{ github.run_number }}\nREPO = "${{ github.repository }}"\nCOMMIT = "${{ github.sha }}"\n')
+          open("buildinfo.py", "w").write('BUILD = ${{ github.run_number }}\nREPO = "${{ github.repository }}"\nREPO_ID = ${{ github.repository_id }}\nCOMMIT = "${{ github.sha }}"\n')
       - name: Updater test
         continue-on-error: true
         run: python test_updater.py
