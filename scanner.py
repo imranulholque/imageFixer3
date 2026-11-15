@@ -1860,6 +1860,14 @@ def _detect_fast(img, want_debug=None):
             pass
         scored.append((v0 * pu, q, q0))
     scored.sort(key=lambda r: -r[0])
+    try:                                                       # learned from the user's own accepted crops: re-order the outlines
+        import croplearn
+        ls = croplearn.scores(small, [(r[0], r[1]) for r in scored])
+        if ls is not None:
+            order = sorted(range(len(scored)), key=lambda i: -ls[i])
+            scored = [scored[i] for i in order]
+    except Exception:
+        pass
     if want_debug is not None:
         want_debug.append(("scored", [(r[0], [(x / s, y / s) for x, y in r[1]]) for r in scored], None))
     pick = scored[0]

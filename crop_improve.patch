@@ -1,0 +1,46 @@
+--- orig/imageFixer3-main/scanner.py	2026-11-15 08:05:04.000000000 +0000
++++ imageFixer3-main/scanner.py	2026-11-15 13:59:40.350309863 +0000
+@@ -1860,6 +1860,14 @@
+             pass
+         scored.append((v0 * pu, q, q0))
+     scored.sort(key=lambda r: -r[0])
++    try:                                                       # learned from the user's own accepted crops: re-order the outlines
++        import croplearn
++        ls = croplearn.scores(small, [(r[0], r[1]) for r in scored])
++        if ls is not None:
++            order = sorted(range(len(scored)), key=lambda i: -ls[i])
++            scored = [scored[i] for i in order]
++    except Exception:
++        pass
+     if want_debug is not None:
+         want_debug.append(("scored", [(r[0], [(x / s, y / s) for x, y in r[1]]) for r in scored], None))
+     pick = scored[0]
+--- orig/imageFixer3-main/phone.py	2026-11-15 08:05:04.000000000 +0000
++++ imageFixer3-main/phone.py	2026-11-15 14:05:56.361013018 +0000
+@@ -712,7 +712,25 @@
+   const centre=1-0.5*Math.hypot(cx-w/2,cy-h/2)/Math.hypot(w/2,h/2),con=sideContrast(chb,w,h,q);
+   cands.push({q,fill,frac,score:con*Math.sqrt(frac)*Math.sqrt(centre)*Math.min(1,fill),con});}
+  return cands;}
+-function coarseQuad(d,w,h){const c=coarseCands(d,w,h);if(!c.length)return null;c.sort((a,b)=>b.score-a.score);return c[0];}
++// learned re-ranking of the candidate outlines (trained on the user's own accepted crops, see croplearn.py): a candidate that
++// holds the other good ones (= the whole sheet, not a header / photo / barcode inside it) and does not hug the border with every
++// corner wins over one that only has a slightly stronger edge. Works on a 96 px copy, ~5 ms.
++function quadMask(q,w,h){const m=new Uint8Array(w*h);let x0=w,y0=h,x1=0,y1=0;for(const p of q){x0=Math.min(x0,p.x);x1=Math.max(x1,p.x);y0=Math.min(y0,p.y);y1=Math.max(y1,p.y);}
++ x0=Math.max(0,Math.floor(x0));y0=Math.max(0,Math.floor(y0));x1=Math.min(w-1,Math.ceil(x1));y1=Math.min(h-1,Math.ceil(y1));
++ let sg=0;for(let i=0;i<4;i++){const a=q[i],b=q[(i+1)%4];sg+=a.x*b.y-b.x*a.y;}sg=sg>=0?1:-1;
++ for(let y=y0;y<=y1;y++)for(let x=x0;x<=x1;x++){let ok=true;for(let i=0;i<4&&ok;i++){const a=q[i],b=q[(i+1)%4];if(sg*((b.x-a.x)*(y+0.5-a.y)-(b.y-a.y)*(x+0.5-a.x))<0)ok=false;}if(ok)m[y*w+x]=1;}
++ return m;}
++function rankCands(cands,W,H){ // -> cands sorted best first
++ if(cands.length<2)return cands;
++ const k=96/Math.max(W,H),w=Math.max(8,Math.round(W*k)),h=Math.max(8,Math.round(H*k)),N=w*h,mg=0.02*Math.max(w,h);
++ const qs=cands.map(c=>c.q.map(p=>({x:p.x*k,y:p.y*k}))),ms=qs.map(q=>quadMask(q,w,h)),cnt=ms.map(m=>{let s=0;for(let i=0;i<N;i++)s+=m[i];return Math.max(s,1);});
++ const smax=Math.max(...cands.map(c=>c.score))+1e-9,Wt=[0.3312,0.535,-0.6354],Mu=[0.7589,0.8816,0.5609],Sd=[0.2712,0.232,0.3681];
++ cands.forEach((c,i)=>{let tot=0,n=0;
++  for(let j=0;j<cands.length;j++){if(j===i)continue;const rj=cands[j].score/smax;let ov=0;for(let p=0;p<N;p++)if(ms[i][p]&&ms[j][p])ov++;tot+=rj*ov/cnt[j];n+=rj;}
++  const touch=qs[i].reduce((a,p)=>a+((p.x<mg||p.y<mg||p.x>w-mg||p.y>h-mg)?1:0),0)/4,f=[c.score/smax,tot/Math.max(n,1e-6),touch];
++  c.rank=f.reduce((a,v,t)=>a+Wt[t]*(v-Mu[t])/Sd[t],0);});
++ return cands.slice().sort((a,b)=>b.rank-a.rank);}
++function coarseQuad(d,w,h){const c=coarseCands(d,w,h);if(!c.length)return null;try{return rankCands(c,w,h)[0];}catch(e){}c.sort((a,b)=>b.score-a.score);return c[0];}
+ 
+ // straight-edge refinement: every side of the outline is moved onto the real edge in the picture (many samples + a robust line fit),
+ // the corners are the meeting points of the 4 fitted lines -> straight sides, exact corners, no wobble.
