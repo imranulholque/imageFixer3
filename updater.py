@@ -4,7 +4,9 @@ No Qt in here (so it can be tested alone). The window part is in updatedlg.py.
 How it works
   * The GitHub build (build.yml) publishes every finished build as a Release called  build-<number>  with the file
     ImageFixer-windows.zip, and writes the number + repository into buildinfo.py before packing.
-  * The program asks   https://api.github.com/repos/<repo>/releases/latest   and compares the number with its own.
+  * The program asks   https://api.github.com/repositories/<id>/releases/latest   (the id never changes, so a renamed GitHub
+    user / repository is found automatically; older builds without the id use /repos/<repo>/, which GitHub redirects)
+    and compares the number with its own.  The download address is taken from GitHub's answer, not from the old name.
   * Install = download the zip, unpack it next to the temp folder, close the program, a small .bat copies the new
     files over the program folder and starts it again.  Settings are not in that folder, so they stay."""
 import hashlib
@@ -27,6 +29,10 @@ try:
     REPO = str(buildinfo.REPO)
 except Exception:
     BUILD, REPO = 0, ""
+try:
+    REPO_ID = int(buildinfo.REPO_ID)          # GitHub's own number for the repository: it never changes when the user name or repo name changes
+except Exception:
+    REPO_ID = 0
 
 API_BASE = "https://api.github.com"
 ASSET = "ImageFixer-windows.zip"
@@ -59,7 +65,7 @@ def install_dir():
 
 def can_self_update():
     """True only for the packed Windows program that knows its GitHub repository."""
-    return sys.platform == "win32" and is_frozen() and bool(REPO) and BUILD > 0
+    return sys.platform == "win32" and is_frozen() and bool(REPO or REPO_ID) and BUILD > 0
 
 
 def version_text():
@@ -67,6 +73,15 @@ def version_text():
 
 
 # ------------------------------------------------------------------ checking
+RELEASE_PAGE_RE = re.compile(r"^https://github\.com/([^/\s]+/[^/\s]+)/releases(?:/|$)")
+
+
+def current_repo_name(data, repo):
+    """The repository name GitHub says it has NOW (it changes when the owner renames the account or repository)."""
+    m = RELEASE_PAGE_RE.match(str(data.get("html_url") or ""))
+    return m.group(1) if m else repo
+
+
 def parse_release(data, repo, current):
     """GitHub 'latest release' json -> dict about the update, or None when there is nothing newer to install."""
     m = TAG_RE.match(str(data.get("tag_name", "")))
@@ -79,13 +94,14 @@ def parse_release(data, repo, current):
         if a.get("name") != ASSET:
             continue
         url = str(a.get("browser_download_url", ""))
-        if not url.startswith("https://github.com/%s/releases/download/" % repo):
+        ok = [r.lower() for r in {repo, current_repo_name(data, repo)} if r]
+        if not any(url.lower().startswith("https://github.com/%s/releases/download/" % r) for r in ok):
             raise UpdateError("The update has an unexpected download address.")
         digest = str(a.get("digest") or "")
         return {"build": build, "tag": data["tag_name"], "name": data.get("name") or data["tag_name"],
                 "notes": (data.get("body") or "").strip(), "url": url, "size": int(a.get("size") or 0),
                 "sha256": digest[7:].lower() if digest.startswith("sha256:") else "",
-                "page": data.get("html_url") or "https://github.com/%s/releases" % repo}
+                "page": data.get("html_url") or "https://github.com/%s/releases" % current_repo_name(data, repo)}
     return None                                    # release still being uploaded: ask again next time
 
 
@@ -93,9 +109,11 @@ def check(repo=None, current=None, timeout=15):
     """Asks GitHub. Returns the update dict, or None = you are up to date. Raises UpdateError when it cannot ask."""
     repo = REPO if repo is None else repo
     current = BUILD if current is None else current
-    if not repo:
+    rid = REPO_ID if repo == REPO else 0
+    if not repo and not rid:
         raise UpdateError("This copy was not made by the GitHub build, so it does not know where to look for updates.")
-    req = urllib.request.Request("%s/repos/%s/releases/latest" % (API_BASE, repo),
+    where = "repositories/%d" % rid if rid else "repos/%s" % repo      # id first: still works after a user / repo rename
+    req = urllib.request.Request("%s/%s/releases/latest" % (API_BASE, where),
                                  headers={"Accept": "application/vnd.github+json", "User-Agent": "ImageFixer-updater"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:

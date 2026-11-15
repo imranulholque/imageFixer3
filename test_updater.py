@@ -41,6 +41,18 @@ def main():
         raise SystemExit("foreign download address accepted")
     except updater.UpdateError:
         pass
+    # renamed GitHub user: the program still knows the OLD name, GitHub's answer has the NEW one -> must still be accepted
+    new = "newname/imageFixer3"
+    moved = rel(html_url="https://github.com/%s/releases/tag/build-12" % new,
+                assets=[{"name": updater.ASSET, "browser_download_url": URL.replace(REPO, new), "size": 5}])
+    assert updater.parse_release(moved, REPO, 11)["url"] == URL.replace(REPO, new)
+    evil = rel(html_url="https://github.com/%s/releases/tag/build-12" % new,
+               assets=[{"name": updater.ASSET, "browser_download_url": "https://github.com/evil/x/releases/download/build-12/ImageFixer-windows.zip"}])
+    try:
+        updater.parse_release(evil, REPO, 11)
+        raise SystemExit("foreign repository accepted")
+    except updater.UpdateError:
+        pass
     sha = "a" * 64
     r = updater.parse_release(rel(assets=[{"name": updater.ASSET, "browser_download_url": URL, "digest": "sha256:" + sha.upper()}]), REPO, 1)
     assert r["sha256"] == sha

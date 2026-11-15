@@ -2,4 +2,5 @@
 In the repository it stays like this: BUILD 0 = a development copy, which never offers updates."""
 BUILD = 0
 REPO = ""
+REPO_ID = 0
 COMMIT = ""
