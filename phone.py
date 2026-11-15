@@ -577,7 +577,7 @@ class PhoneServer(QObject):
         return {"stored": len(b["files"]), "done": done}
 
 
-SW_JS = r"""const C='if-shell-v2';
+SW_JS = r"""const C='if-shell-v3';
 self.addEventListener('install',e=>{self.skipWaiting();e.waitUntil(caches.open(C).then(c=>c.addAll([self.registration.scope,'manifest.webmanifest','icon.svg','engine.js'])).catch(()=>{}));});
 self.addEventListener('activate',e=>e.waitUntil(caches.keys().then(k=>Promise.all(k.filter(x=>x!==C).map(x=>caches.delete(x)))).then(()=>self.clients.claim())));
 self.addEventListener('fetch',e=>{const r=e.request,u=new URL(r.url);
@@ -633,6 +633,23 @@ function hullOf(pts){ // convex hull (monotone chain)
  const lo=[];for(const p of pts){while(lo.length>=2&&cr(lo[lo.length-2],lo[lo.length-1],p)<=0)lo.pop();lo.push(p);}
  const up=[];for(let i=pts.length-1;i>=0;i--){const p=pts[i];while(up.length>=2&&cr(up[up.length-2],up[up.length-1],p)<=0)up.pop();up.push(p);}
  lo.pop();up.pop();return lo.concat(up);}
+function fillHoles(lab,w,h){ // holes inside a blob (a dark face / printed picture inside a paper) are not "outside" the paper -> {lab,n}
+ const N=w*h,out=new Uint8Array(N),st=new Int32Array(N);let sp=0;
+ const seed=p=>{if(!lab[p]&&!out[p]){out[p]=1;st[sp++]=p;}};
+ for(let x=0;x<w;x++){seed(x);seed((h-1)*w+x);}for(let y=0;y<h;y++){seed(y*w);seed(y*w+w-1);}
+ while(sp){const p=st[--sp],x=p%w,y=(p-x)/w;if(x>0)seed(p-1);if(x<w-1)seed(p+1);if(y>0)seed(p-w);if(y<h-1)seed(p+w);}
+ const f=new Uint8Array(N);let n=0;for(let i=0;i<N;i++)if(!out[i]){f[i]=1;n++;}return {lab:f,n};}
+function noiseMask(d,w,h){ // mask for SMALL things (a passport photo, a card): the table colour = median of the border strip, the threshold comes from the table's own texture noise
+ const N=w*h,m=Math.max(2,Math.round(Math.min(w,h)*0.04));if(m*2>=Math.min(w,h))return null;
+ const cnt=N-(w-2*m)*(h-2*m);if(cnt<16)return null;
+ const rr=new Float32Array(cnt),gg=new Float32Array(cnt),bb=new Float32Array(cnt);let k=0;
+ for(let y=0;y<h;y++)for(let x=0;x<w;x++){if(x<m||y<m||x>=w-m||y>=h-m){const i=4*(y*w+x);rr[k]=d[i];gg[k]=d[i+1];bb[k]=d[i+2];k++;}}
+ rr.sort();gg.sort();bb.sort();const cr=rr[cnt>>1],cg=gg[cnt>>1],cb=bb[cnt>>1],d0=new Float32Array(N);
+ for(let i=0;i<N;i++){const a=d[4*i]-cr,b=d[4*i+1]-cg,c=d[4*i+2]-cb;d0[i]=Math.sqrt(a*a+b*b+c*c);}
+ const dd=blurF(blurF(d0,w,h,1),w,h,1),bv=new Float32Array(cnt);k=0;
+ for(let y=0;y<h;y++)for(let x=0;x<w;x++){if(x<m||y<m||x>=w-m||y>=h-m)bv[k++]=dd[y*w+x];}
+ bv.sort();const p98=bv[Math.min(cnt-1,Math.floor(cnt*0.98))],thr=Math.max(14,1.6*p98),o=new Uint8Array(N);
+ for(let i=0;i<N;i++)o[i]=dd[i]>thr?1:0;return o;}
 function lineX(p0,p1,p2,p3){ // intersection of line p0p1 with line p2p3 -> {x,y,t,s} (t along p0p1, s along p2p3) or null
  const d1x=p1.x-p0.x,d1y=p1.y-p0.y,d2x=p3.x-p2.x,d2y=p3.y-p2.y,den=d1x*d2y-d1y*d2x;if(Math.abs(den)<1e-9)return null;
  const t=((p2.x-p0.x)*d2y-(p2.y-p0.y)*d2x)/den,s=((p2.x-p0.x)*d1y-(p2.y-p0.y)*d1x)/den;return {x:p0.x+t*d1x,y:p0.y+t*d1y,t,s};}
@@ -679,17 +696,18 @@ function coarseCands(d,w,h){
  const u4=dist(med(R),med(G),med(B));                       // small = like the paper
  const t1=otsu(u1),t2=otsu(u2),t4=otsu(u4),masks=[],pm=new Uint8Array(N);
  const mk=f=>{const a=new Uint8Array(N);for(let i=0;i<N;i++)a[i]=f(i)?1:0;return a;};
- masks.push(mk(i=>u2[i]>t2),mk(i=>u1[i]>t1&&u2[i]>t2*0.7),mk(i=>u1[i]>t1),mk(i=>u4[i]<t4),mk(i=>u4[i]<t4*0.6));
+ masks.push([mk(i=>u2[i]>t2),3],[mk(i=>u1[i]>t1&&u2[i]>t2*0.7),3],[mk(i=>u1[i]>t1),3],[mk(i=>u4[i]<t4),3],[mk(i=>u4[i]<t4*0.6),3]);
+ const nm=noiseMask(d,w,h);if(nm)masks.push([nm,1]);
  const cands=[];
- for(const mkm of masks){
+ for(const [mkm,rad] of masks){
   let a=new Float32Array(N);for(let i=0;i<N;i++)a[i]=mkm[i];
-  a=blurF(a,w,h,3);const c1=new Uint8Array(N);for(let i=0;i<N;i++)c1[i]=a[i]>0.4?1:0;
-  a=new Float32Array(N);for(let i=0;i<N;i++)a[i]=c1[i];a=blurF(a,w,h,3);const c2=new Uint8Array(N);for(let i=0;i<N;i++)c2[i]=a[i]>0.6?1:0;
-  const bl=bigBlob(c2,w,h);if(!bl)continue;const frac=bl.n/N;if(frac<0.08||frac>0.985)continue;
+  a=blurF(a,w,h,rad);const c1=new Uint8Array(N);for(let i=0;i<N;i++)c1[i]=a[i]>0.4?1:0;
+  a=new Float32Array(N);for(let i=0;i<N;i++)a[i]=c1[i];a=blurF(a,w,h,rad);const c2=new Uint8Array(N);for(let i=0;i<N;i++)c2[i]=a[i]>0.6?1:0;
+  const bl0=bigBlob(c2,w,h);if(!bl0)continue;const bl=fillHoles(bl0.lab,w,h),frac=bl.n/N;if(bl.n<30||frac<0.0015||frac>0.985)continue;
   const pts=[];let cx=0,cy=0;
   for(let y=0;y<h;y++)for(let x=0;x<w;x++){const p=y*w+x;if(!bl.lab[p])continue;cx+=x;cy+=y;
    const edge=x===0||y===0||x===w-1||y===h-1||!bl.lab[p-1]||!bl.lab[p+1]||!bl.lab[p-w]||!bl.lab[p+w];if(edge)pts.push({x:x+0.5,y:y+0.5});}
-  if(pts.length<8)continue;const hull=hullOf(pts);if(hull.length<4)continue;const q=orderQuad(quadFromHull(hull));
+  if(pts.length<8)continue;const hull=hullOf(pts);if(hull.length<4)continue;const qh=quadFromHull(hull);if(qh.length!==4)continue;const q=orderQuad(qh);
   const area=Math.max(1,polyArea(q)),fill=bl.n/area;cx/=bl.n;cy/=bl.n;if(fill<0.7||fill>1.25)continue;
   const centre=1-0.5*Math.hypot(cx-w/2,cy-h/2)/Math.hypot(w/2,h/2),con=sideContrast(chb,w,h,q);
   cands.push({q,fill,frac,score:con*Math.sqrt(frac)*Math.sqrt(centre)*Math.min(1,fill),con});}
@@ -704,6 +722,8 @@ function refineQuad(d,w,h,q0,rounds){
  const smp=(x,y,c)=>{x=x<0?0:x>w-1.001?w-1.001:x;y=y<0?0:y>h-1.001?h-1.001:y;const x0=x|0,y0=y|0,fx=x-x0,fy=y-y0,i=y0*w+x0,a=ch[c];
   return (a[i]*(1-fx)+a[i+1]*fx)*(1-fy)+(a[i+w]*(1-fx)+a[i+w+1]*fx)*fy;};
  let q=q0.map(p=>({x:p.x,y:p.y})),band=Math.max(6,0.03*Math.max(w,h)),moved=0;
+ let minSide=1e30;for(let i=0;i<4;i++)minSide=Math.min(minSide,Math.hypot(q0[(i+1)%4].x-q0[i].x,q0[(i+1)%4].y-q0[i].y));
+ band=Math.max(2.5,Math.min(band,0.2*minSide));   // a small object must not search for its edge far away, into the table
  for(let r=0;r<(rounds||2);r++){
   const cen={x:q.reduce((a,p)=>a+p.x,0)/4,y:q.reduce((a,p)=>a+p.y,0)/4},lines=[];
   for(let i=0;i<4;i++){
@@ -743,7 +763,7 @@ function findPaper(d,W,H,small,smW,smH,opt){ // small = the same picture scaled 
  const best=coarseQuad(small,smW,smH),k=W/smW;
  if(!best){const mm=0.04;return {quad:[[mm,mm],[1-mm,mm],[1-mm,1-mm],[mm,1-mm]].map(p=>({x:p[0]*W,y:p[1]*H})),found:false};}
  let q=best.q.map(p=>({x:p.x*k,y:p.y*k}));
- let found=best.fill>0.82&&best.frac>0.15;
+ let found=best.fill>0.82&&(best.frac>0.15||best.con>25);
  if(!(opt&&opt.noRefine)){try{const r=refineQuad(d,W,H,q,(opt&&opt.rounds)||3);if(r.moved)q=r.quad;}catch(e){}}
  q=orderQuad(q).map(p=>({x:Math.max(0,Math.min(W,p.x)),y:Math.max(0,Math.min(H,p.y))}));
  return {quad:q,found};}
@@ -751,10 +771,13 @@ function findPaper(d,W,H,small,smW,smH,opt){ // small = the same picture scaled 
 function detectLocal(src,live){ // -> {quad:[TL,TR,BR,BL] in src pixels, found}. live = quick version for the camera view
  const W=bw(src),H=bh(src),mk=(side)=>{const s=Math.min(1,side/Math.max(W,H)),w=Math.max(8,Math.round(W*s)),h=Math.max(8,Math.round(H*s)),c=mkC();
   c.width=w;c.height=h;const g=c.getContext('2d',{willReadFrequently:true});g.imageSmoothingQuality='high';g.drawImage(src,0,0,w,h);return {w,h,d:g.getImageData(0,0,w,h).data,s};};
- const sm=mk(live?320:420);
+ const sm=mk(live?320:560);
  if(live){const r=findPaper(sm.d,sm.w,sm.h,sm.d,sm.w,sm.h,{rounds:2});const k=1/sm.s;return {quad:r.quad.map(p=>({x:p.x*k,y:p.y*k})),found:r.found};}
  const fn=mk(1000),r=findPaper(fn.d,fn.w,fn.h,sm.d,sm.w,sm.h,{rounds:3}),k=1/fn.s;
- return {quad:r.quad.map(p=>({x:Math.max(0,Math.min(W,p.x*k)),y:Math.max(0,Math.min(H,p.y*k))})),found:r.found};}
+ let pts=r.quad.map(p=>({x:Math.max(0,Math.min(W,p.x*k)),y:Math.max(0,Math.min(H,p.y*k))}));
+ const cx=pts.reduce((a,p)=>a+p.x,0)/4,cy=pts.reduce((a,p)=>a+p.y,0)/4;
+ pts=pts.map(p=>({x:cx+(p.x-cx)*0.995,y:cy+(p.y-cy)*0.995}));      // a hair inside the page edge: no sliver of table in the crop
+ return {quad:pts,found:r.found&&polyArea(pts)>=0.0015*W*H};}
 
 // the real proportions of the sheet from its 4 photographed corners (same maths as the computer's straighten): a tilted A4 stays A4
 function sheetRatio(q,W,H){const u0=W/2,v0=H/2,[tl,tr,br,bl]=q,dist=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y);
@@ -914,30 +937,59 @@ svg{width:26px;height:26px;fill:none;stroke:currentColor;stroke-width:2;stroke-l
 #toast.on{display:block}#toast.err{background:#3a1b22;border-color:#5a2630;color:#ffb4bd}
 #banner{position:fixed;left:12px;right:12px;top:calc(62px + env(safe-area-inset-top));z-index:44;background:#3a1b22;border:1px solid #5a2630;color:#ffb4bd;padding:10px 14px;border-radius:14px;font-size:13.5px;text-align:center;display:none}
 #banner.on{display:block}
-/* ---- camera: the whole screen is the camera, glass buttons float on top */
+/* ---- camera (DocScanner look): the whole camera picture is shown, glass buttons float on top */
 #cam.on{position:fixed;inset:0;z-index:30;background:#000;display:block;animation:none}
-#camV{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;background:#000}
+#camV{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000}
 #camO{position:absolute;inset:0;width:100%;height:100%;touch-action:none}
-.cTop,.cBot{position:absolute;left:0;right:0;display:flex;align-items:center;pointer-events:none}
-.cTop>*,.cBot>*{pointer-events:auto}
-.cTop{top:0;gap:10px;padding:calc(12px + env(safe-area-inset-top)) 14px 34px;background:linear-gradient(180deg,rgba(0,0,0,.55),rgba(0,0,0,0))}
-.cTop .gap{flex:1}
-.cBot{bottom:0;justify-content:space-between;padding:40px 30px calc(24px + env(safe-area-inset-bottom));background:linear-gradient(0deg,rgba(0,0,0,.6),rgba(0,0,0,0))}
-.gb{position:relative;flex:none;width:46px;height:46px;border-radius:50%;display:grid;place-items:center;background:rgba(24,26,36,.45);border:1px solid rgba(255,255,255,.22);-webkit-backdrop-filter:blur(16px) saturate(1.4);backdrop-filter:blur(16px) saturate(1.4);color:#fff;transition:transform .08s,background .15s,color .15s}
-.gb:active{transform:scale(.9)}
-.gb svg{width:22px;height:22px}
-.gb.on{background:rgba(255,214,102,.95);border-color:transparent;color:#1b1b1b}
-.gb.big{width:56px;height:56px}.gb.big svg{width:26px;height:26px}
-.gb .bd{position:absolute;right:-4px;top:-4px;min-width:21px;height:21px;border-radius:11px;background:var(--ok);color:#fff;font-size:12px;font-weight:700;display:grid;place-items:center;padding:0 5px;border:2px solid #000}
-#camShot{flex:none;width:80px;height:80px;border-radius:50%;border:4px solid #fff;padding:5px;display:grid;place-items:center;background:transparent;box-shadow:0 4px 24px rgba(0,0,0,.4)}
-#camShot::after{content:"";width:100%;height:100%;border-radius:50%;background:#fff;transition:transform .1s,background .25s}
-#camShot:active::after{transform:scale(.86)}
-#camShot.ready{border-color:#3ddc84}#camShot.ready::after{background:#3ddc84}
-#camMsg{position:absolute;left:50%;transform:translateX(-50%);top:calc(68px + env(safe-area-inset-top));width:max-content;max-width:calc(100% - 32px);padding:9px 16px;border-radius:16px;background:rgba(24,26,36,.55);-webkit-backdrop-filter:blur(16px);backdrop-filter:blur(16px);border:1px solid rgba(255,255,255,.16);font-size:14.5px;font-weight:650;text-align:center;line-height:1.3;pointer-events:none;transition:background .2s}
-#camMsg small{display:block;font-weight:500;font-size:12.5px;opacity:.85;margin-top:2px}
-#camMsg.ok{background:rgba(22,130,76,.82)}#camMsg.warn{background:rgba(150,92,0,.82)}
-.incam header,.incam #banner{display:none!important}
-.incam #toast{bottom:auto;top:calc(120px + env(safe-area-inset-top))}
+.cTop{position:absolute;left:0;right:0;top:0;display:flex;align-items:center;gap:10px;padding:calc(12px + env(safe-area-inset-top)) 12px 0;pointer-events:none}
+.cTop>*{pointer-events:auto}.cTop .gap{flex:1;pointer-events:none}
+.cBot{position:absolute;left:0;right:0;bottom:0;display:flex;align-items:center;padding:0 20px calc(22px + env(safe-area-inset-bottom));pointer-events:none}
+.cBot>*{pointer-events:auto}.cBot .side{flex:1;display:flex}.cBot .side.r{justify-content:flex-end}
+.gb{position:relative;flex:none;width:44px;height:44px;border-radius:50%;display:grid;place-items:center;background:rgba(0,0,0,.4);border:1.5px solid transparent;color:#fff;font-weight:700;font-size:20px;transition:transform .08s,background .15s,color .15s,border-color .15s}
+.gb:active{transform:scale(.9)}.gb svg{width:22px;height:22px}
+.gb.on{background:rgba(251,191,36,.25);border-color:#fbbf24;color:#fbbf24}
+#camTorch .sl{stroke:#fff}#camTorch.on .sl{display:none}
+.thumb{position:relative;flex:none;width:48px;height:48px;border-radius:50%;overflow:hidden;display:grid;place-items:center;background:rgba(0,0,0,.4);border:2px solid #fff;color:#fff}
+.thumb svg{width:22px;height:22px}.thumb img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:none}.thumb.has img{display:block}.thumb.has svg{display:none}
+.fin{background:var(--acc);color:#fff;font-weight:700;font-size:15.5px;padding:0 20px;min-height:48px;border-radius:26px}
+#camShot{flex:none;width:78px;height:78px;border-radius:50%;border:4px solid #fff;padding:7px;display:grid;place-items:center;background:transparent;transition:border-color .25s}
+#camShot::after{content:"";width:100%;height:100%;border-radius:50%;background:#fff}
+#camShot.ready{border-color:#3ddc84}
+#camMsg{position:absolute;left:50%;transform:translateX(-50%);top:calc(70px + env(safe-area-inset-top));width:max-content;max-width:calc(100% - 36px);padding:8px 16px;border-radius:18px;text-align:center;pointer-events:none;background:rgba(0,0,0,.6);transition:background .3s}
+#camMsg b{display:block;font-size:14px;line-height:1.3}#camMsg small{display:block;font-size:12px;color:rgba(255,255,255,.8);margin-top:1px;line-height:1.3}#camMsg small:empty{display:none}
+#camMsg.k2{background:rgba(20,83,45,.87)}#camMsg.k0{background:rgba(120,53,15,.87)}
+#camRet{position:absolute;left:50%;transform:translateX(-50%);top:calc(130px + env(safe-area-inset-top));padding:6px 14px;border-radius:16px;background:rgba(79,70,229,.87);font-size:13px;font-weight:700;pointer-events:none;white-space:nowrap}
+#tips{position:absolute;inset:0;z-index:5;background:rgba(0,0,0,.55);display:none;align-items:center;justify-content:center;padding:24px}
+#tips.on{display:flex}
+#tips .card{width:100%;max-width:420px;background:#151a24;border-radius:28px;padding:20px}
+#tips h3{margin:0 0 12px;font-size:20px}
+#tips .ti{display:flex;gap:10px;align-items:flex-start;font-size:14px;line-height:1.4;margin-top:10px}
+#tips .ti i{flex:none;width:22px;height:22px;border-radius:50%;background:#26295a;color:#c7d2fe;font-style:normal;font-size:12px;font-weight:700;display:grid;place-items:center}
+#tips .btn{margin-top:16px;width:100%;min-height:48px;background:var(--acc);border:0;color:#fff;font-weight:700}
+.incam header,.incam #banner,.inedit header,.inedit #banner{display:none!important}
+.incam #toast,.inedit #toast{bottom:auto;top:calc(120px + env(safe-area-inset-top))}
+/* ---- crop screen (DocScanner look) */
+#edit{background:#0b0d12}
+.eTop{flex:none;display:flex;align-items:center;gap:2px;padding:calc(6px + env(safe-area-inset-top)) 8px 4px}
+.eTop .tb{min-height:44px;padding:0 10px;border-radius:12px;font-size:14.5px;font-weight:600;white-space:nowrap}
+.eTop .disc{color:#fca5a5}.eTop .rtk{color:#c7d2fe}
+.eTop b{flex:1;min-width:0;text-align:center;font-size:17px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.eTop .ib{flex:none;width:40px;height:44px;display:grid;place-items:center;color:#fff}.eTop .ib svg{width:21px;height:21px}
+.ban{flex:none;margin:0 12px;min-height:58px;border-radius:14px;padding:10px 14px;display:flex;align-items:center;font-size:13px;line-height:1.35;color:#fff;background:#1f2937;opacity:0;transition:background .45s,opacity .32s}
+.ban.ok{background:#064e3b;opacity:1}.ban.warn{background:#78350f;opacity:1}
+#edit .stage{padding:0}
+.pop{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%) scale(.9);opacity:0;pointer-events:none;transition:opacity .2s,transform .2s;background:rgba(17,24,39,.9);border-radius:22px;padding:16px 22px;box-shadow:0 8px 28px rgba(0,0,0,.5);text-align:center;z-index:3;white-space:nowrap}
+.pop.on{opacity:1;transform:translate(-50%,-50%) scale(1)}
+.pop .tk b{display:block;color:#5eead4;font-size:16px}.pop .tk small{display:block;color:rgba(255,255,255,.8);font-size:13px;margin-top:3px}
+.pop .sr{display:flex;align-items:center;justify-content:center;gap:12px;font-size:16px;font-weight:500}.pop .tk+.sr{margin-top:12px}
+.sdoc{position:relative;flex:none;width:20px;height:28px;border-radius:6px;background:#374151;overflow:hidden}
+.sdoc::before{content:"";position:absolute;left:18%;right:18%;top:22%;height:2px;border-radius:2px;background:rgba(128,136,152,.45);box-shadow:0 5px 0 rgba(128,136,152,.45),0 10px 0 rgba(128,136,152,.45)}
+.sdoc::after{content:"";position:absolute;left:0;right:0;top:6%;height:2px;background:#14b8a6;box-shadow:0 -8px 8px rgba(20,184,166,.45);animation:sdoc 2s ease-in-out infinite}
+@keyframes sdoc{0%,100%{top:6%}50%{top:92%}}
+.eBar{flex:none;display:flex;gap:10px;align-items:center;padding:12px 12px calc(12px + env(safe-area-inset-bottom))}
+.eBar .ol{min-height:50px;padding:0 18px;border-radius:25px;border:1px solid #6b7280;color:#fff;font-weight:500;font-size:14.5px;white-space:nowrap}
+.eBar .pr{flex:1;min-height:50px;border-radius:25px;background:var(--acc);color:#fff;font-weight:700;font-size:16px}
+.eBar button:disabled{opacity:.4;pointer-events:none}
 /* ---- home */
 .hh{padding:6px 2px 2px}.hh h1{margin:0 0 4px;font-size:30px;letter-spacing:-.6px;line-height:1.1}.hh p{margin:0;color:var(--mut);font-size:14.5px;line-height:1.45}
 .hero{position:relative;overflow:hidden;border-radius:26px;padding:22px 20px}
@@ -973,26 +1025,30 @@ svg{width:26px;height:26px;fill:none;stroke:currentColor;stroke-width:2;stroke-l
 </section>
 
 <section class="scr" id="edit">
- <div class="pad"><div class="chips"><button class="chip" id="eAuto"><svg viewBox="0 0 24 24"><path d="M12 3l1.8 4.7L18.5 9.5l-4.7 1.8L12 16l-1.8-4.7L5.5 9.5l4.7-1.8z"/></svg>Find paper</button><button class="chip" id="eFull">Whole photo</button><button class="chip" id="eRotL" aria-label="Turn left"><svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8M3 3v5h5"/></svg></button><button class="chip" id="eRotR" aria-label="Turn right"><svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-3-6.7L21 8M21 3v5h-5"/></svg></button></div></div>
- <div class="stage"><canvas id="cv"></canvas><div class="wait" id="eWait"><div><div class="spin"></div>Finding the paper</div></div></div>
- <div class="hint" id="tip" style="padding:4px 16px"></div>
- <div class="dock"><div class="row"><button class="btn" id="eRetake">Retake</button><button class="btn pri" id="eOk" style="flex:2">Cut out</button></div></div>
+ <div class="eTop"><button class="tb disc" id="eDiscard">Discard</button><b>Crop the page</b><button class="tb rtk hide" id="eRetake">Retake</button><button class="ib" id="eRotL" aria-label="Turn left"><svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8M3 3v5h5"/></svg></button><button class="ib" id="eRotR" aria-label="Turn right"><svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-3-6.7L21 8M21 3v5h-5"/></svg></button></div>
+ <div class="ban" id="eBan"><span id="eBanT"></span></div>
+ <div class="stage"><canvas id="cv"></canvas>
+  <div class="pop" id="ePop"><div class="tk" id="ePopTk"><b>&#10003;&nbsp; Photo taken</b><small>You can move the phone away</small></div><div class="sr" id="ePopSr"><span class="sdoc"></span><span>Auto cropping&hellip;</span></div></div></div>
+ <div class="eBar"><button class="ol" id="eAuto">Auto</button><button class="ol" id="eFull">Whole photo</button><button class="pr" id="eOk">Crop</button></div>
 </section>
 
 <section class="scr" id="cam">
  <video id="camV" playsinline muted autoplay></video><canvas id="camO"></canvas>
  <div class="cTop">
-  <button class="gb" id="camBack" aria-label="Back"><svg viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></svg></button><span class="gap"></span>
-  <button class="gb" id="camTorch" aria-label="Light"><svg viewBox="0 0 24 24"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></svg></button>
+  <button class="gb" id="camBack" aria-label="Back"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button><span class="gap"></span>
+  <button class="gb" id="camTipB" aria-label="Tips">?</button>
   <button class="gb" id="camAuto" aria-label="Auto capture"><svg viewBox="0 0 24 24"><circle cx="12" cy="13.5" r="7.5"/><path d="M12 9.5v4l2.5 2M9.5 2.5h5"/></svg></button>
   <button class="gb" id="camNative" aria-label="Use the phone's own camera app"><svg viewBox="0 0 24 24"><path d="M4 8h3l2-3h6l2 3h3a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1z"/><circle cx="12" cy="13" r="3.5"/></svg></button>
+  <button class="gb" id="camTorch" aria-label="Light"><svg viewBox="0 0 24 24"><path d="M13.5 2 5 13.5h6L10 22l9-12h-6z"/><path class="sl" d="M4 3.6l16 16.8"/></svg></button>
  </div>
- <div id="camMsg">Starting the camera ...</div>
+ <div id="camMsg" class="k1"><b id="camT1">Starting the camera ...</b><small id="camT2"></small></div>
+ <div id="camRet" class="hide"></div>
  <div class="cBot">
-  <button class="gb big" id="camGal" aria-label="Pick a saved photo"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><circle cx="9" cy="10" r="1.6"/><path d="m21 16-5-5-8 8"/></svg></button>
+  <div class="side"><button class="thumb" id="camGal" aria-label="Pick a saved photo"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><circle cx="9" cy="10" r="1.6"/><path d="m21 16-5-5-8 8"/></svg><img id="camThumb" alt=""></button></div>
   <button id="camShot" aria-label="Take the photo"></button>
-  <button class="gb big" id="camDone" aria-label="Review the pages" style="visibility:hidden"><svg viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7"/></svg><i class="bd" id="camN">0</i></button>
+  <div class="side r"><button class="fin hide" id="camDone">Finish (0)</button></div>
  </div>
+ <div id="tips"><div class="card"><h3>For the best scan</h3><div id="tipsL"></div><button class="btn" id="tipsOk">Got it</button></div></div>
 </section>
 
 <section class="scr" id="review">
@@ -1025,7 +1081,7 @@ const LOOKNAME={orig:'Original',clean:'Clean',gray:'Gray',bw:'Black & white'};
 const api=async(p,opt,tries)=>{active++;prog(true);try{for(let k=0;;k++){try{const r=await fetch(base+p,opt);lastOk=Date.now();return r;}
   catch(e){if(k>=(tries==null?2:tries))throw e;await new Promise(r=>setTimeout(r,500*(k+1)));}}}   // a dropped connection is tried again
  finally{active--;prog(active>0);}};
-function show(id){if(id!=='cam')stopCam();document.body.classList.toggle('incam',id==='cam');if(id==='home')homeInfo();for(const s of ['home','edit','review','list','cam'])$(s).classList.toggle('on',s===id);}
+function show(id){if(id!=='cam')stopCam();document.body.classList.toggle('incam',id==='cam');document.body.classList.toggle('inedit',id==='edit');if(id==='home')homeInfo();for(const s of ['home','edit','review','list','cam'])$(s).classList.toggle('on',s===id);}
 function toast(t,err,ms){clearTimeout(tt);const e=$('toast');if(!t){e.classList.remove('on');return;}e.textContent=t;e.className='on'+(err?' err':'');tt=setTimeout(()=>e.classList.remove('on'),ms||(err?5000:2200));}
 function prog(on){$('bar').classList.toggle('on',!!on);}
 function buzz(){try{navigator.vibrate&&navigator.vibrate(15);}catch(e){}}
@@ -1085,63 +1141,96 @@ function openCam(){if(LIVE())openLive();else nativeCam();}
 $('bScan').onclick=()=>{retake=-1;openCam();};
 $('bGal').onclick=()=>{retake=-1;$('fGal').value='';$('fGal').click();};
 $('fCam').onchange=e=>gotPhoto(e.target.files[0]);$('fGal').onchange=e=>gotPhoto(e.target.files[0]);
-// the computer gets only a SMALL copy of the photo (1400 px is plenty for its finder) and only once; after that just an id
-function detSrc(o){const s=Math.min(1,1400/Math.max(o.w,o.h)),c=smallCanvas(o.view,Math.round(o.w*s),Math.round(o.h*s));return toBlob(c,0.85).then(b=>({b,w:c.width}));}
-async function detect(me){
- const d=await(me.dp||(me.dp=detSrc(me)));
- let r=await api('/api/detect?sr=0'+(me.id?'&id='+me.id:''),{method:'POST',body:me.id?undefined:d.b});
- if(r.status===410){me.id=null;r=await api('/api/detect?sr=0',{method:'POST',body:d.b});}
- const j=await r.json();if(!j.ok)throw new Error(j.error);me.id=j.id;ok();return j;}
-async function gotPhoto(f){if(!f)return;
+// ---------- crop screen (DocScanner look). The page is searched on the phone (the same finder as the live outline, DocScanner's PageFinder).
+let searching=false,holdCard=false,holdT0=0,glide=null,foundT0=-1e9,eAnim=0,dragA=-1;
+const TEAL='#5EEAD4',INDIGO='#4F46E5',ease=t=>t<.5?4*t*t*t:1-Math.pow(-2*t+2,3)/2;
+const fullQ=(w,h,m)=>[{x:w*m,y:h*m},{x:w*(1-m),y:h*m},{x:w*(1-m),y:h*(1-m)},{x:w*m,y:h*(1-m)}];
+async function gotPhoto(f,opt){if(!f)return;opt=opt||{};
  toast('Opening the photo ...',false,60000);prog(true);
- try{const s=await shrink(f,MAXSIDE),o={blob:null,base:s.bmp,sr:0,view:s.bmp,w:bw(s.bmp),h:bh(s.bmp),quad:null,id:null,dp:null,look:'clean',rot:0,res:null,warp:false};
+ try{const s=await shrink(f,MAXSIDE),o={blob:null,base:s.bmp,sr:0,view:s.bmp,w:bw(s.bmp),h:bh(s.bmp),quad:null,id:null,dp:null,look:'clean',rot:0,res:null,warp:false,sure:null,touched:false,fromShutter:!!opt.shot,back:retake>=0?'list':(opt.shot?'cam':'gal')};
+  if(opt.hint&&opt.asp&&Math.abs(o.w/o.h-opt.asp)/opt.asp<0.03)o.quad=opt.hint.map(p=>({x:p.x*o.w,y:p.y*o.h}));    // the corners start where the live outline saw the page
   o.blobP=toBlob(s.bmp,JQ);cur=o;toast('');prog(false);
-  show('edit');$('tip').textContent='';await raf();layout();           // the photo is on screen first, then the paper is looked for
+  holdCard=!!opt.shot;holdT0=performance.now();
+  show('edit');setBanner();popUpdate();await raf();layout();
   findHere();
  }catch(err){prog(false);toast('Could not open this photo.',true);}}
-function findHere(){const me=cur,sr=me.sr,w=me.w,h=me.h,s=Math.min(1,1000/Math.max(w,h));me.touched=false;
- if(!me.quad){const m=0.04;me.quad=[{x:w*m,y:h*m},{x:w*(1-m),y:h*m},{x:w*(1-m),y:h*(1-m)},{x:w*m,y:h*(1-m)}];}
- draw();$('eWait').classList.add('on');
+function setBanner(){const b=$('eBan'),s=cur?cur.sure:null;b.className='ban'+(s===true?' ok':s===false?' warn':'');
+ $('eBanT').textContent=s===true?'Page found. Drag a corner or a side if it is not exact.':s===false?'Not sure about the page. Drag the corners onto the page corners.':'';
+ $('eAuto').disabled=$('eOk').disabled=(s==null);$('eRetake').classList.toggle('hide',retake<0);}
+function popUpdate(){const sh=cur&&cur.fromShutter&&holdCard,v=cur&&(cur.fromShutter?holdCard:searching);
+ $('ePop').classList.toggle('on',!!v);$('ePopTk').style.display=sh?'block':'none';$('ePopSr').style.display=searching?'flex':'none';}
+function releaseHold(){if(!holdCard)return;const w=1500-(performance.now()-holdT0),me=cur;
+ const f=()=>{if(cur===me){holdCard=false;popUpdate();}};if(w>0)setTimeout(f,w);else f();}
+function findHere(){const me=cur,sr=me.sr,w=me.w,h=me.h,s=Math.min(1,1000/Math.max(w,h));me.touched=false;me.sure=null;searching=true;
+ if(!me.quad)me.quad=fullQ(w,h,0.01);
+ setBanner();popUpdate();draw();
  heavy('find',asW=>asPic(smallCanvas(me.view,Math.max(8,Math.round(w*s)),Math.max(8,Math.round(h*s))),asW))
- .then(r=>{if(cur!==me||me.sr!==sr||me.touched)return;me.quad=r.quad.map(p=>({x:p.x/s,y:p.y/s}));setTip(r.found);draw();refine();})
- .catch(()=>{if(cur===me)setTip(false);})
- .then(()=>{if(cur===me)$('eWait').classList.remove('on');});}
-async function refine(){ // the computer's finder (OpenCV, same as the PC's Auto crop) refines the quick guess when it arrives (if the corners were not touched)
- const me=cur,sr=cur.sr;
- try{const j=await detect(me);if(cur!==me||me.sr!==sr||me.touched)return;const k=me.w/j.w;me.quad=j.quad.map(p=>({x:p[0]*k,y:p[1]*k}));setTip(j.found);draw();}catch(e){}}
-function setTip(found){$('tip').textContent=found?'Paper found. Drag a round corner or a square side if the outline is not exact.':'Paper not found. Drag the corners onto the paper, or tap "Whole photo".';}
+ .then(r=>{if(cur!==me||me.sr!==sr)return;
+  if(!me.touched){glide={from:me.quad.map(p=>({x:p.x,y:p.y})),to:r.quad.map(p=>({x:p.x/s,y:p.y/s})),t0:performance.now()};}   // the 4 corners glide to the page
+  me.sure=!!r.found;foundT0=performance.now();})
+ .catch(()=>{if(cur===me&&me.sr===sr)me.sure=false;})
+ .then(()=>{if(cur===me){searching=false;if(me.sure==null)me.sure=false;setBanner();popUpdate();releaseHold();draw();}});}
 $('eAuto').onclick=()=>{buzz();findHere();};
-$('eFull').onclick=()=>{const m=0.01,w=cur.w,h=cur.h;cur.quad=[{x:w*m,y:h*m},{x:w*(1-m),y:h*m},{x:w*(1-m),y:h*(1-m)},{x:w*m,y:h*(1-m)}];draw();};
-function turnSrc(cw){cur.touched=true;cur.id=null;cur.dp=null;cur.quad=rotQuad(cur.quad,cur.w,cur.h,cw);cur.sr=(cur.sr+(cw?1:3))%4;cur.view=turned(cur.base,cur.sr);cur.w=bw(cur.view);cur.h=bh(cur.view);layout();draw();buzz();}
+$('eFull').onclick=()=>{cur.touched=true;glide=null;cur.quad=fullQ(cur.w,cur.h,0.01);draw();};
+function turnSrc(cw){cur.touched=true;glide=null;cur.id=null;cur.dp=null;cur.quad=rotQuad(cur.quad,cur.w,cur.h,cw);cur.sr=(cur.sr+(cw?1:3))%4;cur.view=turned(cur.base,cur.sr);cur.w=bw(cur.view);cur.h=bh(cur.view);layout();draw();buzz();}
 $('eRotL').onclick=()=>turnSrc(false);$('eRotR').onclick=()=>turnSrc(true);
 
 const cv=$('cv'),cx=cv.getContext('2d');let drag=null,scale=1;
 function layout(){fit(cv,cur.w,cur.h,cv.parentNode);scale=cv.width/cur.w;}
-function startEdit(){show('edit');$('eWait').classList.remove('on');layout();draw();}
+function startEdit(){searching=false;holdCard=false;glide=null;if(cur){cur.sure=true;cur.fromShutter=false;}show('edit');layout();setBanner();popUpdate();draw();}
 function mids(q){return q.map((p,i)=>({x:(p.x+q[(i+1)%4].x)/2,y:(p.y+q[(i+1)%4].y)/2}));}
-let drawQ=0;
-function draw(){if(drawQ)return;drawQ=requestAnimationFrame(()=>{drawQ=0;paint();});}
-function paint(){if(!cur||!cur.view||!cur.quad)return;const d=DPR();cx.clearRect(0,0,cv.width,cv.height);cx.drawImage(cur.view,0,0,cv.width,cv.height);
+function draw(){if(!eAnim)eAnim=requestAnimationFrame(animLoop);}
+function animLoop(){eAnim=0;if(!cur||!cur.view||!cur.quad||!$('edit').classList.contains('on'))return;const now=performance.now();let again=false;
+ if(glide){if(cur.touched)glide=null;else{const t=Math.min(1,(now-glide.t0)/700),k=ease(t);cur.quad=glide.from.map((p,i)=>({x:p.x+(glide.to[i].x-p.x)*k,y:p.y+(glide.to[i].y-p.y)*k}));if(t>=1)glide=null;else again=true;}}
+ if(searching||now-foundT0<900)again=true;
+ paint(now);if(again)eAnim=requestAnimationFrame(animLoop);}
+function paint(now){const d=DPR(),W=cv.width,H=cv.height,clk=now/1000,st=2.5*d,fv=Math.max(0,1-(now-foundT0)/900);
+ cx.clearRect(0,0,W,H);cx.drawImage(cur.view,0,0,W,H);
  const q=cur.quad.map(p=>({x:p.x*scale,y:p.y*scale})),m=mids(q);
- cx.save();cx.beginPath();cx.rect(0,0,cv.width,cv.height);cx.moveTo(q[0].x,q[0].y);for(let i=3;i>=0;i--)cx.lineTo(q[i].x,q[i].y);cx.closePath();cx.fillStyle='rgba(0,0,0,.5)';cx.fill('evenodd');cx.restore();
- cx.beginPath();q.forEach((p,i)=>i?cx.lineTo(p.x,p.y):cx.moveTo(p.x,p.y));cx.closePath();cx.lineWidth=2.4*d;cx.strokeStyle='#a5b4fc';cx.stroke();
- m.forEach(p=>{const s=9*d;cx.fillStyle='rgba(255,255,255,.92)';cx.strokeStyle='#4f46e5';cx.lineWidth=2.5*d;cx.beginPath();cx.rect(p.x-s,p.y-s,2*s,2*s);cx.fill();cx.stroke();});
- q.forEach(p=>{cx.beginPath();cx.arc(p.x,p.y,13*d,0,7);cx.fillStyle='rgba(255,255,255,.95)';cx.fill();cx.lineWidth=3*d;cx.strokeStyle='#4f46e5';cx.stroke();});
-}
+ if(searching){ // a scanning light travels over the picture while the page is searched, 4 brackets breathe
+  const ph=(clk/2.8)%1,scan=0.5-0.5*Math.cos(ph*2*Math.PI),down=ph<0.5,y=H*scan,trail=H*0.3,y0=down?y-trail:y,y1=down?y:y+trail;
+  cx.fillStyle='rgba(0,0,0,.2)';cx.fillRect(0,0,W,H);
+  const g=cx.createLinearGradient(0,y0,0,y1),glow='rgba(94,234,212,.27)',none='rgba(94,234,212,0)';g.addColorStop(0,down?none:glow);g.addColorStop(1,down?glow:none);cx.fillStyle=g;cx.fillRect(0,y0,W,trail);
+  const layer=(h,c,c0)=>{const gg=cx.createLinearGradient(0,0,W,0);gg.addColorStop(0,c0);gg.addColorStop(.1,c);gg.addColorStop(.9,c);gg.addColorStop(1,c0);cx.fillStyle=gg;cx.fillRect(0,y-h/2,W,h);};
+  layer(st*10,'rgba(94,234,212,.16)','rgba(94,234,212,0)');layer(st*4.5,'rgba(94,234,212,.4)','rgba(94,234,212,0)');layer(st*1.4,'#fff','rgba(255,255,255,0)');
+  const br=0.65+0.35*Math.sin(clk*3.7),gap=Math.min(W,H)*0.05*br,bl=Math.min(W,H)*0.11,x0=gap,y00=gap,x1=W-gap,y1b=H-gap;
+  cx.strokeStyle='rgba(255,255,255,.92)';cx.lineWidth=st*2.4;cx.lineCap='round';
+  for(const [px,py,dx,dy] of [[x0,y00,1,1],[x1,y00,-1,1],[x1,y1b,-1,-1],[x0,y1b,1,-1]]){cx.beginPath();cx.moveTo(px+dx*bl,py);cx.lineTo(px,py);cx.lineTo(px,py+dy*bl);cx.stroke();}}
+ const path=()=>{cx.beginPath();q.forEach((p,i)=>i?cx.lineTo(p.x,p.y):cx.moveTo(p.x,p.y));cx.closePath();};
+ if(searching&&!cur.touched){path();cx.setLineDash([9*d,6*d]);cx.lineDashOffset=-((clk*52)%36)*d*.4;cx.lineWidth=st;cx.strokeStyle='rgba(94,234,212,.55)';cx.stroke();cx.setLineDash([]);return;}
+ path();cx.fillStyle='rgba(79,70,229,.2)';cx.fill();
+ if(fv>.01){cx.fillStyle='rgba(94,234,212,'+(0.3*fv)+')';cx.fill();}
+ cx.lineJoin='round';cx.lineWidth=st;cx.strokeStyle=TEAL;cx.stroke();
+ if(fv>.01){path();cx.lineWidth=st*(1+7*fv);cx.strokeStyle='rgba(94,234,212,'+(0.55*fv)+')';cx.stroke();}
+ m.forEach((p,k)=>{const r=(dragA===4+k?1.5:1)*8*d;cx.fillStyle='#fff';cx.fillRect(p.x-r,p.y-r,2*r,2*r);cx.lineWidth=st*.8;cx.strokeStyle=INDIGO;cx.strokeRect(p.x-r,p.y-r,2*r,2*r);});
+ q.forEach((p,i)=>{const r=(dragA===i?1.5:1)*11*d*(1+0.35*fv);cx.beginPath();cx.arc(p.x,p.y,r,0,7);cx.fillStyle='#fff';cx.fill();cx.lineWidth=st;cx.strokeStyle=INDIGO;cx.stroke();});
+ if(dragA>=0)loupe(dragA<4?cur.quad[dragA]:{x:(cur.quad[dragA-4].x+cur.quad[(dragA-3)%4].x)/2,y:(cur.quad[dragA-4].y+cur.quad[(dragA-3)%4].y)/2},d);}
+function loupe(fp,d){ // a round magnifier above the finger: the exact spot under the dragged corner / side, 2.8x
+ const W=cv.width,H=cv.height,r=54*d,pad=r+8*d,ax=fp.x*scale,ay=fp.y*scale,lx=Math.max(pad,Math.min(W-pad,ax));let ly=ay-r-64*d;if(ly<pad)ly=ay+r+64*d;ly=Math.max(pad,Math.min(H-pad,ly));
+ const half=(r/2.8)/scale;
+ cx.save();cx.fillStyle='rgba(0,0,0,.33)';cx.beginPath();cx.arc(lx,ly+3*d,r+5*d,0,7);cx.fill();cx.fillStyle='#111827';cx.beginPath();cx.arc(lx,ly,r,0,7);cx.fill();
+ cx.beginPath();cx.arc(lx,ly,r,0,7);cx.clip();try{cx.drawImage(cur.view,fp.x-half,fp.y-half,2*half,2*half,lx-r,ly-r,2*r,2*r);}catch(e){}cx.restore();
+ const arm=11*d;cx.lineCap='round';cx.strokeStyle='rgba(0,0,0,.67)';cx.lineWidth=3.5*d;cx.beginPath();cx.moveTo(lx-arm,ly);cx.lineTo(lx+arm,ly);cx.moveTo(lx,ly-arm);cx.lineTo(lx,ly+arm);cx.stroke();
+ cx.strokeStyle='#fff';cx.lineWidth=1.6*d;cx.stroke();
+ cx.beginPath();cx.arc(lx,ly,r,0,7);cx.lineWidth=3*d;cx.strokeStyle='#fff';cx.stroke();cx.beginPath();cx.arc(lx,ly,r-3*d,0,7);cx.lineWidth=1.5*d;cx.strokeStyle=TEAL;cx.stroke();}
 function pos(e){const r=cv.getBoundingClientRect(),k=cv.width/r.width;return{x:(e.clientX-r.left)*k,y:(e.clientY-r.top)*k};}
-cv.onpointerdown=e=>{if(!cur.quad)return;const p=pos(e),d=DPR(),q=cur.quad.map(a=>({x:a.x*scale,y:a.y*scale})),m=mids(q);let best=null,bd=1e9;
- q.forEach((c,i)=>{const t=Math.hypot(c.x-p.x,c.y-p.y)-4*d;if(t<bd){bd=t;best={kind:'c',i};}});
- m.forEach((c,i)=>{const t=Math.hypot(c.x-p.x,c.y-p.y);if(t<bd){bd=t;best={kind:'m',i};}});
- if(best&&bd<64*d){cur.touched=true;drag=best;drag.start=cur.quad.map(a=>({x:a.x,y:a.y}));drag.p0=p;cv.setPointerCapture(e.pointerId);buzz();draw();}};
+cv.onpointerdown=e=>{if(!cur||!cur.quad)return;const p=pos(e),d=DPR(),hit=44*d,q=cur.quad.map(a=>({x:a.x*scale,y:a.y*scale})),m=mids(q);let best=-1,bd=1e9;
+ q.forEach((c,i)=>{const t=Math.hypot(c.x-p.x,c.y-p.y);if(t<bd){bd=t;best=i;}});
+ if(bd>hit){best=-1;bd=1e9;m.forEach((c,k)=>{const t=Math.hypot(c.x-p.x,c.y-p.y);if(t<bd){bd=t;best=4+k;}});if(bd>hit)best=-1;}
+ if(best>=0){cur.touched=true;glide=null;dragA=best;drag={i:best,start:cur.quad.map(a=>({x:a.x,y:a.y})),p0:p};cv.setPointerCapture(e.pointerId);buzz();draw();}};
 cv.onpointermove=e=>{if(!drag)return;const p=pos(e),dx=(p.x-drag.p0.x)/scale,dy=(p.y-drag.p0.y)/scale,S=drag.start;
  const cl=(v,m)=>Math.max(0,Math.min(m,v));
- if(drag.kind==='c'){cur.quad[drag.i]={x:cl(S[drag.i].x+dx,cur.w),y:cl(S[drag.i].y+dy,cur.h)};}
- else{const a=S[drag.i],b=S[(drag.i+1)%4],ux=b.x-a.x,uy=b.y-a.y,L=Math.hypot(ux,uy)||1,nx=-uy/L,ny=ux/L,t=dx*nx+dy*ny;
-  [drag.i,(drag.i+1)%4].forEach(k=>{cur.quad[k]={x:cl(S[k].x+nx*t,cur.w),y:cl(S[k].y+ny*t,cur.h)};});}
+ if(drag.i<4){cur.quad[drag.i]={x:cl(S[drag.i].x+dx,cur.w),y:cl(S[drag.i].y+dy,cur.h)};}
+ else{const k0=drag.i-4,a=S[k0],b=S[(k0+1)%4],ux=b.x-a.x,uy=b.y-a.y,L=Math.hypot(ux,uy)||1,nx=-uy/L,ny=ux/L,t=dx*nx+dy*ny;
+  [k0,(k0+1)%4].forEach(k=>{cur.quad[k]={x:cl(S[k].x+nx*t,cur.w),y:cl(S[k].y+ny*t,cur.h)};});}
  draw();};
-cv.onpointerup=cv.onpointercancel=()=>{drag=null;draw();};
+cv.onpointerup=cv.onpointercancel=()=>{drag=null;dragA=-1;draw();};
 addEventListener('resize',()=>{if($('edit').classList.contains('on')&&cur&&cur.view){layout();draw();}else if($('review').classList.contains('on')&&cur&&cur.res)paintReview();});
-$('eRetake').onclick=()=>openCam();
+$('eRetake').onclick=()=>{glide=null;searching=false;openCam();};
+$('eDiscard').onclick=()=>{const me=cur;if(!me)return;glide=null;searching=false;holdCard=false;
+ if(me.res){show('review');paintReview();return;}                      // came here from the review page (Corners): back to it
+ if(retake>=0&&pages[retake]===me){me.base=null;me.view=null;cur=null;retake=-1;renderList();return;}   // a saved page opened from the list: back to the list
+ cur=null;if(me.back==='cam'&&retake<0){openCam();return;}retake=-1;if(pages.length)renderList();else home();};
 
 // ---------- the scanner on the phone itself: finds the paper, cuts it out, cleans it. Nothing but the final picture goes to the computer.
 function polyArea(q){let a=0;for(let i=0;i<q.length;i++){const p=q[i],r=q[(i+1)%q.length];a+=p.x*r.y-r.x*p.y;}return Math.abs(a)/2;}
@@ -1207,18 +1296,22 @@ $('rUse').onclick=()=>{
  const again=retake<0&&autoOn();retake=-1;cur=null;renderList();if(again)openCam();};
 
 
-// ---------- live camera guide: a + in the middle of the view, the paper outline drawn live, plain instructions, tap = focus there
+// ---------- live camera (DocScanner look): the whole camera picture is shown, the page outline glides over it, plain instructions, tap = focus
 const LIVE=()=>!!(window.isSecureContext&&navigator.mediaDevices&&navigator.mediaDevices.getUserMedia);
-let camS=null,camT=null,camIC=null,camTimer=0,camQ=null,camMiss=0,camStable=0,camBusy=false,camTap=null,camTorchOn=false,camSay='',camVib=false,camGrab=null,camGood=false;
+let camS=null,camT=null,camIC=null,camTimer=0,camQ=null,camMiss=0,camStable=0,camBusy=false,camTap=null,camTorchOn=false,camSay='',camVib=false,camGrab=null,camGood=false,camLastLight=0,camLightN=0,camRaf=0,camFlashT=-1e9,camShown=new Float32Array(9);
 if(!LIVE())$('liveHint').innerHTML='The live paper outline needs a secure link: use the <b>Internet</b> link of the computer, or on Android Chrome open <b>chrome://flags/#unsafely-treat-insecure-origin-as-secure</b>, add <b>'+location.origin+'</b>, enable it and restart Chrome. Until then the phone\'s own camera app opens.';
 let camLoop=0;
-function stopCam(){clearTimeout(camTimer);camTimer=0;camLoop++;if(camS){try{camS.getTracks().forEach(t=>t.stop());}catch(e){}}
+const TIPS=['Put the paper on a darker flat table so all 4 corners show clearly','Hold the phone straight above the paper, not tilted. Less tilt = sharper text','Use even light, daylight is good. Keep your own and the phone\'s shadow off the paper','On glossy paper, shift the phone a little if glare shows. Shoot without flash; use it only when it is really dark','Tap the paper once to focus, then hold still and press the button. A green ring means it is good','Keep the whole paper in the frame, with a small gap all around'];
+$('tipsL').innerHTML=TIPS.map((t,i)=>'<div class="ti"><i>'+(i+1)+'</i><span>'+t+'</span></div>').join('');
+function tipsShow(on){$('tips').classList.toggle('on',on);if(!on){try{localStorage.setItem('camtips','1');}catch(e){}}}
+$('camTipB').onclick=()=>tipsShow(true);$('tipsOk').onclick=()=>tipsShow(false);
+function stopCam(){clearTimeout(camTimer);camTimer=0;camLoop++;cancelAnimationFrame(camRaf);camRaf=0;if(camS){try{camS.getTracks().forEach(t=>t.stop());}catch(e){}}
  camS=camT=camIC=null;camQ=null;camStable=0;camBusy=false;camTorchOn=false;const v=$('camV');if(v){try{v.srcObject=null;}catch(e){}}}
 async function openLive(){
  let st;
  try{st=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:window.ImageCapture?1920:4096},height:{ideal:window.ImageCapture?1080:3072},frameRate:{ideal:24,max:30}},audio:false});}
  catch(e){toast('The camera is blocked here. Opening the phone\'s camera app.',true);nativeCam();return;}
- show('cam');camS=st;camT=st.getVideoTracks()[0];camQ=null;camMiss=0;camStable=0;camBusy=false;camTap=null;camTorchOn=false;camVib=false;
+ show('cam');camS=st;camT=st.getVideoTracks()[0];camQ=null;camMiss=0;camStable=0;camBusy=false;camTap=null;camTorchOn=false;camVib=false;camGood=false;camLastLight=0;camLightN=0;camShown.fill(0);camSay='';
  const v=$('camV');v.srcObject=st;try{await v.play();}catch(e){}
  for(let i=0;i<40&&!v.videoWidth;i++)await new Promise(r=>setTimeout(r,50));
  if(!v.videoWidth||camS!==st){stopCam();toast('Could not start the camera.',true);nativeCam();return;}
@@ -1226,76 +1319,96 @@ async function openLive(){
  try{if((caps.focusMode||[]).includes('continuous'))await camT.applyConstraints({advanced:[{focusMode:'continuous'}]});}catch(e){}
  $('camTorch').style.display=caps.torch?'grid':'none';$('camTorch').classList.remove('on');camBadge();
  camIC=window.ImageCapture?new ImageCapture(camT):null;
- camLayout();camSet('','Starting ...');camTick();}
-function camGeo(){const o=$('camO'),v=$('camV'),W=o.width,H=o.height,vw=v.videoWidth||1,vh=v.videoHeight||1,s=Math.max(W/vw,H/vh);return {W,H,vw,vh,s,ox:(W-vw*s)/2,oy:(H-vh*s)/2};}   // the video fills the screen (cover): video -> screen
-const camScr=(g,p)=>({x:g.ox+p.x*g.vw*g.s,y:g.oy+p.y*g.vh*g.s});
+ camLayout();camSet(1,retake>=0?'Take the new photo of this page':'Keep the paper inside the frame','');
+ const rt=$('camRet');rt.classList.toggle('hide',retake<0);if(retake>=0)rt.textContent='Retaking page '+(retake+1);
+ camRaf=requestAnimationFrame(camFrame);camTick();
+ let seen=false;try{seen=localStorage.getItem('camtips')==='1';}catch(e){}if(!seen)tipsShow(true);}
+function camGeo(){const o=$('camO'),v=$('camV'),W=o.width,H=o.height,vw=v.videoWidth||1,vh=v.videoHeight||1,s=Math.min(W/vw,H/vh);return {W,H,vw,vh,s,dw:vw*s,dh:vh*s,ox:(W-vw*s)/2,oy:(H-vh*s)/2};}   // the camera picture is shown whole, centred (bars above / below)
+const camScr=(g,p)=>({x:g.ox+p.x*g.dw,y:g.oy+p.y*g.dh});
 function camLayout(){const o=$('camO'),r=o.getBoundingClientRect(),d=DPR();o.width=Math.max(80,Math.round(r.width*d));o.height=Math.max(80,Math.round(r.height*d));}
-function camBadge(){const n=pages.length;$('camDone').style.visibility=n?'visible':'hidden';$('camN').textContent=n;}
+function camBadge(){const n=pages.length,b=$('camDone'),t=$('camGal');b.classList.toggle('hide',!n);b.textContent='Finish ('+n+')';
+ const im=$('camThumb');if(n&&pages[n-1].th){im.src=pages[n-1].th;t.classList.add('has');}else{im.removeAttribute('src');t.classList.remove('has');}}
 addEventListener('resize',()=>{if(camS)camLayout();});
-function camSet(cls,txt,sub){const m=$('camMsg');m.className=cls;const key=cls+'|'+txt+'|'+(sub||'');if(key===camSay)return;camSay=key;
- m.textContent=txt;if(sub){const s=document.createElement('small');s.textContent=sub;m.appendChild(s);}}
+function camSet(kind,txt,sub){const m=$('camMsg'),key=kind+'|'+txt+'|'+(sub||'');if(key===camSay)return;camSay=key;m.className='k'+kind;$('camT1').textContent=txt;$('camT2').textContent=sub||'';}
 async function camFocusAt(nx,ny){if(!camT)return;let caps={};try{caps=camT.getCapabilities();}catch(e){}
  const modes=caps.focusMode||[],mode=modes.includes('continuous')?'continuous':modes.includes('single-shot')?'single-shot':null;
- try{await camT.applyConstraints({advanced:[mode?{focusMode:mode,pointsOfInterest:[{x:nx,y:ny}]}:{pointsOfInterest:[{x:nx,y:ny}]}]});}catch(e){}}   // best effort: phones that cannot take a focus point just keep their own autofocus
+ try{await camT.applyConstraints({advanced:[mode?{focusMode:mode,pointsOfInterest:[{x:nx,y:ny}]}:{pointsOfInterest:[{x:nx,y:ny}]}]});}catch(e){}}
 $('camO').onpointerdown=e=>{const o=$('camO'),r=o.getBoundingClientRect(),k=o.width/r.width,px=(e.clientX-r.left)*k,py=(e.clientY-r.top)*k,g=camGeo();
- const vx=Math.min(1,Math.max(0,(px-g.ox)/(g.vw*g.s))),vy=Math.min(1,Math.max(0,(py-g.oy)/(g.vh*g.s)));
+ const vx=Math.min(1,Math.max(0,(px-g.ox)/g.dw)),vy=Math.min(1,Math.max(0,(py-g.oy)/g.dh));
  camTap={x:px/o.width,y:py/o.height,t:Date.now()};camFocusAt(vx,vy);buzz();};
 $('camTorch').onclick=async()=>{if(!camT)return;camTorchOn=!camTorchOn;try{await camT.applyConstraints({advanced:[{torch:camTorchOn}]});$('camTorch').classList.toggle('on',camTorchOn);}catch(e){camTorchOn=false;}};
-$('camBack').onclick=()=>{pages.length?renderList():home();};
+$('camBack').onclick=()=>{retake=-1;pages.length?renderList():home();};
 $('camNative').onclick=()=>{stopCam();nativeCam();};
-$('camGal').onclick=()=>{retake=-1;$('fGal').value='';$('fGal').click();};
-$('camDone').onclick=()=>{if(pages.length)renderList();};
+$('camGal').onclick=()=>{$('fGal').value='';$('fGal').click();};
+$('camDone').onclick=()=>{if(pages.length){retake=-1;renderList();}};
 async function takeFull(){ // the live picture is only Full HD (light); the saved photo is the camera's real still, capped at ~4096 px
  let st=null;try{const pc=await camIC.getPhotoCapabilities(),W=pc.imageWidth,H=pc.imageHeight;
   if(W&&H&&W.max&&H.max){const k=Math.min(1,4096/Math.max(W.max,H.max)),f=(R,v)=>{const step=R.step||1;return Math.max(R.min||0,Math.min(R.max,(R.min||0)+Math.round((v-(R.min||0))/step)*step));};
    st={imageWidth:f(W,W.max*k),imageHeight:f(H,H.max*k)};}}catch(e){}
  if(st){try{return await camIC.takePhoto(st);}catch(e){}}
  return camIC.takePhoto();}
-$('camShot').onclick=async()=>{if(camBusy||!camS)return;camBusy=true;buzz();clearTimeout(camTimer);
- let blob=null;const v=$('camV');
+$('camShot').onclick=async()=>{if(camBusy||!camS)return;camBusy=true;buzz();clearTimeout(camTimer);camFlashT=performance.now();
+ let blob=null;const v=$('camV'),hint=camQ?camQ.map(p=>({x:p.x,y:p.y})):null,asp=v.videoWidth/v.videoHeight;
  if(camIC){try{blob=await Promise.race([takeFull(),new Promise((_,no)=>setTimeout(no,7000))]);}catch(e){blob=null;}}   // the camera's own still photo (sharper, focused), about 12 MP at most: enough for text, light for the phone
  if(!blob){try{const c=document.createElement('canvas');c.width=v.videoWidth;c.height=v.videoHeight;c.getContext('2d').drawImage(v,0,0);blob=await toBlob(c,0.92);}catch(e){}}
  if(!blob){camBusy=false;toast('Could not take the photo. Try again.',true);camTick();return;}
- try{v.pause();}catch(e){}gotPhoto(blob);};
+ try{v.pause();}catch(e){}gotPhoto(blob,{shot:true,hint,asp});};
 async function camTick(){clearTimeout(camTimer);if(!camS||camBusy)return;
  const v=$('camV'),t0=performance.now(),st=camS,my=++camLoop;
  if(v.videoWidth&&v.readyState>=2&&!document.hidden){
   try{
    const m=320,s=Math.min(1,m/Math.max(v.videoWidth,v.videoHeight)),gw=Math.max(8,Math.round(v.videoWidth*s)),gh=Math.max(8,Math.round(v.videoHeight*s));
    if(!camGrab||camGrab.width!==gw||camGrab.height!==gh){camGrab=document.createElement('canvas');camGrab.width=gw;camGrab.height=gh;}
-   camGrab.getContext('2d').drawImage(v,0,0,gw,gh);
+   const gx=camGrab.getContext('2d',{willReadFrequently:true});gx.drawImage(v,0,0,gw,gh);
    const r=await heavy('live',asW=>asPic(camGrab,asW));          // the worker looks at the little frame; the page stays smooth
    if(camS!==st||my!==camLoop||camBusy)return;
    let q=r.found?r.quad.map(p=>({x:p.x/gw,y:p.y/gh})):null,move=1;
-   if(q){if(camQ){move=q.reduce((a,p,i)=>a+Math.hypot(p.x-camQ[i].x,p.y-camQ[i].y),0)/4;q=q.map((p,i)=>({x:(p.x+camQ[i].x)/2,y:(p.y+camQ[i].y)/2}));}camQ=q;camMiss=0;}
-   else if(++camMiss>2)camQ=null;
-   camStable=(q&&move<0.014)?camStable+1:0;
-   camJudge(v);camDraw();
+   if(q){if(camQ){move=q.reduce((a,p,i)=>a+Math.hypot(p.x-camQ[i].x,p.y-camQ[i].y),0)/4;q=q.map((p,i)=>({x:(p.x+camQ[i].x)/2,y:(p.y+camQ[i].y)/2}));}camQ=q;camMiss=0;
+    camStable=move<0.014?camStable+1:0;camJudge(v,gw,gh,gx);}
+   else{camStable=0;camGood=false;if(++camMiss>2){camQ=null;camSet(1,'Looking for the paper…','Put it on a darker table and keep all 4 corners in view');}}
   }catch(e){}}
  if(camS!==st||my!==camLoop||camBusy)return;
  camTimer=setTimeout(camTick,Math.max(150,Math.min(600,(performance.now()-t0)*0.8)));}   // the slower the phone, the more it rests between looks
-function camJudge(v){camGood=false;
- if(!camQ){camSet('warn','Looking for the paper ...','Put it on a plain, darker table. Keep all 4 corners in the view.');return;}
- const g=camGeo(),qv=camQ,q=qv.map(p=>{const s=camScr(g,p);return {x:s.x/g.W,y:s.y/g.H};}),W=v.videoWidth,H=v.videoHeight,area=polyArea(q),pct=Math.round(area*100),sub='The page fills '+pct+'% of the view - the rest is cut away';
- const cx=q.reduce((a,p)=>a+p.x,0)/4,cy=q.reduce((a,p)=>a+p.y,0)/4,dx=cx-0.5,dy=cy-0.5,vcx=qv.reduce((a,p)=>a+p.x,0)/4,vcy=qv.reduce((a,p)=>a+p.y,0)/4;
+function camLight(q,gw,gh,gx){ // 0 = fine, 1 = too dark, 2 = shadow across the paper, 3 = glare. Looks at the paper only, a few hundred samples.
+ let D;try{D=gx.getImageData(0,0,gw,gh).data;}catch(e){return 0;}
+ const cl=(v,a,b)=>Math.max(a,Math.min(b,v)),x0=cl(Math.floor(Math.min(...q.map(p=>p.x))*gw),0,gw-1),x1=cl(Math.floor(Math.max(...q.map(p=>p.x))*gw),x0+1,gw),y0=cl(Math.floor(Math.min(...q.map(p=>p.y))*gh),0,gh-1),y1=cl(Math.floor(Math.max(...q.map(p=>p.y))*gh),y0+1,gh);
+ const GX=4,GY=5,cell=[];let glare=0,n=0;
+ for(let cy=0;cy<GY;cy++)for(let cx2=0;cx2<GX;cx2++){const tmp=[];
+  for(let j=0;j<6;j++)for(let i=0;i<6;i++){const px=cl(Math.floor(x0+((cx2+(i+.5)/6)/GX*(x1-x0))),0,gw-1),py=cl(Math.floor(y0+((cy+(j+.5)/6)/GY*(y1-y0))),0,gh-1),o=4*(py*gw+px),l=(D[o]*77+D[o+1]*150+D[o+2]*29)>>8;tmp.push(l);if(l>=251)glare++;n++;}
+  tmp.sort((a,b)=>a-b);cell.push(tmp[27]);}   // the paper brightness of this part (text is darker, so not the average)
+ const mx=Math.max(...cell),mn=Math.min(...cell),med=cell.slice().sort((a,b)=>a-b)[cell.length>>1];
+ return med<95?1:(mx>60&&mn/mx<0.62)?2:(glare/n>0.07)?3:0;}
+function camJudge(v,gw,gh,gx){camGood=false;
+ const q=camQ,W=v.videoWidth,H=v.videoHeight,area=polyArea(q),cx0=q.reduce((a,p)=>a+p.x,0)/4,cy0=q.reduce((a,p)=>a+p.y,0)/4,dx=cx0-0.5,dy=cy0-0.5;
  const clip=q.some(p=>p.x<0.015||p.x>0.985||p.y<0.015||p.y>0.985);
- const d=(a,b)=>Math.hypot((a.x-b.x)*W,(a.y-b.y)*H),rt=Math.max(d(qv[0],qv[1]),d(qv[3],qv[2]))/Math.max(1,Math.min(d(qv[0],qv[1]),d(qv[3],qv[2]))),rl=Math.max(d(qv[0],qv[3]),d(qv[1],qv[2]))/Math.max(1,Math.min(d(qv[0],qv[3]),d(qv[1],qv[2])));
- if(clip)return camSet('warn','Move the phone back a little','All 4 corners of the paper must be inside the view.');
- if(area<0.3)return camSet('warn','Move closer','The paper is small in the view ('+pct+'%).');
- if(Math.abs(dx)>0.07||Math.abs(dy)>0.07){const h=Math.abs(dx)>=Math.abs(dy)?(dx>0?'right':'left'):(dy>0?'down':'up');
-  return camSet('warn','Move the phone a little '+h,'Keep the whole paper in the middle of the view.');}
- if(Math.max(rt,rl)>1.28)return camSet('warn','Hold the phone flatter, straight above the paper','The page looks tilted. Less tilt = a better scan.');
- if(camStable>=4){camGood=true;if(camAutoOn()&&camStable>=8&&!camBusy){setTimeout(()=>{if(camGood&&!camBusy&&camS)$('camShot').onclick();},0);}if(camStable===4){camFocusAt(vcx,vcy);if(!camVib){camVib=true;buzz();}}return camSet('ok','Good - hold still, tap the round button',sub);}
- camVib=false;camSet('ok','Almost - hold still ...',sub);}
-function camDraw(){const o=$('camO'),g=o.getContext('2d'),W=o.width,H=o.height,d=DPR(),G=camGeo();g.clearRect(0,0,W,H);
- const good=!!(camQ&&camGood);$('camShot').classList.toggle('ready',good);
- if(camQ){const q=camQ.map(p=>camScr(G,p)),col=good?'#3ddc84':'#ffd166';
-  g.fillStyle='rgba(0,0,0,.45)';g.beginPath();g.rect(0,0,W,H);g.moveTo(q[0].x,q[0].y);for(let i=3;i>=0;i--)g.lineTo(q[i].x,q[i].y);g.closePath();g.fill('evenodd');   // what is NOT paper is darkened = what the crop throws away
-  g.beginPath();q.forEach((p,i)=>i?g.lineTo(p.x,p.y):g.moveTo(p.x,p.y));g.closePath();g.fillStyle=good?'rgba(61,220,132,.13)':'rgba(255,209,102,.08)';g.fill();
-  g.lineJoin='round';g.lineCap='round';g.strokeStyle=col;g.globalAlpha=.9;g.lineWidth=1.6*d;g.stroke();g.globalAlpha=1;
-  g.lineWidth=5*d;for(let i=0;i<4;i++){const p=q[i],a=q[(i+1)%4],b=q[(i+3)%4],L=Math.min(34*d,0.22*Math.hypot(a.x-p.x,a.y-p.y),0.22*Math.hypot(b.x-p.x,b.y-p.y));   // a bracket on every corner
-   const u=(t)=>{const l=Math.hypot(t.x-p.x,t.y-p.y)||1;return {x:(t.x-p.x)/l*L,y:(t.y-p.y)/l*L};},ua=u(a),ub=u(b);
-   g.beginPath();g.moveTo(p.x+ua.x,p.y+ua.y);g.lineTo(p.x,p.y);g.lineTo(p.x+ub.x,p.y+ub.y);g.stroke();}}
+ const d=(a,b)=>Math.hypot((a.x-b.x)*W,(a.y-b.y)*H),rt=Math.max(d(q[0],q[1]),d(q[3],q[2]))/Math.max(1,Math.min(d(q[0],q[1]),d(q[3],q[2]))),rl=Math.max(d(q[0],q[3]),d(q[1],q[2]))/Math.max(1,Math.min(d(q[0],q[3]),d(q[1],q[2])));
+ const li=camLight(q,gw,gh,gx);camLightN=(li!==0&&li===camLastLight)?camLightN+1:(li!==0?1:0);camLastLight=li;const lightIssue=camLightN>=3?li:0;   // light is judged on 3 frames in a row, so one flicker does not change the message
+ if(clip)return camSet(0,'Move the phone back a little','All 4 corners of the paper must be inside the frame');
+ if(area<0.3)return camSet(0,'Move closer','The paper looks small in the frame');
+ if(Math.abs(dx)>0.07||Math.abs(dy)>0.07){const h=Math.abs(dx)>=Math.abs(dy)?(dx>0?'right':'left'):(dy>0?'down':'up');return camSet(0,'Move the phone a little '+h,'Keep the whole paper in the middle of the frame');}
+ if(Math.max(rt,rl)>1.28)return camSet(0,'Hold the phone flat, straight above the paper','The page looks tilted. Less tilt = a better scan');
+ if(lightIssue===1)return camSet(0,'Too dark','Move to a brighter place or turn the flash on');
+ if(lightIssue===2)return camSet(0,'Shadow on the paper','Move your hand or the phone\'s shadow away so the light is even');
+ if(lightIssue===3)return camSet(0,'Glare on the paper','Shift the phone or turn the paper a little to avoid the reflection');
+ if(camStable>=4){camGood=true;if(camAutoOn()&&camStable>=8&&!camBusy){setTimeout(()=>{if(camGood&&!camBusy&&camS)$('camShot').onclick();},0);}if(camStable===4){camFocusAt(cx0,cy0);if(!camVib){camVib=true;buzz();}}return camSet(2,'Good, take the photo','Hold still and tap the round button');}
+ camVib=false;camSet(1,'Almost, hold still…','The paper is found');}
+function camFrame(){camRaf=0;if(!camS)return;camRaf=requestAnimationFrame(camFrame);
+ const o=$('camO'),g=o.getContext('2d'),W=o.width,H=o.height,d=DPR(),G=camGeo(),now=performance.now();g.clearRect(0,0,W,H);
+ const fl=Math.max(0,1-(now-camFlashT)/420),f=fl*fl*(3-2*fl),good=!!(camQ&&camGood),sh=camShown;     // f = the soft "got it" pulse after the shutter
+ $('camShot').classList.toggle('ready',good);$('camShot').style.transform=f>0.001?'scale('+(1-0.12*f)+')':'';
+ if(camQ){if(sh[8]<0.02){for(let i=0;i<4;i++){sh[2*i]=camQ[i].x;sh[2*i+1]=camQ[i].y;}}else for(let i=0;i<8;i++){const tv=i%2?camQ[i>>1].y:camQ[i>>1].x;sh[i]+=(tv-sh[i])*0.3;}sh[8]+=(1-sh[8])*0.2;}else sh[8]+=(0-sh[8])*0.2;   // the outline glides to the newest look
+ const va=sh[8],mix=(a,b,t)=>Math.round(a+(b-a)*t);
+ if(va<0.98){ // no page seen yet: a dashed guide frame INSIDE the camera picture; on capture it closes in a little and turns teal
+  const mx=G.dw*0.07+f*14*d,my=G.dh*0.07+f*14*d,c=[mix(255,94,f),mix(255,234,f),mix(255,212,f)];
+  g.save();g.globalAlpha=(f>0?1:.8)*(1-va);g.strokeStyle='rgb('+c+')';g.lineWidth=(1.6+2.4*f)*d;g.setLineDash([9*d,7*d]);g.beginPath();g.roundRect?g.roundRect(G.ox+mx,G.oy+my,G.dw-2*mx,G.dh-2*my,10*d):g.rect(G.ox+mx,G.oy+my,G.dw-2*mx,G.dh-2*my);g.stroke();g.restore();}
+ if(va>0.02){const q=[0,1,2,3].map(i=>({x:G.ox+sh[2*i]*G.dw,y:G.oy+sh[2*i+1]*G.dh})),base=good?[61,220,132]:[255,209,102],col='rgb('+[mix(base[0],94,f),mix(base[1],234,f),mix(base[2],212,f)]+')';
+  g.fillStyle='rgba(0,0,0,'+(0.45*va)+')';g.beginPath();g.rect(G.ox,G.oy,G.dw,G.dh);g.moveTo(q[0].x,q[0].y);for(let i=3;i>=0;i--)g.lineTo(q[i].x,q[i].y);g.closePath();g.fill('evenodd');   // what is NOT paper is darkened = what the crop throws away
+  g.beginPath();q.forEach((p,i)=>i?g.lineTo(p.x,p.y):g.moveTo(p.x,p.y));g.closePath();g.fillStyle=col;g.globalAlpha=(good?.14:.08)*va;g.fill();
+  g.globalAlpha=.9*va;g.lineJoin='round';g.lineCap='round';g.strokeStyle=col;g.lineWidth=1.8*d;g.stroke();g.globalAlpha=va;
+  g.lineWidth=3.6*d;for(let i=0;i<4;i++){const p=q[i],a=q[(i+1)%4],b=q[(i+3)%4],la=Math.hypot(a.x-p.x,a.y-p.y)||1,lb=Math.hypot(b.x-p.x,b.y-p.y)||1,L=Math.min(34*d,.22*la,.22*lb);   // a bracket on every corner
+   g.beginPath();g.moveTo(p.x+(a.x-p.x)/la*L,p.y+(a.y-p.y)/la*L);g.lineTo(p.x,p.y);g.lineTo(p.x+(b.x-p.x)/lb*L,p.y+(b.y-p.y)/lb*L);g.stroke();}
+  g.globalAlpha=1;}
+ if(f>0.01){g.fillStyle='rgba(255,255,255,'+(0.16*f)+')';g.fillRect(0,0,W,H);}
  if(camTap&&Date.now()-camTap.t<1100){const x=camTap.x*W,y=camTap.y*H,r=32*d;g.strokeStyle='#fff';g.lineWidth=2*d;g.beginPath();g.roundRect?g.roundRect(x-r,y-r,2*r,2*r,10*d):g.rect(x-r,y-r,2*r,2*r);g.stroke();}}
 
 const camAutoOn=()=>{try{return localStorage.getItem('autocap')==='1';}catch(e){return false;}};
