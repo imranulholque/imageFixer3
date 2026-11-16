@@ -860,6 +860,12 @@ class Card(QWidget):
         self._gest_timer.setSingleShot(True)
         self._gest_timer.setInterval(700)
         self._gest_timer.timeout.connect(self._end_gesture)
+        self.sel_main = False                      # Ctrl + click on the empty page: the page is edited together with the layers
+        self._tgt_busy = self._tgt_again = False
+        self._tgt_timer = QTimer(self)             # sliders on selected layers: made a moment after the last move
+        self._tgt_timer.setSingleShot(True)
+        self._tgt_timer.setInterval(130)
+        self._tgt_timer.timeout.connect(self._target_apply)
         self._bg_timer = QTimer(self)              # background-removal sliders: re-cut a moment after the last move
         self._bg_timer.setSingleShot(True)
         self._bg_timer.setInterval(160)
@@ -1378,7 +1384,6 @@ class Card(QWidget):
         self.canvas.selectionMoved.connect(self._move_selection)
         self.canvas.sel_mode_name = self.sel_mode
         self.canvas.moveFinished.connect(self._on_move)
-        QApplication.instance().installEventFilter(self)       # first edit on a selected layer works on that layer
         self.canvas.viewClicked.connect(self._on_view_click)
         self.canvas.tfCommitted.connect(self._commit_layer_pts)
         self.canvas.tfCopyChanged.connect(self._on_tf_copy)
@@ -3194,6 +3199,100 @@ class Card(QWidget):
         self._timer.start()
         self._refresh_layers_ui()
 
+    # ---------------------------------------------------------- edit the selected layers right on the page
+    def _targets(self):
+        """Picture layers that the sliders work on now: the selected one, or all Ctrl-selected ones (page view, no zoom)."""
+        if self.ctx is not None:
+            return []
+        ids = set(self.sel_group)
+        if self._place_id is not None:
+            ids.add(self._place_id)
+        return [l["id"] for l in self.layers if l["id"] in ids and l.get("text") is None]
+
+    @staticmethod
+    def _ed_render(src, ed):
+        img = src
+        sh = ed.get("shadow")
+        if sh:
+            img = core.remove_shadow(img, sh["strength"] / 100.0, None, sh)
+        return core.render_full(img, copy.deepcopy(ed["adjs"]), ed["look"], None)
+
+    def _target_set(self, ids, look=None, shadow=None):
+        self._begin_change()
+        for lid in ids:
+            l = self._layer(lid)
+            if l is None:
+                continue
+            ed = dict(l.get("ed") or {"adjs": [], "look": core.new_look(), "shadow": None})
+            ed["look"] = dict(ed["look"])
+            if look is not None:
+                ed["look"][look[0]] = look[1]
+            if shadow == "on":
+                ed["shadow"] = dict(self.shadow_opts)
+            elif shadow == "live" and ed.get("shadow"):
+                ed["shadow"] = dict(self.shadow_opts)
+            elif shadow == "live":
+                continue
+            ed["dirty"] = True
+            src = l.get("ed_src")
+            self._replace_layer(lid, ed=ed, ed_src=l["rgb"] if src is None else src)
+        self._tgt_timer.start()
+
+    def _target_apply(self):
+        if self._tgt_busy:
+            self._tgt_again = True
+            return
+        jobs = [(l["id"], l["ed_src"], copy.deepcopy(l["ed"])) for l in self.layers
+                if l.get("ed") is not None and l.get("ed_src") is not None and l["ed"].get("dirty")]
+        if not jobs:
+            return
+        self._tgt_busy = True
+
+        def work(progress):
+            return [(lid, self._ed_render(src, ed).convert("RGB")) for lid, src, ed in jobs]
+
+        def done(res):
+            self._tgt_busy = False
+            sent = {lid: ed for lid, _s, ed in jobs}
+            for lid, img in res:
+                l = self._layer(lid)
+                if l is None or l.get("ed") is None:
+                    continue
+                ed, o = dict(l["ed"]), sent[lid]
+                if ed["look"] == o["look"] and ed["adjs"] == o["adjs"] and ed.get("shadow") == o.get("shadow"):
+                    ed["dirty"] = False
+                else:
+                    self._tgt_again = True
+                self._replace_layer(lid, rgb=img, ed=ed)
+                if self._place_id == lid:
+                    self.canvas.set_tf_image(self._layer_qimage(self._layer(lid)))
+            self._touch()
+            self._timer.start()
+            self._sync_live()
+            self._fill_layer_list()
+            if self._tgt_again:
+                self._tgt_again = False
+                self._tgt_timer.start()
+
+        def fail(msg):
+            self._tgt_busy = False
+            self.message.emit("Could not change the layer: " + msg.splitlines()[0])
+        run_background(work, done, fail)
+
+    def _sync_target_sliders(self):
+        """The sliders show the values of the selected layer (or of the page when no layer is selected)."""
+        if self.ctx is not None or not hasattr(self, "lookRows"):
+            return
+        ids = self._targets()
+        look = self.look
+        if ids:
+            pid = self._place_id if self._place_id in ids else ids[0]
+            ed = self._layer(pid).get("ed")
+            look = ed["look"] if ed else core.new_look()
+        for k, row in self.lookRows.items():
+            if k in look:
+                row.set_value(look[k])
+
     def _auto_layer_edit(self):
         """A picture layer is selected (its transform border is shown): the first slider / tool touched works on this
         layer alone - no double click needed.  Text boxes keep their own Aa tab."""
@@ -3205,22 +3304,6 @@ class Card(QWidget):
         self.sel_group = set(self.sel_group) | {lid} if self.sel_group else set()
         self.edit_layer(lid)
         return True
-
-    _EDIT_WIDGETS = None
-
-    def eventFilter(self, obj, ev):
-        try:
-            if (ev.type() == QEvent.Type.MouseButtonPress and self._place_id is not None and self.ctx is None
-                    and isinstance(obj, QWidget) and self.stackPages.currentIndex() in (self.TAB_ADJUST, self.TAB_COLOR,
-                                                                                         self.TAB_SHADOW, self.TAB_TEXT)):
-                page = self.stackPages.currentWidget()
-                if page is not None and page.isAncestorOf(obj) and isinstance(
-                        obj, (QAbstractButton, QAbstractSlider, QAbstractSpinBox, QComboBox, QLineEdit,
-                              QAbstractItemView, ColorList, AdjRow)):
-                    self._auto_layer_edit()
-        except Exception:
-            _log("auto layer edit")
-        return False
 
     def _layer_double(self):
         lid = self._place_id
@@ -3403,7 +3486,7 @@ class Card(QWidget):
             self._end_layer_session()
         self.leave_layer(done)
 
-    def layer_from_selection(self, cut=False):
+    def layer_from_selection(self, cut=False, place=False):
         """Ctrl+J: the selected area becomes a layer of its own (Ctrl+Shift+J = cut it out of the page as well).
         Nothing selected = a copy of the selected layer.  The new layer opens at once: every tool works on it alone."""
         if not self._loaded:
@@ -3479,7 +3562,13 @@ class Card(QWidget):
             def open_it():
                 self.show_tab(self.TAB_LAYERS)
                 self._refresh_layers_ui()
-                self.edit_layer(lid)
+                if place and not inlayer:
+                    self.sel = None                       # the part is a layer now: no selection left on the page
+                    self._sel_ver += 1
+                    self.canvas.set_selection(None)
+                    self.place_layer_tool(lid)            # border at once: move / resize / rotate, sliders work on it
+                else:
+                    self.edit_layer(lid)
             if cut:
                 if inlayer:
                     pa = self.alpha
@@ -3692,6 +3781,7 @@ class Card(QWidget):
             self._ctrl_toggle(lid)
             return
         self.sel_group = set()
+        self.sel_main = False
         self.place_layer_tool(lid)
         self._show_text_tab_if_text(lid)
         self.canvas.begin_layer_drag(x, y, alt)                 # drag starts right away: click = select, drag = move, Alt + drag = copy
@@ -3841,13 +3931,21 @@ class Card(QWidget):
         if lid is not None and QApplication.keyboardModifiers() & Qt.KeyboardModifier.ControlModifier:
             self._ctrl_toggle(lid)                     # Ctrl + click: one more layer in the group
             return
+        if lid is None and QApplication.keyboardModifiers() & Qt.KeyboardModifier.ControlModifier:
+            self.sel_main = not self.sel_main          # Ctrl + click on the empty page: the page is edited too
+            self.message.emit("The page is edited together with the selected layers." if self.sel_main
+                              else "Only the selected layers are edited.")
+            return
         if lid is not None:
             self.sel_group = set()
+            self.sel_main = False
             self.place_layer_tool(lid)                 # another picture: select that one
             self._show_text_tab_if_text(lid)
         else:
             self.sel_group = set()
+            self.sel_main = False
             self._end_layer_session()                  # empty place: the picture is deselected
+            self._refresh_layers_ui()
 
     def _layer_qimage(self, l):
         rgba = core.layer_rgba(l, pend=False)
@@ -3958,9 +4056,9 @@ class Card(QWidget):
             layers = []
             for l in layers0:
                 if l["id"] == lid:
-                    layers.append(self._regrid(dict(l, rgb=rgb, a=alpha, pend=None), l["rgb"].size))
+                    layers.append(self._regrid(dict(l, rgb=rgb, a=alpha, pend=None, ed=None, ed_src=None), l["rgb"].size))
                 elif pending and l["id"] in grp and l.get("text") is None:
-                    layers.append(dict(l, rgb=core.render_full(l["rgb"], copy.deepcopy(adjs), look, sel), pend=None))
+                    layers.append(dict(l, rgb=core.render_full(l["rgb"], copy.deepcopy(adjs), look, sel), pend=None, ed=None, ed_src=None))
                 else:
                     layers.append(l)
             v = self._build_view(st["base"], st["adjs"], core.new_look(**st["look"]), st["sel"],
@@ -4026,7 +4124,7 @@ class Card(QWidget):
         def done(cut):
             self._bg_busy = False
             if self._layer(lid) is not None and self.ctx is None:
-                self._replace_layer(lid, rgb=cut.convert("RGB"), a=cut.split()[3], bg=bg)
+                self._replace_layer(lid, rgb=cut.convert("RGB"), a=cut.split()[3], bg=bg, ed=None, ed_src=None)
                 self._touch()
                 self._timer.start()
                 if self._place_id == lid:
@@ -4116,6 +4214,7 @@ class Card(QWidget):
                               else "One layer selected.")
             return
         self.sel_group = set()
+        self.sel_main = False
 
         def go():
             l = self._layer(lid)
@@ -4170,6 +4269,7 @@ class Card(QWidget):
                                       "R = turn 90°, Delete = remove, click outside = done.  To change which one is in front "
                                       "use the Layers tab.")
         self.btnLayerDone.setVisible(self.ctx is not None)
+        self._sync_target_sliders()
         self._sync_live()
         l = None if self.sel_layer is None else self._layer(self.sel_layer)
         self.bgGroup.setEnabled(self.ctx is None and l is not None and l.get("text") is None)
@@ -4296,6 +4396,11 @@ class Card(QWidget):
         self._touch()
 
     def _set_look(self, key, v):
+        ids = self._targets()
+        if ids:
+            self._target_set(ids, look=(key, int(v)))
+            if not self.sel_main:
+                return                                     # only the selected layers change, the page stays
         self._begin_change()
         self.look[key] = int(v)
         self._set_last({"kind": "look", "key": key, "value": int(v), "label": LOOK_TITLES.get(key, key)})
@@ -4823,6 +4928,9 @@ class Card(QWidget):
         if px is None:
             self._warn("Select something first, then press Ctrl+T.")
             return
+        if self.ctx is None:                                     # on the page: the selected part becomes a layer
+            self.layer_from_selection(cut=True, place=True)
+            return
         self._set_tool("transform")
         self.canvas.start_transform(*px)
         self.tfBtns["free"].setChecked(True)
@@ -5085,6 +5193,11 @@ class Card(QWidget):
         (strength, whiteness ...) can be changed afterwards and the result follows - nothing is applied twice."""
         if not self._loaded:
             return
+        ids = self._targets()
+        if ids and not live:
+            self._target_set(ids, shadow="on")
+            if not self.sel_main:
+                return
         if live and self.shadow_src is None:
             return
         if live and self._shadow_busy:               # still working: one more pass follows, with the latest values
@@ -5145,6 +5258,11 @@ class Card(QWidget):
 
     def _shadow_opt(self, key, v):
         self.shadow_opts[key] = v
+        ids = self._targets()
+        if ids:
+            self._target_set(ids, shadow="live")
+            if not self.sel_main:
+                return
         if self.shadow_src is not None:              # shadow already applied: follow the slider live
             self._shadow_timer.start()
 

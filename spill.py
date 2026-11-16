@@ -230,7 +230,7 @@ def _in(obj):
     return obj.get() if isinstance(obj, Ref) else obj
 
 
-_LAYER_KEYS = ("rgb", "a", "src", "sa")
+_LAYER_KEYS = ("rgb", "a", "src", "sa", "ed_src")
 
 
 def demote(st):
