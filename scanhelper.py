@@ -66,6 +66,11 @@ def note(text):
     emit({"event": "note", "message": text})
 
 
+def stage(name):
+    """Tells the main window where we are (start / setup / scanning), so it can show a real progress bar."""
+    emit({"event": "stage", "stage": name, "t": time.time()})
+
+
 # ------------------------------------------------------------------ a window the driver windows can belong to
 def make_owner():
     """A tiny always-on-top window.  Scanner driver windows open on top of it instead of hiding behind other programs."""
@@ -149,6 +154,7 @@ def _dib_to_file(handle, path):
 def twain_scan(a):
     import twain
     pages = []
+    stage("setup")
     owner = make_owner()
     sm = twain.SourceManager(owner)
     src = None
@@ -186,6 +192,7 @@ def twain_scan(a):
                 note("paper size not set (%s)" % (str(ex).splitlines()[0] if str(ex) else type(ex).__name__))
 
         show = bool(a.ui)
+        stage("scanning")
         _pick(src, "request_acquire", "RequestAcquire")(show, show)
         if show:
             _pick(src, "modal_loop", "ModalLoop")()
@@ -299,6 +306,7 @@ def wia_scan(a):
             break
     if info is None:
         raise RuntimeError("The scanner is not connected any more (WIA).")
+    stage("setup")
     dev = info.Connect()
     pages = []
     if a.ui:
@@ -337,6 +345,7 @@ def wia_scan(a):
         _wia_set(iprops, 6151, int(bw * dpi), "paper width")
         _wia_set(iprops, 6152, int(bh * dpi), "paper height")
     n = 0
+    stage("scanning")
     while True:
         try:
             img = item.Transfer(WIA_PNG)
@@ -375,6 +384,7 @@ def cmd_list(a):
 
 
 def cmd_scan(a):
+    stage("start")
     os.makedirs(a.dir, exist_ok=True)
     pages = wia_scan(a) if a.kind == "wia" else twain_scan(a)
     emit({"event": "done", "pages": len(pages), "bits": BITS})

@@ -2,6 +2,7 @@
 Two ways: Normal (one picture per page) and ID card (FRONT, then BACK -> one page, each side its own layer).
 The real scanning is done by scanhelper (a separate small program, a 32-bit and a 64-bit copy), see scanhelper.py."""
 import json
+import math
 import os
 import shutil
 import sys
@@ -9,7 +10,8 @@ import tempfile
 import time
 
 from PySide6.QtCore import QProcess, QTimer, Qt
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QFormLayout, QHBoxLayout, QLabel, QPushButton, QVBoxLayout)
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QFormLayout, QHBoxLayout, QLabel, QProgressBar, QPushButton,
+                               QVBoxLayout, QWidget)
 
 import idscan
 import jobs
@@ -19,6 +21,14 @@ SIZES = (("Auto (the scanner decides the paper size)", "max"), ("A4", "a4"), ("A
          ("Letter", "letter"), ("Legal", "legal"))
 MODES = (("Color", "color"), ("Gray", "gray"), ("Black and white", "bw"))
 SHORTCUT = "Ctrl+Shift+N"
+# about how long the scanner itself needs (seconds) when we have not scanned with these settings before
+GUESS_S = {150: 8.0, 200: 10.0, 300: 14.0, 400: 20.0, 600: 34.0}
+BAR_CSS = ("QProgressBar { background: #1b1e2e; border: 1px solid #343a5a; border-radius: 8px; }"
+           "QProgressBar::chunk { border-radius: 7px; background: qlineargradient(x1:0, y1:0, x2:1, y2:0,"
+           " stop:0 #6366f1, stop:1 #22d3ee); }")
+STAGE_TEXT = {"start": "Starting the scanner program ...", "setup": "Preparing the scanner ...",
+              "scanning": "Scanning - the scanner is working ...", "process": "Making the picture sharper ...",
+              "ui": "Use the scanner's own window ..."}
 
 
 def helper_command(bits):
@@ -155,6 +165,32 @@ class ScanDialog(QDialog):
         self.lblMsg.setWordWrap(True)
         root.addWidget(self.lblMsg)
 
+        # progress: what is happening now, how far, how long
+        self.pwrap = QWidget()
+        pl = QVBoxLayout(self.pwrap)
+        pl.setContentsMargins(0, 0, 0, 0)
+        pl.setSpacing(4)
+        self.pbar = QProgressBar()
+        self.pbar.setRange(0, 1000)
+        self.pbar.setTextVisible(False)
+        self.pbar.setFixedHeight(16)
+        self.pbar.setStyleSheet(BAR_CSS)
+        self.lblProg = QLabel("")
+        self.lblProg.setStyleSheet("font-weight: 600;")
+        self.lblTime = QLabel("")
+        self.lblTime.setObjectName("muted")
+        row = QHBoxLayout()
+        row.addWidget(self.lblProg, 1)
+        row.addWidget(self.lblTime)
+        pl.addWidget(self.pbar)
+        pl.addLayout(row)
+        self.pwrap.hide()
+        root.addWidget(self.pwrap)
+        self._p = None
+        self._ptimer = QTimer(self)
+        self._ptimer.setInterval(80)
+        self._ptimer.timeout.connect(self._tick)
+
         btns = QHBoxLayout()
         self.btnScan = QPushButton("Scan")
         self.btnScan.setProperty("accent", True)
@@ -175,6 +211,95 @@ class ScanDialog(QDialog):
         root.addWidget(self.lblKey)
         self._load_settings()
         self._mode_changed()
+
+    # ------------------------------------------------------------ progress bar
+    def _time_key(self):
+        return "scan/time/%s_%s_%s_%s" % ((self.cmbDev.currentData() or {}).get("kind", ""), self.cmbDpi.currentData(),
+                                          self.cmbSize.currentData(), self.cmbCol.currentData())
+
+    def _prog_start(self, out):
+        try:
+            est = float(self.st.value(self._time_key(), 0) or 0)
+        except Exception:
+            est = 0.0
+        if est <= 0:
+            est = GUESS_S.get(int(self.cmbDpi.currentData() or 300), 15.0)
+        now = time.time()
+        self._p = {"out": out, "seen": 0, "stage": "start", "ts": now, "t0": now, "est": max(2.0, est), "pages": 0,
+                   "shown": 0.0, "proc": 0.0, "ptext": "", "ui": self.chkUi.isChecked(), "learned": False}
+        self.pbar.setRange(0, 1000)
+        self.pbar.setValue(0)
+        self.pwrap.show()
+        self._ptimer.start()
+        self._tick()
+
+    def _prog_stage(self, name):
+        if self._p is not None and self._p["stage"] != name:
+            self._p["stage"] = name
+            self._p["ts"] = time.time()
+
+    def _prog_proc(self, frac, text=""):
+        if self._p is not None:
+            self._p["proc"] = max(self._p["proc"], max(0.0, min(1.0, float(frac))))
+            self._p["ptext"] = text or ""
+
+    def _prog_hide(self, delay=0):
+        self._ptimer.stop()
+        p, self._p = self._p, None
+        if delay and p is not None:
+            self.pbar.setRange(0, 1000)
+            self.pbar.setValue(1000)
+            QTimer.singleShot(delay, lambda: self.pwrap.hide() if self._p is None else None)
+        else:
+            self.pwrap.hide()
+
+    def _tick(self):
+        p = self._p
+        if p is None:
+            return
+        for ev in read_events(p["out"])[p["seen"]:]:
+            p["seen"] += 1
+            kind = ev.get("event")
+            if kind == "stage":
+                self._prog_stage(str(ev.get("stage")))
+            elif kind == "page":
+                p["pages"] += 1
+                if not p["learned"] and p["stage"] == "scanning":       # remember how long this scanner needs
+                    p["learned"] = True
+                    took = time.time() - p["ts"]
+                    if 1.0 < took < 600.0:
+                        old = float(self.st.value(self._time_key(), 0) or 0)
+                        self.st.setValue(self._time_key(), took if old <= 0 else 0.5 * old + 0.5 * took)
+        now = time.time()
+        dt = now - p["ts"]
+        st = p["stage"]
+        if st == "process":
+            target = 0.80 + 0.20 * p["proc"]
+        elif st == "start":
+            target = 0.02 + 0.06 * (1 - math.exp(-dt / 2.0))
+        elif st == "setup":
+            target = 0.08 + 0.07 * (1 - math.exp(-dt / 1.5))
+        else:                                                              # scanning: slows down, never stands still
+            target = 0.15 + 0.60 * (1 - math.exp(-dt / (p["est"] * 0.55)))
+            if p["pages"]:
+                target = max(target, 0.15 + 0.60 * p["pages"] / (p["pages"] + 1.0))
+        if p["ui"] and st == "scanning":
+            self.pbar.setRange(0, 0)                                       # the person drives the driver window: no estimate
+            text = STAGE_TEXT["ui"]
+        else:
+            if self.pbar.maximum() == 0:
+                self.pbar.setRange(0, 1000)
+            p["shown"] = max(p["shown"], p["shown"] + (target - p["shown"]) * 0.2)
+            self.pbar.setValue(int(min(0.995, p["shown"]) * 1000))
+            text = STAGE_TEXT.get(st, "Working ...")
+        extra = []
+        if st == "process" and p["ptext"]:
+            extra.append(p["ptext"])
+        elif p["pages"]:
+            extra.append("%d page%s received" % (p["pages"], "" if p["pages"] == 1 else "s"))
+        pct = "" if self.pbar.maximum() == 0 else "  %d%%" % int(min(99, p["shown"] * 100))
+        self.lblProg.setText(text + pct)
+        self.lblTime.setText("  |  ".join(extra + ["%d s" % int(now - p["t0"])]))
 
     # ------------------------------------------------------------ settings
     def _combo_set(self, cmb, key, default):
@@ -219,6 +344,7 @@ class ScanDialog(QDialog):
 
     def closeEvent(self, e):
         self._save_settings()
+        self._ptimer.stop()
         if self._proc is not None:
             self._cancel()
         super().closeEvent(e)
@@ -384,7 +510,8 @@ class ScanDialog(QDialog):
         self._proc = p
         self._cancelled = False
         self._busy_set(True)
-        self.lblMsg.setText("Scanning ... (if the scanner's window opened, use it; this window waits)")
+        self.lblMsg.setText("(if the scanner's own window opens, use it; this window waits)" if self.chkUi.isChecked() else "")
+        self._prog_start(out)
         p.start(cmd[0], args)
 
     def _cancel(self):
@@ -401,6 +528,7 @@ class ScanDialog(QDialog):
             self._proc = None
             p.deleteLater()
             self._busy_set(False)
+            self._prog_hide()
             self.lblMsg.setText("The scan helper could not start.")
 
     def _scan_done(self, p, out):
@@ -414,9 +542,11 @@ class ScanDialog(QDialog):
         notes = [e["message"] for e in events if e.get("event") == "note"]
         self._busy_set(False)
         if self._cancelled and not pages:
+            self._prog_hide()
             self.lblMsg.setText("Cancelled.")
             return
         if not pages:
+            self._prog_hide()
             if any(e.get("event") == "cancelled" for e in events):
                 self.lblMsg.setText("Cancelled in the scanner window.")
                 return
@@ -431,6 +561,10 @@ class ScanDialog(QDialog):
             return
         if notes:
             self.lblMsg.setText("Done. Notes: " + "; ".join(notes[:4]))
+        if self._p is not None:
+            self._p["pages"] = len(pages)
+            self._prog_stage("process")
+            self._p["shown"] = max(self._p["shown"], 0.78)
         self._got_pages(pages)
 
     # ------------------------------------------------------------ what to do with the pictures
@@ -452,9 +586,11 @@ class ScanDialog(QDialog):
             for im in imgs:
                 im.load()
             cards = []
-            for im in imgs:
+            for i, im in enumerate(imgs):
+                progress(i / len(imgs), "cutting the card out")
                 card, ok = idscan.cut_card(im, dpi)
-                card, eff = scanfix.enhance(card, dpi, fix)          # sharper card; eff = its real dpi now
+                card, eff = scanfix.enhance(card, dpi, fix,           # sharper card; eff = its real dpi now
+                                            lambda f, t="", i=i: progress((i + 0.3 + 0.7 * f) / len(imgs), t))
                 cards.append((card, ok, eff))
             return cards
 
@@ -481,15 +617,17 @@ class ScanDialog(QDialog):
                 back = cards[0][0]
             self._front = None
             self._finish_id(front, back, dpi, page, place, all(found))
-        jobs.run_background(work, done, lambda m: self._fail(m))
+        jobs.run_background(work, done, lambda m: self._fail(m), self._prog_proc)
 
     def _fail(self, msg):
+        self._prog_hide()
         self.lblMsg.setText("Could not read the scan: %s" % (msg.splitlines()[-1] if msg else ""))
         self._update_step()
 
     def _finish_id(self, front, back, dpi, page, place, all_found):
         def work(progress):
-            pg, items = idscan.compose_page(front, back, dpi, page, place)
+            progress(0.9, "putting the page together")
+            pg, items = idscan.compose_page(front, back, dpi, page, place, rounded=all_found)
             path = os.path.join(self.work, "idcard_%s.png" % time.strftime("%H%M%S"))
             pg.save(path)
             return path, items
@@ -497,11 +635,12 @@ class ScanDialog(QDialog):
         def done(r):
             path, items = r
             self.win.scan_id_page(path, items)
+            self._prog_hide(1200)
             self.lblMsg.setText("ID card page is ready (front and back are two layers)." +
                                 ("" if all_found else "  Note: a card was not found in a scan, the whole scan was used."))
             self._update_step()
             self._mode_changed()
-        jobs.run_background(work, done, lambda m: self._fail(m))
+        jobs.run_background(work, done, lambda m: self._fail(m), self._prog_proc)
 
     def _to_png(self, pages, dpi=300, fix=None):
         fix = fix or scanfix.OFF
@@ -510,9 +649,11 @@ class ScanDialog(QDialog):
             from PIL import Image
             outs = []
             for i, p in enumerate(pages):
+                progress(i / len(pages), "page %d / %d" % (i + 1, len(pages)))
                 im = Image.open(p)
                 im.load()
-                im, _ = scanfix.enhance(im, dpi, fix)
+                im, _ = scanfix.enhance(im, dpi, fix, lambda f, t="", i=i: progress((i + f) / len(pages),
+                                                                                    "page %d / %d" % (i + 1, len(pages))))
                 q = os.path.join(self.work, "scan_%s_%d.png" % (time.strftime("%H%M%S"), i + 1))
                 im.convert("RGB").save(q)
                 outs.append(q)
@@ -520,5 +661,6 @@ class ScanDialog(QDialog):
 
         def done(outs):
             self.win.scan_received(outs)
+            self._prog_hide(1200)
             self.lblMsg.setText("%d page%s added." % (len(outs), "" if len(outs) == 1 else "s"))
-        jobs.run_background(work, done, lambda m: self._fail(m))
+        jobs.run_background(work, done, lambda m: self._fail(m), self._prog_proc)

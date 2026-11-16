@@ -1431,6 +1431,7 @@ class MainWindow(QMainWindow):
         c.removeRequested.connect(self.remove_card)
         c.copyRequested.connect(lambda card: self.copy_cards([card]))
         c.printRequested.connect(lambda card: self.print_cards([card]))
+        c.pasteRequested.connect(self.paste)
         c.saveRequested.connect(self.save_card)
         c.saveAsRequested.connect(self.save_card_as)
         c.saveAllRequested.connect(self.save_all)

@@ -48,18 +48,30 @@ def factor_for(size, dpi, mode):
     return f if f >= 1.05 else 1.0
 
 
-def enhance(img, dpi=300, mode=BEST):
-    """-> (picture, effective dpi).  mode: OFF / SHARPEN (sharpen only) / BEST (denoise + enlarge + sharpen)."""
+def enhance(img, dpi=300, mode=BEST, progress=None):
+    """-> (picture, effective dpi).  mode: OFF / SHARPEN (sharpen only) / BEST (denoise + enlarge + sharpen).
+    progress(fraction 0..1, text) is called between the steps (it is only for a progress bar)."""
+    def tell(f, t=""):
+        if progress is not None:
+            try:
+                progress(f, t)
+            except Exception:
+                pass
     img = img.convert("RGB")
     if mode == OFF:
         return img, dpi
     if mode == BEST:
+        tell(0.02, "cleaning")
         img = _denoise(img)
     f = factor_for(img.size, dpi, mode)
     if f > 1.0:
+        tell(0.30, "enlarging")
         img = img.resize((max(1, int(round(img.width * f))), max(1, int(round(img.height * f)))), Image.Resampling.LANCZOS)
     eff = dpi * f
     # the blur of the scanner / resize grows with the factor, so the sharpening radius grows with it
     radius = 0.8 + 0.45 * f
     percent = 70 if f == 1.0 else 95
-    return _sharpen_luma(img, radius, percent), eff
+    tell(0.65, "sharpening")
+    out = _sharpen_luma(img, radius, percent)
+    tell(1.0, "")
+    return out, eff

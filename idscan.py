@@ -9,9 +9,10 @@ import math
 
 import cv2
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 
 CARD_ASPECT = 85.6 / 54.0                 # ID-1 (bank card, NID, driving licence)
+CORNER_MM = 3.18                          # corner radius of an ID-1 card (ISO 7810)
 # page sizes in millimetres
 PAGES_MM = {"A4": (210.0, 297.0), "A5": (148.0, 210.0), "Letter": (215.9, 279.4), "Legal": (215.9, 355.6)}
 
@@ -163,19 +164,36 @@ def cut_card(img, dpi=300, keep_orientation=False):
     return card, True
 
 
+def rounded_card(card, extra=1.06):
+    """The card as RGBA with the real rounded corners: the four corners of a rectangular cut are scanner lid / shadow /
+    smeared edge, they become transparent (smooth, anti-aliased) so the card looks like the real card on the page."""
+    card = card.convert("RGB")
+    w, h = card.size
+    r = CORNER_MM / 85.6 * max(w, h) * extra             # a hair bigger than the real radius: no dark crumbs left
+    r = max(2.0, min(r, min(w, h) / 2.0))
+    S = 4                                                # drawn 4 times bigger, then reduced = smooth edge
+    m = Image.new("L", (w * S, h * S), 0)
+    ImageDraw.Draw(m).rounded_rectangle((0, 0, w * S - 1, h * S - 1), radius=r * S, fill=255)
+    m = m.resize((w, h), Image.Resampling.LANCZOS)
+    out = card.convert("RGBA")
+    out.putalpha(m)
+    return out
+
+
 def page_pixels(page, dpi):
     mm = PAGES_MM.get(page, PAGES_MM["A4"])
     return int(round(mm[0] / 25.4 * dpi)), int(round(mm[1] / 25.4 * dpi))
 
 
-def compose_page(front, back, dpi=300, page="A4", place="center", gap_mm=8.0):
-    """FRONT above BACK, real size, centred on a white page.
+def compose_page(front, back, dpi=300, page="A4", place="center", gap_mm=8.0, rounded=True):
+    """FRONT above BACK, real size, centred on a white page.  rounded = the corners are cut round like a real card
+    (transparent corners; every picture is then RGBA).
     -> (page picture, [(name, picture, (x0, y0, x1, y1) as fractions of the page), ...])"""
     dpi = max(150, int(dpi))
     PW, PH = page_pixels(page, dpi)
-    cards = [("Front", front.convert("RGB")), ("Back", back.convert("RGB"))]
-    if back is None:
-        cards = cards[:1]
+    cards = [("Front", front.convert("RGB"))]
+    if back is not None:
+        cards.append(("Back", back.convert("RGB")))
     # both sides of one card are the same size: a few pixels of difference are crop noise, make them equal
     if len(cards) == 2:
         a, b = cards[0][1], cards[1][1]
@@ -185,6 +203,8 @@ def compose_page(front, back, dpi=300, page="A4", place="center", gap_mm=8.0):
     f = min(1.0, maxw / max(c.width for _, c in cards))
     if f < 1.0:
         cards = [(n, c.resize((max(1, int(c.width * f)), max(1, int(c.height * f))), Image.Resampling.LANCZOS)) for n, c in cards]
+    if rounded:
+        cards = [(n, rounded_card(c)) for n, c in cards]
     gap = int(round(gap_mm / 25.4 * dpi))
     total = sum(c.height for _, c in cards) + gap * (len(cards) - 1)
     if place == "top":
@@ -204,5 +224,5 @@ def paste_preview(page_img, items):
     out = page_img.copy()
     W, H = out.size
     for _, c, (x0, y0, x1, y1) in items:
-        out.paste(c, (int(round(x0 * W)), int(round(y0 * H))))
+        out.paste(c, (int(round(x0 * W)), int(round(y0 * H))), c if c.mode == "RGBA" else None)
     return out

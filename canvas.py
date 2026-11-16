@@ -49,6 +49,7 @@ class ImageCanvas(QWidget):
     layerOutside = Signal(float, float)         # click outside the box of the selected picture layer
     layerEditRequested = Signal()               # double click on the selected picture layer
     layerCopyRequested = Signal()               # Alt + drag on the selected picture layer: a copy stays where it is
+    contextRequested = Signal(float, float, object)   # plain right click (no drag): x, y in preview pixels, global screen point
     layerPressed = Signal(int, float, float, bool)   # press on a picture / text box with the Hand or Move tool (Ctrl + click in other tools): id, x, y, Alt held
     paintFinished = Signal(object)              # colour brush stroke: list of (x, y) in preview pixels
 
@@ -76,6 +77,9 @@ class ImageCanvas(QWidget):
         self._quad = []
         self._drag = None
         self._pan_last = None
+        self._rc_press = None                 # right button went down here: a click without a drag opens the menu
+        self._shift_flag = False              # Shift as seen by the last mouse / key event (more reliable than polling)
+        self._snap_a = None                   # the straight direction chosen while Shift is held (stays steady, no flicker)
         self._view_press = None
         self.layer_probe = None                  # card gives a function (x, y, ctrl) -> id of the picture / text box there, or None
         self._hover = None
@@ -407,6 +411,58 @@ class ImageCanvas(QWidget):
             self._tf["w"], self._tf["h"] = float(img.width()), float(img.height())
             self.update()
 
+    # ---- Shift = dead straight, the same everywhere (layers, selection outline, selected pixels, crop box)
+    def _note_mods(self, mods):
+        self._shift_flag = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+
+    def _shift_on(self):
+        return self._shift_flag or QApplication_shift()
+
+    def _snap(self, dx, dy):
+        """Shift held: the movement is forced to sideways / up-down / exact diagonal.  The direction is kept until the
+        pointer clearly goes to another one, so the object does not jump between directions near the start point."""
+        if not self._shift_on():
+            self._snap_a = None
+            return dx, dy
+        if not dx and not dy:
+            return dx, dy
+        step = math.pi / 4
+        ang = math.atan2(dy, dx)
+        cur = self._snap_a
+        if cur is not None and abs((ang - cur + math.pi) % (2 * math.pi) - math.pi) < step / 2 + 0.2:
+            a = cur
+        else:
+            a = round(ang / step) * step
+        self._snap_a = a
+        ux, uy = math.cos(a), math.sin(a)
+        t = dx * ux + dy * uy
+        return t * ux, t * uy
+
+    def _drag_to(self, pos):
+        """Carries on a drag that moves something.  True = there was such a drag.  Also called when Shift is pressed or
+        let go in the middle of a drag, so the picture follows at once (and the result is right when the mouse is released)."""
+        if self._selmove is not None:
+            ip = self.to_img(pos)
+            a = self._selmove["start"]
+            dx, dy = self._snap(ip.x() - a.x(), ip.y() - a.y())
+            self._selmove["d"] = (int(round(dx)), int(round(dy)))
+            self.update()
+            return True
+        if self._tf_drag is not None:
+            self._tf_do(pos)
+            return True
+        if self._drag is not None:
+            self._do_drag(pos)
+            return True
+        if self._float_start is not None:
+            ip = self.to_img(pos)
+            a = self._float_start[0]
+            dx, dy = self._snap(ip.x() - a.x(), ip.y() - a.y())
+            self._float_d = (int(round(dx)), int(round(dy)))
+            self.update()
+            return True
+        return False
+
     def begin_layer_drag(self, x, y, alt=False):
         """The mouse is still down on a picture layer that was just selected: carry on as a drag (Alt = a copy stays)."""
         if self.mode != self.TRANSFORM or self._tf is None or not self._tf.get("layer"):
@@ -662,8 +718,7 @@ class ImageCanvas(QWidget):
         dx, dy = ip.x() - d[2].x(), ip.y() - d[2].y()
         n = t["n"]
         if d[0] == "move":
-            if QApplication_shift():                         # Shift: the object moves dead straight
-                dx, dy = snap_straight(dx, dy)
+            dx, dy = self._snap(dx, dy)                      # Shift: the object moves dead straight
             t["pts"] = [QPointF(q.x() + dx, q.y() + dy) for q in st]
         elif d[0] == "rotate":
             a = math.radians(math.degrees(math.atan2(ip.y() - c0.y(), ip.x() - c0.x())) - d[3])
@@ -692,7 +747,7 @@ class ImageCanvas(QWidget):
         if name[0] == "c":
             if mode in ("free", "skew"):                         # scale around the centre (Shift = free)
                 r0 = math.hypot(S[idx].x() - c0.x(), S[idx].y() - c0.y()) or 1.0
-                if QApplication_shift():
+                if self._shift_on():
                     gx = (S[idx].x() - c0.x()) * u.x() + (S[idx].y() - c0.y()) * u.y()
                     gy = (S[idx].x() - c0.x()) * v.x() + (S[idx].y() - c0.y()) * v.y()
                     px = (ip.x() - c0.x()) * u.x() + (ip.y() - c0.y()) * u.y()
@@ -1378,10 +1433,13 @@ class ImageCanvas(QWidget):
 
     def mousePressEvent(self, e):
         self.setFocus()
+        self._note_mods(e.modifiers())
+        self._snap_a = None
         if self._img is None:
             return
         pos = e.position()
         btn = e.button()
+        self._rc_press = pos if btn == Qt.MouseButton.RightButton else None
         if btn == Qt.MouseButton.LeftButton and not self._space and self.layer_probe is not None \
                 and self.mode != self.TRANSFORM:
             ipp = self.to_img(pos)
@@ -1509,7 +1567,7 @@ class ImageCanvas(QWidget):
             self._crop = QRectF(QPointF(min(x0, x1), min(y0, y1)), QPointF(max(x0, x1), max(y0, y1)))
         elif kind == "move":
             a, r0 = self._drag[1], self._drag[2]
-            dx, dy = ip.x() - a.x(), ip.y() - a.y()
+            dx, dy = self._snap(ip.x() - a.x(), ip.y() - a.y())
             dx = self._cl(dx, -r0.left(), iw - r0.right())
             dy = self._cl(dy, -r0.top(), ih - r0.bottom())
             self._crop = r0.translated(dx, dy)
@@ -1531,6 +1589,7 @@ class ImageCanvas(QWidget):
     def mouseMoveEvent(self, e):
         pos = e.position()
         self._hover = pos
+        self._note_mods(e.modifiers())
         if self._pan_last is not None:
             d = pos - self._pan_last
             self._pan_last = pos
@@ -1539,26 +1598,7 @@ class ImageCanvas(QWidget):
             self._clamp()
             self.update()
             return
-        if self._selmove is not None:
-            ip = self.to_img(pos)
-            a = self._selmove["start"]
-            self._selmove["d"] = (int(round(ip.x() - a.x())), int(round(ip.y() - a.y())))
-            self.update()
-            return
-        if self._tf_drag is not None:
-            self._tf_do(pos)
-            return
-        if self._drag is not None:
-            self._do_drag(pos)
-            return
-        if self._float_start is not None:
-            ip = self.to_img(pos)
-            a = self._float_start[0]
-            dx, dy = ip.x() - a.x(), ip.y() - a.y()
-            if QApplication_shift():                       # Shift: dead straight (moving and copying)
-                dx, dy = snap_straight(dx, dy)
-            self._float_d = (int(round(dx)), int(round(dy)))
-            self.update()
+        if self._drag_to(pos):
             return
         if self._erase is not None:
             ip = self._inside(self.to_img(pos))
@@ -1584,6 +1624,16 @@ class ImageCanvas(QWidget):
                 self.update()
 
     def mouseReleaseEvent(self, e):
+        self._note_mods(e.modifiers())
+        if e.button() == Qt.MouseButton.RightButton and self._rc_press is not None:
+            moved = (e.position() - self._rc_press).manhattanLength()
+            self._rc_press = None
+            self._pan_last = None
+            self._update_cursor(e.position())
+            if moved < 5 and self._img is not None:            # a click, not a drag of the picture: the menu
+                ip = self.to_img(e.position())
+                self.contextRequested.emit(ip.x(), ip.y(), e.globalPosition().toPoint())
+            return
         if self._selmove is not None and e.button() == Qt.MouseButton.LeftButton:
             dx, dy = self._selmove["d"]
             self._selmove = None
@@ -1646,6 +1696,7 @@ class ImageCanvas(QWidget):
             self.update()
         self._pan_last = None
         self._drag = None
+        self._snap_a = None
         self._update_cursor(e.position())
 
     def leaveEvent(self, e):
@@ -1713,6 +1764,10 @@ class ImageCanvas(QWidget):
 
     def keyReleaseEvent(self, e):
         if e.key() in (Qt.Key.Key_Shift, Qt.Key.Key_Alt, Qt.Key.Key_Control):
+            self._shift_flag = bool(e.modifiers() & Qt.KeyboardModifier.ShiftModifier) and e.key() != Qt.Key.Key_Shift
+            if e.key() == Qt.Key.Key_Shift and self._hover is not None:
+                self._snap_a = None
+                self._drag_to(self._hover)                       # Shift let go in the middle of a drag: free again
             self._update_cursor(self._hover)
             self.update()
         if e.key() == Qt.Key.Key_Space and not e.isAutoRepeat():
@@ -1723,6 +1778,11 @@ class ImageCanvas(QWidget):
 
     def keyPressEvent(self, e):
         if e.key() in (Qt.Key.Key_Shift, Qt.Key.Key_Alt, Qt.Key.Key_Control):   # the chip at the mouse shows what the key does
+            if e.key() == Qt.Key.Key_Shift:
+                self._shift_flag = True
+                if self._hover is not None and not e.isAutoRepeat():
+                    self._snap_a = None
+                    self._drag_to(self._hover)                   # Shift pressed in the middle of a drag: straight at once
             self._update_cursor(self._hover)
             self.update()
         if e.key() == Qt.Key.Key_Space:

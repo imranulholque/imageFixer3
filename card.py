@@ -768,6 +768,7 @@ class Card(QWidget):
     removeRequested = Signal(object)
     copyRequested = Signal(object)
     printRequested = Signal(object)
+    pasteRequested = Signal()
     saveRequested = Signal(object)
     saveAsRequested = Signal(object)
     saveAllRequested = Signal()
@@ -1384,6 +1385,7 @@ class Card(QWidget):
         self.canvas.layerCopyRequested.connect(self._copy_layer_drag)
         self.canvas.layer_probe = self._layer_probe
         self.canvas.layerPressed.connect(self._on_layer_pressed)
+        self.canvas.contextRequested.connect(self._on_canvas_context)
         self.btnApply.clicked.connect(self.apply_pending)
         self.btnCancel.clicked.connect(self.cancel_pending)
         self.btnUndo.clicked.connect(self.undo_step)
@@ -1900,6 +1902,8 @@ class Card(QWidget):
         self.btnLayerCopy.clicked.connect(lambda: self.sel_layer is not None and self.duplicate_layer(self.sel_layer))
         self.btnLayerDel.clicked.connect(lambda: self.sel_layer is not None and self.delete_layer(self.sel_layer))
         self.layerList.itemClicked.connect(self._layer_list_clicked)
+        self.layerList.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.layerList.customContextMenuRequested.connect(self._layer_list_menu)
         self.layerList.itemDoubleClicked.connect(lambda it: QTimer.singleShot(0, lambda: self.edit_layer(it.data(Qt.ItemDataRole.UserRole))))
         self.layerList.eyeClicked.connect(self._layer_eye_clicked)
         self.layerList.reordered.connect(self._layer_list_reordered)
@@ -3267,7 +3271,8 @@ class Card(QWidget):
         for name, im, (x0, y0, x1, y1) in items:
             self._layer_seq += 1
             rgb = im.convert("RGB")
-            new.append({"id": self._layer_seq, "name": name, "rgb": rgb, "a": Image.new("L", rgb.size, 255), "src": rgb,
+            alpha = im.getchannel("A") if im.mode == "RGBA" else Image.new("L", rgb.size, 255)      # round card corners = transparent
+            new.append({"id": self._layer_seq, "name": name, "rgb": rgb, "a": alpha, "src": rgb,
                         "sa": None, "bg": bg, "grid": [(x0, y0), (x1, y0), (x0, y1), (x1, y1)], "n": 1,
                         "opacity": 100, "visible": True})
         self.layers = self.layers + new
@@ -3622,6 +3627,146 @@ class Card(QWidget):
         self.place_layer_tool(lid)
         self._show_text_tab_if_text(lid)
         self.canvas.begin_layer_drag(x, y, alt)                 # drag starts right away: click = select, drag = move, Alt + drag = copy
+
+    # ------------------------------------------------------------ right click menus
+    def _has_selection(self):
+        try:
+            return self.sel is not None and bool(np.max(self.sel) > 0.5)
+        except Exception:
+            return False
+
+    def _clipboard_has_picture(self):
+        try:
+            md = QApplication.clipboard().mimeData()
+            return md is not None and (md.hasUrls() or md.hasImage() or md.hasFormat("application/pdf"))
+        except Exception:
+            return False
+
+    def copy_layer_image(self, lid):
+        """The picture of one layer (with its transparent parts) goes to the clipboard."""
+        l = self._layer(lid)
+        if l is None:
+            return
+        try:
+            rgba = core.layer_rgba(l, pend=True)
+            arr = np.ascontiguousarray(np.asarray(rgba))
+            qimg = QImage(arr.data, arr.shape[1], arr.shape[0], arr.shape[1] * 4, QImage.Format.Format_RGBA8888).copy()
+            QApplication.clipboard().setImage(qimg)
+            self.message.emit("Layer copied. Paste it in another program, or use Duplicate to make a copy here.")
+        except Exception:
+            _log("copy layer")
+
+    def _flip_layer(self, lid, horizontal):
+        self.place_layer_tool(lid)
+        if self._tool == "transform" and self._place_id == lid:
+            self.canvas.tf_flip(horizontal)
+            self._commit_layer_pts()
+
+    def _turn_layer(self, lid, deg_ccw):
+        self.place_layer_tool(lid)
+        self.rotate_key(deg_ccw)
+
+    def _layer_menu(self, lid, gpos):
+        l = self._layer(lid)
+        if l is None:
+            return
+        is_text = l.get("text") is not None
+        idx = next((k for k, x in enumerate(self.layers) if x["id"] == lid), 0)
+        top, bottom = idx >= len(self.layers) - 1, idx <= 0
+        m = QMenu(self)
+        items = [
+            ("Move / resize / rotate", lambda: self.place_layer_tool(lid), True),
+            ("Edit the text" if is_text else "Edit this picture alone\tdouble click", lambda: self.edit_layer(lid), True),
+            None,
+            ("Duplicate", lambda: self.duplicate_layer(lid), True),
+            ("Copy picture", lambda: self.copy_layer_image(lid), not is_text),
+            None,
+            ("Bring to front\tCtrl+Alt+Shift+Up", lambda: self.move_layer_to(lid, True), not top),
+            ("Bring forward", lambda: self.move_layer_order(lid, 1), not top),
+            ("Send backward", lambda: self.move_layer_order(lid, -1), not bottom),
+            ("Send to back\tCtrl+Alt+Shift+Down", lambda: self.move_layer_to(lid, False), not bottom),
+            None,
+            ("Turn right\tR", lambda: self._turn_layer(lid, -90.0), True),
+            ("Turn left\tShift+R", lambda: self._turn_layer(lid, 90.0), True),
+            ("Flip left-right", lambda: self._flip_layer(lid, True), True),
+            ("Flip top-bottom", lambda: self._flip_layer(lid, False), True),
+            None,
+            ("Hide" if l.get("visible", True) else "Show", lambda: (self.toggle_layer(lid, not l.get("visible", True)), self._refresh_layers_ui()), True),
+            ("Delete\tDel", lambda: self.delete_layer(lid), True),
+        ]
+        acts = {}
+        for it in items:
+            if it is None:
+                m.addSeparator()
+                continue
+            a = m.addAction(it[0])
+            a.setEnabled(bool(it[2]))
+            acts[a] = it[1]
+        a = m.exec(gpos)
+        fn = acts.get(a)
+        if fn is not None:
+            QTimer.singleShot(0, fn)                  # after the menu has closed
+
+    def _page_menu(self, gpos):
+        m = QMenu(self)
+        acts = {}
+
+        def add(text, fn, on=True):
+            a = m.addAction(text)
+            a.setEnabled(bool(on))
+            acts[a] = fn
+        if self._tool in CROP_KEYS or (self._tool == "transform" and self._place_id is None):
+            add("Apply\tEnter", lambda: self.canvas.applyRequested.emit())
+            add("Cancel\tEsc", lambda: self.canvas.cancelRequested.emit())
+            m.addSeparator()
+        add("Undo\tCtrl+Z", self.undo_step, self.btnUndo.isEnabled())
+        add("Redo\tCtrl+Y", self.redo_step, self.btnRedo.isEnabled())
+        m.addSeparator()
+        if self._has_selection():
+            add("Copy the selection to a new layer\tCtrl+J", lambda: self.layer_from_selection(False))
+            add("Cut the selection to a new layer\tCtrl+Shift+J", lambda: self.layer_from_selection(True))
+            add("Delete what is selected\tDel", self.delete_selection)
+            m.addSeparator()
+            add("Inverse selection\tCtrl+Shift+I", self.invert_selection)
+            add("Deselect\tCtrl+D", self.deselect)
+        else:
+            add("Select all\tCtrl+A", self.select_all)
+        m.addSeparator()
+        add("Copy picture\tCtrl+C", self.copy_image, self._loaded)
+        add("Paste\tCtrl+V", lambda: self.pasteRequested.emit(), self._clipboard_has_picture())
+        add("Transform\tCtrl+T", self.start_transform, self._loaded)
+        m.addSeparator()
+        add("Turn right\tR", lambda: self.rotate(-90.0), self._loaded)
+        add("Turn left\tShift+R", lambda: self.rotate(90.0), self._loaded)
+        m.addSeparator()
+        add("Save\tCtrl+S", lambda: self.saveRequested.emit(self), self._loaded)
+        add("Print\tCtrl+P", lambda: self.printRequested.emit(self), self._loaded)
+        a = m.exec(gpos)
+        fn = acts.get(a)
+        if fn is not None:
+            QTimer.singleShot(0, fn)
+
+    def _on_canvas_context(self, x, y, gpos):
+        """Right click on the picture: a menu for the layer under the pointer, else for the page."""
+        if not self._loaded:
+            return
+        lid = None
+        if self.ctx is None and self.layers:
+            lid = self._layer_at(x, y)
+        if lid is not None:
+            self.sel_layer = lid                       # the layer under the pointer is the one the menu works on
+            self._refresh_layers_ui()
+            self._layer_menu(lid, gpos)
+        else:
+            self._page_menu(gpos)
+
+    def _layer_list_menu(self, pos):
+        it = self.layerList.itemAt(pos)
+        if it is None:
+            return
+        lid = it.data(Qt.ItemDataRole.UserRole)
+        self.sel_layer = lid
+        self._layer_menu(lid, self.layerList.viewport().mapToGlobal(pos))
 
     def _on_layer_outside(self, x, y):
         lid = self._layer_at(x, y, skip=self._place_id)

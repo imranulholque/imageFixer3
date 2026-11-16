@@ -31,6 +31,8 @@ Clean many text pictures (WhatsApp photos, scans) and print them. One big card p
                 A picture you placed (signature, stamp ...): select it, then pick any crop - it is cropped alone and becomes
                 transparent outside the shape. (Click outside the picture first to crop the page instead.)
 Slow work shows a progress bar at the bottom; the window stays usable.
+ RIGHT CLICK: on a picture / text box layer = Duplicate, Copy picture, order (front / back), turn, flip, hide, delete.  On the page = Undo / Redo,
+                selection actions (new layer, delete, inverse), Copy, Paste, Transform, Turn, Save, Print.  (Right-click + drag still moves the view.)
 
 PDF FILES
  Open, drag in, or paste (Ctrl+V) a PDF like a picture: every page becomes its own picture (its own card), like Photoshop.

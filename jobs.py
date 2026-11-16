@@ -118,12 +118,14 @@ _live = set()
 
 
 class _Bg(QObject):
-    def __init__(self, fn, done, fail):
+    def __init__(self, fn, done, fail, progress=None):
         super().__init__()
         self._done, self._fail = done, fail
         self.sig = _Signals()
         self.sig.finished.connect(self._fin)
         self.sig.failed.connect(self._err)
+        if progress is not None:
+            self.sig.progress.connect(progress)
         _live.add(self)
         QThreadPool.globalInstance().start(_Job(lambda progress: fn(progress), self.sig))
 
@@ -139,6 +141,7 @@ class _Bg(QObject):
             self._fail(msg)
 
 
-def run_background(fn, done=None, fail=None):
-    """fn(progress) in a worker thread; done(result) / fail(message) in the window thread. Nothing is locked."""
-    return _Bg(fn, done, fail)
+def run_background(fn, done=None, fail=None, progress=None):
+    """fn(progress) in a worker thread; done(result) / fail(message) in the window thread. Nothing is locked.
+    progress(fraction, text) (optional) is called in the window thread whenever fn reports progress."""
+    return _Bg(fn, done, fail, progress)
