@@ -1907,7 +1907,7 @@ class Card(QWidget):
         self.btnLayerEdit.clicked.connect(lambda: self.sel_layer is not None and self.edit_layer(self.sel_layer))
         self.btnLayerMove.clicked.connect(lambda: self.sel_layer is not None and self.place_layer_tool(self.sel_layer))
         self.btnLayerCopy.clicked.connect(lambda: self.sel_layer is not None and self.duplicate_layer(self.sel_layer))
-        self.btnLayerDel.clicked.connect(lambda: self.sel_layer is not None and self.delete_layer(self.sel_layer))
+        self.btnLayerDel.clicked.connect(lambda: self._delete_selected_layers())
         self.layerList.itemClicked.connect(self._layer_list_clicked)
         self.layerList.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.layerList.customContextMenuRequested.connect(self._layer_list_menu)
@@ -3199,11 +3199,14 @@ class Card(QWidget):
         l = None if lid is None else self._layer(lid)
         if l is None or self.ctx is not None:
             return
-        self._layer_seq += 1
-        nl = textbox.duplicate(l, self._layer_seq, 0.0)
         self._checkpoint("Copy")
-        i = next(k for k, x in enumerate(self.layers) if x["id"] == lid)
-        self.layers = self.layers[:i] + [nl] + self.layers[i:]
+        ids = [lid] + [g for g in sorted(self.sel_group) if g != lid and self._layer(g) is not None]
+        for gid in ids:                          # every selected layer leaves a copy behind (just under it)
+            src = self._layer(gid)
+            self._layer_seq += 1
+            nl = textbox.duplicate(src, self._layer_seq, 0.0)
+            i = next(k for k, x in enumerate(self.layers) if x["id"] == gid)
+            self.layers = self.layers[:i] + [nl] + self.layers[i:]
         self.ops += 1
         self._touch()
         self._timer.start()
@@ -3597,26 +3600,40 @@ class Card(QWidget):
         self.sel_layer = lid
         self._refresh_layers_ui()
 
+    def _delete_selected_layers(self):
+        lid = self.sel_layer if self.sel_layer is not None else self._place_id
+        if lid is None and self.sel_group:
+            lid = sorted(self.sel_group)[0]
+        if lid is not None:
+            self.delete_layer(lid)
+
     def delete_layer(self, lid):
+        """Removes the layer; when it is one of several selected layers, all the selected layers are removed."""
         self._inline_end()
         if self._layer(lid) is None:
             return
         if self.ctx == lid:
             self.leave_layer(lambda: self.delete_layer(lid))
             return
-        if self._tool == "transform" and self._place_id == lid:
+        gone = {lid}
+        if lid in self.sel_group and len(self.sel_group) > 1:
+            gone |= {g for g in self.sel_group if self._layer(g) is not None}
+        if self._tool == "transform" and self._place_id is not None and self._place_id in gone:
             self._place_id = None
             self._hide_layer = None
             self._go_move()
         self._checkpoint()
-        self.layers = [l for l in self.layers if l["id"] != lid]
-        if self.sel_layer == lid:
+        self.layers = [l for l in self.layers if l["id"] not in gone]
+        if self.sel_layer in gone:
             self.sel_layer = None
+        self.sel_group = set()
+        self.sel_main = False
         self.ops += 1
         self._touch()
         self._timer.start()
         self._refresh_layers_ui()
-        self.canvas.fx.done("delete", "Picture removed", "Ctrl+Z brings it back")
+        self.canvas.fx.done("delete", "Picture removed" if len(gone) == 1 else "%d pictures removed" % len(gone),
+                            "Ctrl+Z brings it back")
 
     def move_layer_order(self, lid, d):
         i = next((k for k, l in enumerate(self.layers) if l["id"] == lid), None)
@@ -4227,11 +4244,18 @@ class Card(QWidget):
         if QApplication.keyboardModifiers() & Qt.KeyboardModifier.ControlModifier:
             ids = {x.data(Qt.ItemDataRole.UserRole) for x in self.layerList.selectedItems()}
             self.sel_group = ids if len(ids) > 1 else set()
-            if self.sel_group and self.sel_layer is None:
-                self.sel_layer = lid
             n = len(self.sel_group)
-            self.message.emit("%d layers selected: Adjust / Color changes go to all of them." % n if n > 1
+            self.message.emit("%d layers selected: every change goes to all of them." % n if n > 1
                               else "One layer selected.")
+            keep = ids or {lid}
+            act = self._place_id if self._place_id in keep else (lid if lid in keep else sorted(keep)[0])
+
+            def show():
+                if self._place_id == act and self._tool == "transform" and self.ctx is None:
+                    self._refresh_layers_ui()          # same open box: the other boxes appear
+                else:
+                    self.place_layer_tool(act)         # the open box + the boxes of the others
+            QTimer.singleShot(0, show)
             return
         self.sel_group = set()
         self.sel_main = False
