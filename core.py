@@ -2265,6 +2265,28 @@ def content_box(alpha, pad=0.03, thr=14):
     return (max(0, b[0] - px), max(0, b[1] - px), min(w, b[2] + px), min(h, b[3] + px))
 
 
+def _apply_border(out, border):
+    """A thin grey frame along the inside edge of the layer (follows the rounded corners).  It is drawn here, on the
+    finished picture, so brightness / contrast / sharpness / colour changes of the card never touch it."""
+    color, frac = border
+    arr = np.array(out)                                         # RGBA copy
+    a = arr[:, :, 3]
+    bw = max(2, int(round(max(out.size) * float(frac))))
+    pad = bw + 2
+    ap = np.pad(a, pad)                                         # zeros around: the picture edge counts as an edge too
+    try:
+        import cv2
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * bw + 1, 2 * bw + 1))
+        inner = cv2.erode(ap, k)[pad:-pad, pad:-pad]
+    except Exception:
+        inner = np.asarray(Image.fromarray(ap).filter(_PilFilter.MinFilter(2 * bw + 1)))[pad:-pad, pad:-pad]
+    af = a.astype(np.float32)
+    w = np.clip((af - inner.astype(np.float32)) / np.maximum(af, 1.0), 0.0, 1.0)[..., None]
+    col = np.array(color, np.float32)
+    arr[:, :, :3] = np.clip(arr[:, :, :3].astype(np.float32) * (1.0 - w) + col * w, 0, 255).astype(np.uint8)
+    return Image.fromarray(arr, "RGBA")
+
+
 def layer_rgba(l, pend=True):
     """RGBA of a layer dict (rgb, a, opacity; an unfinished edit 'pend' = (adjs, look, sel) is applied too)."""
     rgb = l["rgb"]
@@ -2276,6 +2298,11 @@ def layer_rgba(l, pend=True):
     if l.get("opacity", 100) < 100:
         a = a.point(lambda v, f=l["opacity"] / 100.0: int(v * f))
     out.putalpha(a)
+    if l.get("border"):
+        try:
+            out = _apply_border(out, l["border"])
+        except Exception:
+            pass
     return out
 
 

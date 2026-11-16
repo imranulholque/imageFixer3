@@ -605,8 +605,15 @@ class ScanDialog(QDialog):
             cards = []
             for i, im in enumerate(imgs):
                 progress(i / len(imgs), "cutting the card out")
-                card, ok = idscan.cut_card(im, dpi)
-                card, eff = scanfix.enhance(card, dpi, fix,           # sharper card; eff = its real dpi now
+                d = dpi
+                try:                                      # the scanner may have used another dpi than asked: the file knows
+                    m = im.info.get("dpi")
+                    if m and 100 <= float(m[0]) <= 1200 and abs(float(m[0]) - dpi) > 0.05 * dpi:
+                        d = float(m[0])
+                except Exception:
+                    pass
+                card, ok = idscan.cut_card(im, d)
+                card, eff = scanfix.enhance(card, d, fix,           # sharper card; eff = its real dpi now
                                             lambda f, t="", i=i: progress((i + 0.3 + 0.7 * f) / len(imgs), t))
                 cards.append((card, ok, eff))
             return cards

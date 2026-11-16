@@ -5,7 +5,7 @@ import json
 import threading
 
 from PySide6.QtCore import QEvent, QObject, QTimer, Qt, Signal
-from PySide6.QtWidgets import QMessageBox, QProgressDialog, QToolButton
+from PySide6.QtWidgets import QMessageBox, QProgressDialog, QPushButton
 
 import updater
 
@@ -14,41 +14,28 @@ RETRY_MS = 45 * 1000                         # a check that failed (no internet 
 FIRST_CHECK_MS = 2500                   # a few seconds after start, so start-up stays fast
 
 
-class UpdateBadge(QToolButton):
-    """A small round button on the right edge of the window, in the empty margin (no text, no menu, no tool lives there).
-    It is visible ONLY while a newer version exists and stays until the program is updated.  Click = the update question."""
-    SIZE = 26
+class UpdateBadge(QPushButton):
+    """Green 'New update available' button in the empty space of the top bar.  It is visible ONLY while a newer version
+    exists (also after the question was closed) and goes away when the program is updated.  Click = the update question."""
 
     def __init__(self, win):
-        super().__init__(win)
+        super().__init__("New update available", win)
         self.win = win
-        self.setText("\u2193")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setFixedSize(self.SIZE, self.SIZE)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.setStyleSheet("QToolButton{background:#1e9e5a;color:white;border:2px solid white;border-radius:%dpx;"
-                           "font-size:14px;font-weight:bold;}QToolButton:hover{background:#25b869;}" % (self.SIZE // 2))
+        self.setStyleSheet("QPushButton{background:#1e9e5a;color:white;border:none;border-radius:6px;"
+                           "padding:6px 14px;font-weight:bold;}QPushButton:hover{background:#25b869;}")
         self.hide()
-        win.installEventFilter(self)
 
     def place(self):
-        w = self.win
-        self.move(w.width() - self.SIZE - 2, max(40, w.height() // 2 - self.SIZE // 2))
-        self.raise_()
-
-    def eventFilter(self, obj, ev):
-        if obj is self.win and ev.type() in (QEvent.Type.Resize, QEvent.Type.Show):
-            self.place()
-        return False
+        pass
 
     def set_update(self, info):
         if info is None:
             self.hide()
             return
         self.setToolTip("A new version (build %d) is ready - click to install" % info["build"])
-        self.place()
         self.show()
-        self.raise_()
 
 
 class UpdateManager(QObject):

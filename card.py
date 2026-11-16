@@ -9,11 +9,11 @@ import uuid
 
 import numpy as np
 from PIL import Image, ImageChops, ImageFilter, ImageOps
-from PySide6.QtCore import QMimeData, QObject, QPointF, QRectF, QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QEvent, QMimeData, QObject, QPointF, QRectF, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtCore import QRect
 from PySide6.QtGui import QColor, QDrag, QIcon, QImage, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (QSplitter, QApplication, QButtonGroup, QCheckBox, QColorDialog, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu,
-                               QAbstractItemView, QPushButton, QScrollArea, QSizePolicy, QSlider, QStackedWidget, QStyle, QStyledItemDelegate, QToolButton,
+                               QAbstractItemView, QAbstractButton, QAbstractSlider, QAbstractSpinBox, QComboBox, QPushButton, QScrollArea, QSizePolicy, QSlider, QStackedWidget, QStyle, QStyledItemDelegate, QToolButton,
                                QVBoxLayout, QWidget)
 
 import core
@@ -722,7 +722,7 @@ class LayerList(QListWidget):
         super().__init__(parent)
         self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
         self.setDefaultDropAction(Qt.DropAction.MoveAction)
-        self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)      # Ctrl + click = several layers
         self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.setSpacing(2)
         self.setItemDelegate(_EyeDelegate(self))
@@ -808,6 +808,7 @@ class Card(QWidget):
         self._hide_layer = None                    # a layer that is being moved is not drawn twice
         self._place_id = None
         self.sel_layer = None
+        self.sel_group = set()                 # Ctrl + click: several layers that are edited together
         self._layer_seq = 0
         self._bg_busy = False
         self._bg_again = False
@@ -1377,6 +1378,7 @@ class Card(QWidget):
         self.canvas.selectionMoved.connect(self._move_selection)
         self.canvas.sel_mode_name = self.sel_mode
         self.canvas.moveFinished.connect(self._on_move)
+        QApplication.instance().installEventFilter(self)       # first edit on a selected layer works on that layer
         self.canvas.viewClicked.connect(self._on_view_click)
         self.canvas.tfCommitted.connect(self._commit_layer_pts)
         self.canvas.tfCopyChanged.connect(self._on_tf_copy)
@@ -2767,7 +2769,22 @@ class Card(QWidget):
         pend = None
         if core.active_adjs(self.adjs) or core.look_edited(self.look):
             pend = (copy.deepcopy(self.adjs), dict(self.look), self.sel)
-        return [dict(l, rgb=self.base, a=self.alpha, pend=pend) if l["id"] == self.ctx else l for l in self.layers]
+        grp = self._group_ids()
+        out = []
+        for l in self.layers:
+            if l["id"] == self.ctx:
+                out.append(dict(l, rgb=self.base, a=self.alpha, pend=pend))
+            elif pend is not None and l["id"] in grp and l.get("text") is None:
+                out.append(dict(l, pend=pend))           # the other layers of the group get the same settings
+            else:
+                out.append(l)
+        return out
+
+    def _group_ids(self):
+        """Layers edited together with the open one (Ctrl + click selected several)."""
+        if self.ctx is None or self.ctx not in self.sel_group or len(self.sel_group) < 2:
+            return set()
+        return set(self.sel_group) - {self.ctx}
 
     def result_image(self):
         return core.render_full(*self.render_args())
@@ -3177,6 +3194,34 @@ class Card(QWidget):
         self._timer.start()
         self._refresh_layers_ui()
 
+    def _auto_layer_edit(self):
+        """A picture layer is selected (its transform border is shown): the first slider / tool touched works on this
+        layer alone - no double click needed.  Text boxes keep their own Aa tab."""
+        lid = self._place_id
+        l = None if lid is None else self._layer(lid)
+        if l is None or self.ctx is not None or l.get("text") is not None:
+            return False
+        self._commit_layer_pts()
+        self.sel_group = set(self.sel_group) | {lid} if self.sel_group else set()
+        self.edit_layer(lid)
+        return True
+
+    _EDIT_WIDGETS = None
+
+    def eventFilter(self, obj, ev):
+        try:
+            if (ev.type() == QEvent.Type.MouseButtonPress and self._place_id is not None and self.ctx is None
+                    and isinstance(obj, QWidget) and self.stackPages.currentIndex() in (self.TAB_ADJUST, self.TAB_COLOR,
+                                                                                         self.TAB_SHADOW, self.TAB_TEXT)):
+                page = self.stackPages.currentWidget()
+                if page is not None and page.isAncestorOf(obj) and isinstance(
+                        obj, (QAbstractButton, QAbstractSlider, QAbstractSpinBox, QComboBox, QLineEdit,
+                              QAbstractItemView, ColorList, AdjRow)):
+                    self._auto_layer_edit()
+        except Exception:
+            _log("auto layer edit")
+        return False
+
     def _layer_double(self):
         lid = self._place_id
         if lid is not None:
@@ -3274,7 +3319,8 @@ class Card(QWidget):
             alpha = im.getchannel("A") if im.mode == "RGBA" else Image.new("L", rgb.size, 255)      # round card corners = transparent
             new.append({"id": self._layer_seq, "name": name, "rgb": rgb, "a": alpha, "src": rgb,
                         "sa": None, "bg": bg, "grid": [(x0, y0), (x1, y0), (x0, y1), (x1, y1)], "n": 1,
-                        "opacity": 100, "visible": True})
+                        "opacity": 100, "visible": True,
+                        "border": ((135, 135, 135), 0.006)})      # grey frame: a white card is seen on the white page
         self.layers = self.layers + new
         self.ops += 1
         self.sel_layer = None
@@ -3623,7 +3669,29 @@ class Card(QWidget):
                 return None
         return lid
 
+    def _ctrl_toggle(self, lid):
+        """Ctrl + click: add / remove a layer of the group that is edited together."""
+        cur = self._place_id if self._place_id is not None else self.sel_layer
+        grp = set(self.sel_group)
+        if not grp and cur is not None:
+            grp.add(cur)
+        if lid in grp and len(grp) > 1:
+            grp.discard(lid)
+        else:
+            grp.add(lid)
+        self.sel_group = grp if len(grp) > 1 else set()
+        if self.ctx is None and cur is None:
+            self.place_layer_tool(lid)
+        self._refresh_layers_ui()
+        n = len(self.sel_group)
+        self.message.emit("%d layers selected: Adjust / Color changes go to all of them." % n if n > 1
+                          else "One layer selected.")
+
     def _on_layer_pressed(self, lid, x, y, alt):
+        if QApplication.keyboardModifiers() & Qt.KeyboardModifier.ControlModifier:
+            self._ctrl_toggle(lid)
+            return
+        self.sel_group = set()
         self.place_layer_tool(lid)
         self._show_text_tab_if_text(lid)
         self.canvas.begin_layer_drag(x, y, alt)                 # drag starts right away: click = select, drag = move, Alt + drag = copy
@@ -3770,10 +3838,15 @@ class Card(QWidget):
 
     def _on_layer_outside(self, x, y):
         lid = self._layer_at(x, y, skip=self._place_id)
+        if lid is not None and QApplication.keyboardModifiers() & Qt.KeyboardModifier.ControlModifier:
+            self._ctrl_toggle(lid)                     # Ctrl + click: one more layer in the group
+            return
         if lid is not None:
+            self.sel_group = set()
             self.place_layer_tool(lid)                 # another picture: select that one
             self._show_text_tab_if_text(lid)
         else:
+            self.sel_group = set()
             self._end_layer_session()                  # empty place: the picture is deselected
 
     def _layer_qimage(self, l):
@@ -3878,11 +3951,18 @@ class Card(QWidget):
         layers0 = list(self.layers)
         self._checkpoint()
         pending = core.active_adjs(adjs) or core.look_edited(look)
+        grp = self._group_ids()
 
         def work(progress):
             rgb = core.render_full(base, adjs, look, sel) if pending else base
-            layers = [self._regrid(dict(l, rgb=rgb, a=alpha, pend=None), l["rgb"].size) if l["id"] == lid else l
-                      for l in layers0]
+            layers = []
+            for l in layers0:
+                if l["id"] == lid:
+                    layers.append(self._regrid(dict(l, rgb=rgb, a=alpha, pend=None), l["rgb"].size))
+                elif pending and l["id"] in grp and l.get("text") is None:
+                    layers.append(dict(l, rgb=core.render_full(l["rgb"], copy.deepcopy(adjs), look, sel), pend=None))
+                else:
+                    layers.append(l)
             v = self._build_view(st["base"], st["adjs"], core.new_look(**st["look"]), st["sel"],
                                  self._deco_from(None, None, layers, None))
             return layers, v
@@ -3893,6 +3973,7 @@ class Card(QWidget):
             self.base, self.adjs, self.look, self.sel = st["base"], copy.deepcopy(st["adjs"]), core.new_look(**st["look"]), st["sel"]
             self.shadow_src, self._shadow_done = st["shadow_src"], st["shadow"]
             self.ctx = self.alpha = self._stash = None
+            self.sel_group = set()
             self._go_move()
             self._clear_clone()
             self.colors.rebuild(self.adjs)
@@ -4000,6 +4081,8 @@ class Card(QWidget):
             lw.addItem(it)
             if l["id"] == self.sel_layer:
                 lw.setCurrentItem(it)
+            if l["id"] in self.sel_group:
+                it.setSelected(True)
         self._icon_cache = keep
         if self.sel_layer is None or self._layer(self.sel_layer) is None:
             lw.clearSelection()
@@ -4023,15 +4106,22 @@ class Card(QWidget):
             self._skip_click = False
             return
         lid = it.data(Qt.ItemDataRole.UserRole)
+        if QApplication.keyboardModifiers() & Qt.KeyboardModifier.ControlModifier:
+            ids = {x.data(Qt.ItemDataRole.UserRole) for x in self.layerList.selectedItems()}
+            self.sel_group = ids if len(ids) > 1 else set()
+            if self.sel_group and self.sel_layer is None:
+                self.sel_layer = lid
+            n = len(self.sel_group)
+            self.message.emit("%d layers selected: Adjust / Color changes go to all of them." % n if n > 1
+                              else "One layer selected.")
+            return
+        self.sel_group = set()
 
         def go():
             l = self._layer(lid)
             if l is None:
                 return
-            if l.get("text") is not None:
-                self.place_layer_tool(lid)               # a text box: move / resize it (Aa tab for the text)
-            else:
-                self.edit_layer(lid)                     # a picture layer: every tool works on it alone
+            self.place_layer_tool(lid)                   # border appears; the first edit works on this layer alone
         QTimer.singleShot(0, go)
 
     def _layer_eye_clicked(self, lid, solo):
@@ -4658,6 +4748,8 @@ class Card(QWidget):
         if not self._loaded and key != "view":
             return
         self._inline_end()
+        if key not in ("view", "transform", "move", "copy") and self._place_id is not None and self.ctx is None:
+            self._auto_layer_edit()                              # a layer is selected: the tool works on it alone
         if key not in CROP_KEYS:
             self._auto_back = False
         if self.ctx is not None and key in ("transform", "copy"):

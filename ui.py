@@ -640,6 +640,7 @@ class MainWindow(QMainWindow):
         self.btnClear.clicked.connect(self.clear_all)
         self.btnSettings = QPushButton("Settings")
         self.btnSettings.setMenu(self._build_menu())
+        l.insertWidget(l.indexOf(self.btnApplyAll) + 1, self.updater.badge)      # green 'New update available' in the empty space
         for b in (self.btnFolder, self.btnOpenDir, self.btnClear):
             l.addWidget(b)
         self.btnMore = QPushButton("\u22ef")          # small window: the less used buttons live in this menu
