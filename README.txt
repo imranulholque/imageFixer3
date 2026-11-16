@@ -268,3 +268,11 @@ NEW (layers from a selection, like Picsart)
   that layer ONLY, and the main screen shows that layer.  Click "Main picture" (bottom of the list) to work on the whole page again.
   Drag a row up / down = order.  The tick = hide / show.  Buttons: Edit, Move (move / resize / rotate on the page), Copy, Remove.
 - Inside a layer you can make a selection and press Ctrl+J again (layer in a layer).  Not for a bent (Warp) layer.
+
+NEW (any layer, eye icon, sharper scans)
+- Auto crop (A), Crop, Straighten now work INSIDE a layer too (e.g. the Front / Back of an ID card): click the layer, press A, fix the
+  corners, Enter.  When you go back to the page the layer keeps its real scale and centre (it is not stretched into the old frame).
+- Layers tab: every row has an EYE at the right (open eye = shown, slashed eye = hidden), like Photoshop.  Alt + click on the eye =
+  show only this layer (click again = show all).  The old tick box is gone.
+- Scan dialog: new "Sharpness" option (default: clean + enlarge up to 600 dpi + sharpen the brightness only).  Default scan dpi is now 600.
+  For an ID card scan at 600 dpi: this gives the best result.  Code: scanfix.py.

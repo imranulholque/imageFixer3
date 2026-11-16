@@ -10,9 +10,10 @@ import uuid
 import numpy as np
 from PIL import Image, ImageChops, ImageFilter, ImageOps
 from PySide6.QtCore import QMimeData, QObject, QPointF, QRectF, QSize, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QDrag, QIcon, QImage, QPixmap
+from PySide6.QtCore import QRect
+from PySide6.QtGui import QColor, QDrag, QIcon, QImage, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (QSplitter, QApplication, QButtonGroup, QCheckBox, QColorDialog, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu,
-                               QAbstractItemView, QPushButton, QScrollArea, QSizePolicy, QSlider, QStackedWidget, QToolButton,
+                               QAbstractItemView, QPushButton, QScrollArea, QSizePolicy, QSlider, QStackedWidget, QStyle, QStyledItemDelegate, QToolButton,
                                QVBoxLayout, QWidget)
 
 import core
@@ -665,9 +666,57 @@ def side_sync():
     return _SIDE_SYNC
 
 
+EYE_ROLE = Qt.ItemDataRole.UserRole + 1
+EYE_W = 40
+
+
+def eye_rect(row_rect):
+    """The eye button at the right end of a layer row."""
+    return QRect(row_rect.right() - EYE_W + 1, row_rect.top(), EYE_W, row_rect.height())
+
+
+class _EyeDelegate(QStyledItemDelegate):
+    """Draws the normal row, then an eye on the right: open eye = layer shown, eye with a slash = hidden (like Photoshop)."""
+
+    def paint(self, p, opt, idx):
+        super().paint(p, opt, idx)
+        shown = bool(idx.data(EYE_ROLE))
+        r = eye_rect(opt.rect)
+        c = r.center()
+        col = opt.palette.color(opt.palette.ColorRole.HighlightedText if opt.state & QStyle.StateFlag.State_Selected
+                                else opt.palette.ColorRole.Text)
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        if not shown:
+            col.setAlpha(110)
+        pen = QPen(col, 1.8)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        w, h = 11.0, 7.0
+        path = QPainterPath()
+        path.moveTo(c.x() - w, c.y())
+        path.quadTo(c.x(), c.y() - h * 2.0, c.x() + w, c.y())
+        path.quadTo(c.x(), c.y() + h * 2.0, c.x() - w, c.y())
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(path)
+        if shown:
+            p.setBrush(col)
+            p.drawEllipse(QPointF(c.x(), c.y()), 3.4, 3.4)
+        else:
+            p.drawLine(QPointF(c.x() - w, c.y() + h + 1), QPointF(c.x() + w, c.y() - h - 1))
+        p.restore()
+
+    def sizeHint(self, opt, idx):
+        sz = super().sizeHint(opt, idx)
+        sz.setWidth(sz.width() + EYE_W)
+        return sz
+
+
 class LayerList(QListWidget):
-    """The layers list: drag a row up or down to change which layer is in front (top of the list = front)."""
+    """The layers list: drag a row up or down to change which layer is in front (top of the list = front).
+    The eye at the right of a row shows / hides the layer (Alt + click = show only this layer)."""
     reordered = Signal()
+    eyeClicked = Signal(int, bool)                  # layer id, Alt held
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -676,6 +725,33 @@ class LayerList(QListWidget):
         self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.setSpacing(2)
+        self.setItemDelegate(_EyeDelegate(self))
+
+    def _eye_hit(self, e):
+        it = self.itemAt(e.position().toPoint())
+        if it is not None and eye_rect(self.visualItemRect(it)).contains(e.position().toPoint()):
+            return it
+        return None
+
+    def mousePressEvent(self, e):
+        it = self._eye_hit(e)
+        if it is not None and e.button() == Qt.MouseButton.LeftButton:
+            self.eyeClicked.emit(int(it.data(Qt.ItemDataRole.UserRole)),
+                                 bool(e.modifiers() & Qt.KeyboardModifier.AltModifier))
+            e.accept()
+            return
+        super().mousePressEvent(e)
+
+    def mouseDoubleClickEvent(self, e):
+        if self._eye_hit(e) is not None:
+            e.accept()
+            return
+        super().mouseDoubleClickEvent(e)
+
+    def mouseMoveEvent(self, e):
+        self.viewport().setCursor(Qt.CursorShape.PointingHandCursor if self._eye_hit(e) is not None
+                                  else Qt.CursorShape.ArrowCursor)
+        super().mouseMoveEvent(e)
 
     def dropEvent(self, e):
         super().dropEvent(e)
@@ -1825,7 +1901,7 @@ class Card(QWidget):
         self.btnLayerDel.clicked.connect(lambda: self.sel_layer is not None and self.delete_layer(self.sel_layer))
         self.layerList.itemClicked.connect(self._layer_list_clicked)
         self.layerList.itemDoubleClicked.connect(lambda it: QTimer.singleShot(0, lambda: self.edit_layer(it.data(Qt.ItemDataRole.UserRole))))
-        self.layerList.itemChanged.connect(self._layer_list_checked)
+        self.layerList.eyeClicked.connect(self._layer_eye_clicked)
         self.layerList.reordered.connect(self._layer_list_reordered)
         lay.addWidget(g)
         lay.addStretch(1)
@@ -2264,9 +2340,6 @@ class Card(QWidget):
         Drag a corner if it is not exact, then Enter = cut it out and make it straight and rectangular (Ctrl+Z undoes it)."""
         if not self._loaded:
             return
-        if self.ctx is not None:
-            self._warn("Auto crop works on the whole page. Click 'Back to the page' first.")
-            return
         if self._fq is not None:
             self._fq_off()
         if self._tool in CROP_KEYS or self._tool == "transform" or self._place_id is not None:
@@ -2304,8 +2377,8 @@ class Card(QWidget):
         back = self._auto_back
 
         def make(progress):
-            return core.warp_quad(base, quad) if inlayer else scanner.straighten(base, quad)
-        am = (lambda progress: core.warp_quad(alpha.convert("RGB"), quad).convert("L")) if inlayer else None
+            return scanner.straighten(base, quad)
+        am = (lambda progress: scanner.straighten(alpha.convert("RGB"), quad).convert("L")) if inlayer else None
 
         def after():
             self._clear_clone()
@@ -3623,6 +3696,33 @@ class Card(QWidget):
                 self._notify("layer", "Editing this picture alone", "all tools work on it only; click 'Back to the page' when done")
         self._job("Opening picture", work, done)
 
+    def _regrid(self, l, old_size):
+        """A layer whose pixel size changed (crop, auto crop, straighten, rotate) keeps its real scale and its centre on the
+        page; without this the new picture would be stretched into the old frame."""
+        try:
+            new_size = l["rgb"].size
+            if l.get("n", 1) != 1 or tuple(new_size) == tuple(old_size) or not self.base_size_ok():
+                return l
+            (tl, tr, bl, br) = l["grid"][:4]
+            PW, PH = self._page_size()
+            fx, fy = new_size[0] / float(old_size[0]), new_size[1] / float(old_size[1])
+            ux, uy = (tr[0] - tl[0]) * PW, (tr[1] - tl[1]) * PH        # frame axes in page pixels
+            vx, vy = (bl[0] - tl[0]) * PW, (bl[1] - tl[1]) * PH
+            cx, cy = tl[0] * PW + ux / 2 + vx / 2, tl[1] * PH + uy / 2 + vy / 2
+            ux, uy, vx, vy = ux * fx, uy * fx, vx * fy, vy * fy
+            p0 = (cx - ux / 2 - vx / 2, cy - uy / 2 - vy / 2)
+            g = [p0, (p0[0] + ux, p0[1] + uy), (p0[0] + vx, p0[1] + vy), (p0[0] + ux + vx, p0[1] + uy + vy)]
+            return dict(l, grid=[(x / PW, y / PH) for x, y in g])
+        except Exception:
+            _log("regrid layer")
+            return l
+
+    def base_size_ok(self):
+        return self._stash is not None and self._stash.get("base") is not None
+
+    def _page_size(self):
+        return self._stash["base"].size
+
     def leave_layer(self, then=None):
         if self.ctx is None:
             if then:
@@ -3636,7 +3736,8 @@ class Card(QWidget):
 
         def work(progress):
             rgb = core.render_full(base, adjs, look, sel) if pending else base
-            layers = [dict(l, rgb=rgb, a=alpha, pend=None) if l["id"] == lid else l for l in layers0]
+            layers = [self._regrid(dict(l, rgb=rgb, a=alpha, pend=None), l["rgb"].size) if l["id"] == lid else l
+                      for l in layers0]
             v = self._build_view(st["base"], st["adjs"], core.new_look(**st["look"]), st["sel"],
                                  self._deco_from(None, None, layers, None))
             return layers, v
@@ -3740,8 +3841,7 @@ class Card(QWidget):
         lw.blockSignals(True)
         lw.clear()
         keep = {}
-        flags = (Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsDragEnabled
-                 | Qt.ItemFlag.ItemIsUserCheckable)
+        flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsDragEnabled
         for l in reversed(self.layers):                          # top layer first
             icon = self._layer_icon(l)
             keep[(l["id"], id(l["rgb"]), id(l["a"]), l.get("opacity", 100))] = self._icon_cache[
@@ -3749,8 +3849,9 @@ class Card(QWidget):
             it = QListWidgetItem(icon, l["name"])
             it.setData(Qt.ItemDataRole.UserRole, l["id"])
             it.setFlags(flags)
-            it.setCheckState(Qt.CheckState.Checked if l.get("visible", True) else Qt.CheckState.Unchecked)
-            it.setToolTip(l["name"] + "\nClick = select.  Drag = change the order.  Double click = edit.")
+            it.setData(EYE_ROLE, bool(l.get("visible", True)))
+            it.setToolTip(l["name"] + "\nClick = select and work on this layer.  Eye = show / hide "
+                          "(Alt + eye = only this one).  Drag = change the order.  Double click = edit.")
             lw.addItem(it)
             if l["id"] == self.sel_layer:
                 lw.setCurrentItem(it)
@@ -3788,9 +3889,23 @@ class Card(QWidget):
                 self.edit_layer(lid)                     # a picture layer: every tool works on it alone
         QTimer.singleShot(0, go)
 
-    def _layer_list_checked(self, it):
-        self._skip_click = True
-        self.toggle_layer(it.data(Qt.ItemDataRole.UserRole), it.checkState() == Qt.CheckState.Checked)
+    def _layer_eye_clicked(self, lid, solo):
+        """The eye of a row: show / hide that layer.  Alt + click = show only this layer (click again = show all)."""
+        l = self._layer(lid)
+        if l is None:
+            return
+        if solo:
+            others = [x for x in self.layers if x["id"] != lid]
+            only_me = l.get("visible", True) and not any(x.get("visible", True) for x in others)
+            self._checkpoint()
+            self.layers = [dict(x, visible=True) if (only_me or x["id"] == lid) else dict(x, visible=False)
+                           for x in self.layers]
+            self._sync_live()
+            self._touch()
+            self._timer.start()
+        else:
+            self.toggle_layer(lid, not l.get("visible", True))
+        self._refresh_layers_ui()
 
     def _layer_list_reordered(self):
         lw = self.layerList
@@ -4312,7 +4427,7 @@ class Card(QWidget):
 
     def _on_move(self, dx, dy, copy_flag):
         if self.ctx is not None:
-            self._warn("Not inside a picture. Use 'Move / resize' on the picture in the Picture tab to place it.")
+            self._warn("Move / copy of a part is not possible inside a layer. To move the whole layer on the page use the 'Move' button in the Layers tab.")
             return
         if not self._loaded or self.sel is None:
             self._warn("Make a selection first.")
@@ -4401,7 +4516,7 @@ class Card(QWidget):
         if key not in CROP_KEYS:
             self._auto_back = False
         if self.ctx is not None and key in ("transform", "copy"):
-            self._warn("Not inside a picture. Use 'Move / resize' on the picture in the Picture tab to place it.")
+            self._warn("Move / copy of a part is not possible inside a layer. To move the whole layer on the page use the 'Move' button in the Layers tab.")
             return
         if key != "transform" and self._place_id is not None:      # a picture was not placed: it stays where it was
             self._place_id = None
@@ -4602,9 +4717,9 @@ class Card(QWidget):
 
             def make(progress):
                 # the page keeps the real proportions of the sheet; a picture layer and its transparency must stay the same size
-                return core.warp_quad(base, quad) if inlayer else scanner.straighten(base, quad)
-            if inlayer:                                       # the transparency is straightened the same way
-                alpha_make = lambda progress: core.warp_quad(alpha.convert("RGB"), quad).convert("L")
+                return scanner.straighten(base, quad)
+            if inlayer:                                       # the transparency is straightened the same way (same size)
+                alpha_make = lambda progress: scanner.straighten(alpha.convert("RGB"), quad).convert("L")
         elif self._tool in CROP_SHAPE:                        # circle / oval / rounded box
             l, t, r, b = [v / s for v in c.crop_rect_img()]
             shape = "round" if self._tool == "crop_round" else "oval"

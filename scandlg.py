@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QFormLayout, QHBox
 
 import idscan
 import jobs
+import scanfix
 
 SIZES = (("Auto (the scanner decides the paper size)", "max"), ("A4", "a4"), ("A5", "a5"), ("A3", "a3"), ("B5", "b5"),
          ("Letter", "letter"), ("Legal", "legal"))
@@ -114,6 +115,12 @@ class ScanDialog(QDialog):
         r2.addWidget(self.cmbDpi)
         r2.addWidget(self.cmbCol)
         form.addRow("Quality", r2)
+        self.cmbFix = QComboBox()
+        self.cmbFix.addItem("Sharper: clean + enlarge + sharpen (best)", scanfix.BEST)
+        self.cmbFix.addItem("Sharper: sharpen only (same size)", scanfix.SHARPEN)
+        self.cmbFix.addItem("Off: exactly as the scanner gave it", scanfix.OFF)
+        self.cmbFix.setToolTip("Makes soft scans crisper. A higher scan dpi (600 for an ID card) gives the best result.")
+        form.addRow("Sharpness", self.cmbFix)
 
         self.chkUi = QCheckBox("Show the scanner's own window (driver settings)")
         self.chkUi.setToolTip("Like Photoshop: the driver of the scanner opens its own window to choose size, preview ...")
@@ -179,7 +186,8 @@ class ScanDialog(QDialog):
         try:
             self._combo_set(self.cmbMode, "mode", "normal")
             self._combo_set(self.cmbSize, "size", "max")
-            self._combo_set(self.cmbDpi, "dpi", 300)
+            self._combo_set(self.cmbDpi, "dpi", 600)
+            self._combo_set(self.cmbFix, "fix", scanfix.BEST)
             self._combo_set(self.cmbCol, "color", "color")
             self._combo_set(self.cmbPage, "page", "A4")
             self._combo_set(self.cmbPlace, "place", "center")
@@ -190,7 +198,7 @@ class ScanDialog(QDialog):
             pass
 
     def _save_settings(self):
-        for key, cmb in (("mode", self.cmbMode), ("size", self.cmbSize), ("dpi", self.cmbDpi), ("color", self.cmbCol),
+        for key, cmb in (("mode", self.cmbMode), ("size", self.cmbSize), ("dpi", self.cmbDpi), ("fix", self.cmbFix), ("color", self.cmbCol),
                          ("page", self.cmbPage), ("place", self.cmbPlace)):
             self.st.setValue("scan/" + key, cmb.currentData())
         self.st.setValue("scan/ui", self.chkUi.isChecked())
@@ -428,8 +436,9 @@ class ScanDialog(QDialog):
     # ------------------------------------------------------------ what to do with the pictures
     def _got_pages(self, pages):
         dpi = int(self.cmbDpi.currentData())
+        fix = self.cmbFix.currentData()
         if not self._id_mode():
-            self._to_png(pages)
+            self._to_png(pages, dpi, fix)
             return
         self.lblMsg.setText("Cutting the card out ...")
         front, back = self._front, None
@@ -442,12 +451,18 @@ class ScanDialog(QDialog):
             imgs = [Image.open(p) for p in pages]
             for im in imgs:
                 im.load()
-            cards = [idscan.cut_card(im, dpi) for im in imgs]
+            cards = []
+            for im in imgs:
+                card, ok = idscan.cut_card(im, dpi)
+                card, eff = scanfix.enhance(card, dpi, fix)          # sharper card; eff = its real dpi now
+                cards.append((card, ok, eff))
             return cards
 
         def done(cards):
-            nonlocal front, back
-            found = [f for _, f in cards]
+            nonlocal front, back, dpi
+            found = [c[1] for c in cards]
+            dpi = int(round(max(c[2] for c in cards)))            # the page is made at the dpi of the (enlarged) cards
+            cards = [(c[0], c[1]) for c in cards]
             if both and len(cards) >= 2:
                 front, back = cards[0][0], cards[1][0]
             elif both:
@@ -488,13 +503,16 @@ class ScanDialog(QDialog):
             self._mode_changed()
         jobs.run_background(work, done, lambda m: self._fail(m))
 
-    def _to_png(self, pages):
+    def _to_png(self, pages, dpi=300, fix=None):
+        fix = fix or scanfix.OFF
+
         def work(progress):
             from PIL import Image
             outs = []
             for i, p in enumerate(pages):
                 im = Image.open(p)
                 im.load()
+                im, _ = scanfix.enhance(im, dpi, fix)
                 q = os.path.join(self.work, "scan_%s_%d.png" % (time.strftime("%H%M%S"), i + 1))
                 im.convert("RGB").save(q)
                 outs.append(q)
