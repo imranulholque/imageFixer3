@@ -356,6 +356,16 @@ class ScanDialog(QDialog):
             self._cancel()
         super().closeEvent(e)
 
+    def _auto_close(self, delay=900):
+        """The work is completely finished (pictures are in Image Fixer): close this window after a short moment, so the
+        message can still be read.  Never while a new scan / job is running."""
+        if self.chkClose.isChecked():
+            QTimer.singleShot(delay, self._close_if_idle)
+
+    def _close_if_idle(self):
+        if self.isVisible() and not self._busy and self._proc is None and self._p is None:
+            self.close()
+
     # ------------------------------------------------------------ finding scanners
     def refresh(self):
         if self._busy or self._procs:
