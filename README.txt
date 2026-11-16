@@ -276,3 +276,10 @@ NEW (any layer, eye icon, sharper scans)
   show only this layer (click again = show all).  The old tick box is gone.
 - Scan dialog: new "Sharpness" option (default: clean + enlarge up to 600 dpi + sharpen the brightness only).  Default scan dpi is now 600.
   For an ID card scan at 600 dpi: this gives the best result.  Code: scanfix.py.
+
+NEW (update notice)
+- When a newer build exists a small green round button (arrow down) appears on the right edge of the window, in the empty margin.
+  It stays until the program is updated.  Click it = "Update now / Later".  No text, no menu.
+- The update question pops up at EVERY start of the program (and every time the window comes back from the tray) while an update waits.
+  The update found is remembered, so it is shown even if the internet is not ready yet at start.
+- The check runs 2.5 s after start, then every 3 minutes; a failed check is tried again after 45 s.  It needs a PUBLIC repository.

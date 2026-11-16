@@ -1,15 +1,54 @@
 """Auto update, window part: background check, notification, 'Update now?' question, download progress.
 Setting 'auto_update' (Settings menu): ON = the program looks for a new build by itself, tells you, asks, then installs.
 OFF = it never looks and never shows anything about updates (only the 'Check for updates now' menu item still works)."""
+import json
 import threading
 
-from PySide6.QtCore import QObject, QTimer, Qt, Signal
-from PySide6.QtWidgets import QMessageBox, QProgressDialog
+from PySide6.QtCore import QEvent, QObject, QTimer, Qt, Signal
+from PySide6.QtWidgets import QMessageBox, QProgressDialog, QToolButton
 
 import updater
 
-CHECK_EVERY_MS = 5 * 60 * 1000               # while the program stays open (GitHub allows 60 asks / hour, this is 12)
-FIRST_CHECK_MS = 10 * 1000                   # a few seconds after start, so start-up stays fast
+CHECK_EVERY_MS = 3 * 60 * 1000               # while the program stays open (GitHub allows 60 asks / hour, this is 20)
+RETRY_MS = 45 * 1000                         # a check that failed (no internet yet at start-up) is tried again soon
+FIRST_CHECK_MS = 2500                   # a few seconds after start, so start-up stays fast
+
+
+class UpdateBadge(QToolButton):
+    """A small round button on the right edge of the window, in the empty margin (no text, no menu, no tool lives there).
+    It is visible ONLY while a newer version exists and stays until the program is updated.  Click = the update question."""
+    SIZE = 26
+
+    def __init__(self, win):
+        super().__init__(win)
+        self.win = win
+        self.setText("\u2193")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFixedSize(self.SIZE, self.SIZE)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setStyleSheet("QToolButton{background:#1e9e5a;color:white;border:2px solid white;border-radius:%dpx;"
+                           "font-size:14px;font-weight:bold;}QToolButton:hover{background:#25b869;}" % (self.SIZE // 2))
+        self.hide()
+        win.installEventFilter(self)
+
+    def place(self):
+        w = self.win
+        self.move(w.width() - self.SIZE - 2, max(40, w.height() // 2 - self.SIZE // 2))
+        self.raise_()
+
+    def eventFilter(self, obj, ev):
+        if obj is self.win and ev.type() in (QEvent.Type.Resize, QEvent.Type.Show):
+            self.place()
+        return False
+
+    def set_update(self, info):
+        if info is None:
+            self.hide()
+            return
+        self.setToolTip("A new version (build %d) is ready - click to install" % info["build"])
+        self.place()
+        self.show()
+        self.raise_()
 
 
 class UpdateManager(QObject):
@@ -34,6 +73,47 @@ class UpdateManager(QObject):
         self.progress.connect(self._on_progress)
         self.staged.connect(self._on_staged)
         self.failed.connect(self._on_failed)
+        self.badge = UpdateBadge(win)
+        self.badge.clicked.connect(lambda: self.info and self.ask(self.info))
+        self.available_changed.connect(self.badge.set_update)
+        self._launch_popup = True            # the question is shown once at EVERY start while an update is waiting
+        self._load_pending()
+
+    def _load_pending(self):
+        """An update that was found earlier (even if this start has no internet yet) is remembered until it is installed."""
+        try:
+            raw = self.win.settings.value("pending_update", "", type=str)
+            info = json.loads(raw) if raw else None
+            if info and int(info.get("build", 0)) > updater.BUILD and self.enabled():
+                self.info = info
+            else:
+                self.win.settings.setValue("pending_update", "")
+        except Exception:
+            self.info = None
+
+    def _save_pending(self, info):
+        try:
+            self.win.settings.setValue("pending_update", json.dumps(info) if info else "")
+        except Exception:
+            pass
+
+    def on_shown(self):
+        """The window came back from the tray: while an update is waiting, ask again."""
+        if self.info is None or not self.enabled() or self._dlg is not None:
+            return
+        if self._launch_popup:
+            QTimer.singleShot(800, self._launch_ask)
+        else:
+            QTimer.singleShot(800, lambda: self.info is not None and self.ask(self.info))
+
+    def _launch_ask(self):
+        """At every start: while an update is waiting, ask (once per start)."""
+        if not self._launch_popup or self.info is None or not self.enabled():
+            return
+        if self.win.isVisible() and not self.win.isMinimized():
+            self._launch_popup = False
+            self._asked.add(self.info["build"])
+            self.ask(self.info)
 
     # ---------------------------------------------------------------- setting
     def enabled(self):
@@ -53,6 +133,9 @@ class UpdateManager(QObject):
         if not self.enabled() or not updater.can_self_update():
             return
         self.timer.start(CHECK_EVERY_MS)
+        if self.info is not None:                          # known from the last run: show the badge and ask at once
+            self.available_changed.emit(self.info)
+            QTimer.singleShot(1500, self._launch_ask)
         QTimer.singleShot(FIRST_CHECK_MS, lambda: self.check(False))
 
     # --------------------------------------------------------------- checking
@@ -71,10 +154,17 @@ class UpdateManager(QObject):
     def _on_checked(self, info, err, manual):
         self._busy = False
         if err:
+            updater.log("check failed: " + err)
             if manual:
                 QMessageBox.warning(self.win, "Image Fixer update", err)
+            else:
+                QTimer.singleShot(RETRY_MS, lambda: self.check(False))      # no internet yet: try again soon
             return
         if info is None:
+            self._save_pending(None)
+            if self.info is not None:
+                self.info = None
+                self.available_changed.emit(None)
             if manual:
                 QMessageBox.information(self.win, "Image Fixer update",
                                         "You have the newest version (%s)." % updater.version_text())
@@ -82,9 +172,12 @@ class UpdateManager(QObject):
         if not manual and not self.enabled():
             return                                   # switched off while the check was running: say nothing
         self.info = info
+        self._save_pending(info)
         self.available_changed.emit(info)
         if manual:
             self.ask(info)
+        elif self._launch_popup:
+            self._launch_ask()                       # first answer of this start: the question, every start
         elif info["build"] not in self._asked:
             self._asked.add(info["build"])
             self._notify(info)

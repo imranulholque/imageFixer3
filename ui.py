@@ -1213,11 +1213,14 @@ class MainWindow(QMainWindow):
 
     def show_front(self):
         self._wake()
+        was_hidden = (not self.isVisible()) or self.isMinimized()
         if self.isMinimized():
             self.showNormal()
         self.show()
         self.raise_()
         self.activateWindow()
+        if was_hidden and hasattr(self, "updater"):
+            self.updater.on_shown()                      # an update is waiting: the question comes again
 
     def closeEvent(self, e):
         if self.quitting:
