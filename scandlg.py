@@ -604,11 +604,13 @@ class ScanDialog(QDialog):
             elif both:
                 front = cards[0][0]
                 self._front = front
+                self._prog_hide(600)        # the work is finished: stop the bar / timer (it stayed at 99% and kept counting)
                 self.lblMsg.setText("The scanner gave only 1 page. Scan the BACK now.")
                 self._update_step()
                 return
             elif not want_back:
                 self._front = cards[0][0]
+                self._prog_hide(600)        # the work is finished: stop the bar / timer (it stayed at 99% and kept counting)
                 self.lblMsg.setText("Front scanned%s." % ("" if found[0] else " (the card was not found, the whole scan is used)"))
                 self._update_step()
                 self._mode_changed()
@@ -629,7 +631,7 @@ class ScanDialog(QDialog):
             progress(0.9, "putting the page together")
             pg, items = idscan.compose_page(front, back, dpi, page, place, rounded=all_found)
             path = os.path.join(self.work, "idcard_%s.png" % time.strftime("%H%M%S"))
-            pg.save(path)
+            pg.save(path, compress_level=1)
             return path, items
 
         def done(r):
@@ -655,7 +657,7 @@ class ScanDialog(QDialog):
                 im, _ = scanfix.enhance(im, dpi, fix, lambda f, t="", i=i: progress((i + f) / len(pages),
                                                                                     "page %d / %d" % (i + 1, len(pages))))
                 q = os.path.join(self.work, "scan_%s_%d.png" % (time.strftime("%H%M%S"), i + 1))
-                im.convert("RGB").save(q)
+                im.convert("RGB").save(q, compress_level=1)   # temporary file: fast saving matters more than size
                 outs.append(q)
             return outs
 
