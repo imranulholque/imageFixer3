@@ -5,11 +5,11 @@ import time
 import numpy as np
 from PySide6.QtCore import QPointF, QRect, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor, QImage, QPainter, QPainterPath, QPen, QPolygonF, QTransform
-from PySide6.QtWidgets import QApplication, QWidget
+from PySide6.QtWidgets import QAbstractSpinBox, QApplication, QComboBox, QLineEdit, QPlainTextEdit, QTextEdit, QWidget
 
 import core
 from feedback import Effects, rotate_cursor
-from theme import dropper_cursor, move_selection_cursor
+from theme import copy_cursor, dropper_cursor, move_selection_cursor
 
 
 def QApplication_shift():
@@ -118,6 +118,7 @@ class ImageCanvas(QWidget):
         self._selmove = None                  # dragging the selection outline: {'start': QPointF, 'd': (dx, dy)}
         self.sel_mode_name = "add"            # set by the card: the outline can be dragged in the modes 'new' and 'add'
         self._move_sel_cursor = move_selection_cursor()
+        self._copy_cursor = copy_cursor()           # Alt held: arrow with a green '+'
         self._ants_timer = QTimer(self)
         self._ants_timer.setInterval(200)
         self._ants_timer.timeout.connect(self._tick)
@@ -1143,7 +1144,7 @@ class ImageCanvas(QWidget):
             return C.ArrowCursor
         if hit == "move":
             alt = bool(QApplication.keyboardModifiers() & Qt.KeyboardModifier.AltModifier)
-            return C.DragCopyCursor if (alt or self._tf.get("copy")) else C.SizeAllCursor
+            return self._copy_cursor if (alt or self._tf.get("copy")) else C.SizeAllCursor
         return {"c0": C.SizeFDiagCursor, "c2": C.SizeFDiagCursor, "c1": C.SizeBDiagCursor, "c3": C.SizeBDiagCursor,
                 "e0": C.SizeVerCursor, "e2": C.SizeVerCursor, "e1": C.SizeHorCursor,
                 "e3": C.SizeHorCursor}.get(hit, C.PointingHandCursor)
@@ -1753,6 +1754,16 @@ class ImageCanvas(QWidget):
         self._snap_a = None
         self._update_cursor(e.position())
 
+    def enterEvent(self, e):
+        """The keys (Alt = copy cursor, Shift = straight) only reach the picture area when it has the keyboard:
+        take it when the mouse comes in, unless the person is typing in a box."""
+        fw = QApplication.focusWidget()
+        typing = isinstance(fw, (QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox, QComboBox)) and fw is not self
+        if not typing and self._img is not None:
+            self.setFocus()
+        self._update_cursor(self.mapFromGlobal(self.cursor().pos()))
+        super().enterEvent(e)
+
     def leaveEvent(self, e):
         self._hover = None
         self.update()
@@ -1772,7 +1783,7 @@ class ImageCanvas(QWidget):
         elif self.mode == self.MOVESEL:
             copy = self.copy_mode or bool(QApplication.keyboardModifiers() & Qt.KeyboardModifier.AltModifier) \
                 or (self._float_start is not None and bool(self._float_start[1]))
-            self.setCursor(C.DragCopyCursor if copy else C.SizeAllCursor)        # arrow with a '+': this will be a copy
+            self.setCursor(self._copy_cursor if copy else C.SizeAllCursor)        # arrow with a green '+': this will be a copy
         elif self.mode == self.TRANSFORM:
             self.setCursor(self._tf_cursor(pos))
         elif self.mode == self.CROP:

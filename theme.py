@@ -87,6 +87,27 @@ def move_selection_cursor():
     return QCursor(pm, 2, 2)
 
 
+def copy_cursor():
+    """Alt is held: an arrow with a green round '+' badge, so it is clear that the drag will make a COPY (hot spot = arrow tip)."""
+    pm = QPixmap(32, 32)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    arrow = QPolygonF([QPointF(2, 2), QPointF(2, 20), QPointF(7, 15.5), QPointF(11, 24), QPointF(14.5, 22.5),
+                       QPointF(10.5, 14.5), QPointF(17, 14)])
+    p.setPen(QPen(QColor("#000000"), 1.6))
+    p.setBrush(QBrush(QColor("#ffffff")))
+    p.drawPolygon(arrow)
+    p.setPen(QPen(QColor("#ffffff"), 1.6))
+    p.setBrush(QBrush(QColor("#16a34a")))
+    p.drawEllipse(QPointF(24, 22), 7.0, 7.0)
+    p.setPen(QPen(QColor("#ffffff"), 2.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+    p.drawLine(QPointF(20.5, 22), QPointF(27.5, 22))
+    p.drawLine(QPointF(24, 18.5), QPointF(24, 25.5))
+    p.end()
+    return QCursor(pm, 2, 2)
+
+
 QSS = """
 * { font-family: "Segoe UI"; font-size: 13px; color: #e8eaed; }
 QMainWindow, QDialog, QMessageBox { background: #0e1116; }

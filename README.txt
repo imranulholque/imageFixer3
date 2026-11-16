@@ -12,7 +12,7 @@ Clean many text pictures (WhatsApp photos, scans) and print them. One big card p
                 (the stamp colour is learned from the selected pixels, the writing colour from the writing around the stamp), so the letters
                 under the stamp are rebuilt and the faint halo of the stamp goes too. Writing with the SAME colour as the stamp cannot be separated.
  - Delete key:  deletes the selection (filled from the paper around it).   Fill color (Color tab) fills it with a color.
- - Move v:      drag = move, Alt + drag = copy, Ctrl+T = Transform (resize / rotate, Enter = apply; Alt + drag inside Transform = place a COPY, the original stays). Hold Shift while dragging = dead straight (sideways, up / down or diagonal).
+ - Move v:      drag = move, Alt + drag = copy, Ctrl+T = Transform the selected part (resize / rotate, Enter = apply; Alt + drag inside Transform = place a COPY, the original stays; Ctrl+T alone never makes a layer). Ctrl+J = the selected part (or the part you are transforming) becomes a separate layer on the page: move / resize / rotate / adjust it freely, the main picture is never changed. Double click a layer = open it alone. Holding Alt shows an arrow with a green + (= copy). Hold Shift while dragging = dead straight (sideways, up / down or diagonal).
  - Color Brush (P): paints with the fill color (swatch in the options bar / Color tab). Select something first = the color goes ONLY
                 inside the selection; no selection = paint anywhere on the page. Size, Opacity, Softness. One stroke = one Ctrl+Z step.
  - Eyedropper:  click a color -> slider (fade / stronger) and "Change to..." (recolor, shading stays). Respects the selection.

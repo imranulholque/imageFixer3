@@ -122,7 +122,7 @@ HINTS = {
              "Shift+click = add a color,  Alt+click = take a color out. ",
     "move": "Drag inside the selection to move it (old place is filled from around).  Alt + drag = copy.",
     "copy": "Drag the selection: a copy is placed there, the original stays.",
-    "transform": "Scale / Rotate, Skew, Distort, Perspective, Warp (buttons).  Drag inside = move (Alt + drag = place a copy, the original stays), round handle = rotate.  Keys: [ ] rotate 1°, Ctrl+[ ] 15°, arrows move.  "
+    "transform": "Scale / Rotate, Skew, Distort, Perspective, Warp (buttons).  Drag inside = move (Alt + drag = place a copy, the original stays), round handle = rotate.  Ctrl+J = make it a layer.  Keys: [ ] rotate 1°, Ctrl+[ ] 15°, arrows move.  "
                  "Enter = apply,  Esc = cancel.",
     "crop": "Drag the box or its handles, then Apply (Enter).",
     "persp": "Drag the 4 corner points onto the 4 corners of the page, then Apply (Enter).",
@@ -3499,13 +3499,17 @@ class Card(QWidget):
             self._end_layer_session()
         self.leave_layer(done)
 
-    def layer_from_selection(self, cut=False, place=False):
+    def layer_from_selection(self, cut=False, place=True):
         """Ctrl+J: the selected area becomes a layer of its own (Ctrl+Shift+J = cut it out of the page as well).
         Nothing selected = a copy of the selected layer.  The new layer opens at once: every tool works on it alone."""
         if not self._loaded:
             return
         if self._tool == "transform" and self._place_id is not None:
             self._end_layer_session()
+        tf_pts = None
+        if self._tool == "transform" and self._place_id is None and self.ctx is None and self.canvas.in_transform():
+            tf_pts = self.canvas.transform_params()          # Ctrl+T was running: the layer gets the transformed shape,
+            self._go_move()                                  # the main picture stays exactly as it was (nothing is applied to it)
         if self.sel is None:
             if self.sel_layer is not None and self._layer(self.sel_layer) is not None and not cut:
                 self.duplicate_layer(self.sel_layer)
@@ -3557,11 +3561,16 @@ class Card(QWidget):
                 grid = [pt(x0 / W, y0 / H), pt(x1 / W, y0 / H), pt(x0 / W, y1 / H), pt(x1 / W, y1 / H)]
             else:
                 grid = [(x0 / W, y0 / H), (x1 / W, y0 / H), (x0 / W, y1 / H), (x1 / W, y1 / H)]
+            ln = 1
+            if tf_pts is not None and not inlayer:           # moved / resized / rotated with Ctrl+T before Ctrl+J
+                PH, PW = self.prev.shape[:2]
+                grid = [(x / PW, y / PH) for x, y in tf_pts[0]]
+                ln = tf_pts[1]
             self._layer_seq += 1
             nums = [int(l["name"][6:]) for l in self.layers if l["name"].startswith("Layer ") and l["name"][6:].isdigit()]
             bg = dict(self.BG_DEFAULT, remove=False, opacity=100)
             layer = {"id": self._layer_seq, "name": "Layer %d" % (max(nums, default=0) + 1),
-                     "rgb": rgb, "a": a, "src": rgb, "sa": a, "bg": bg, "grid": grid, "n": 1,
+                     "rgb": rgb, "a": a, "src": rgb, "sa": a, "bg": bg, "grid": grid, "n": ln,
                      "opacity": 100, "visible": True}
             lid = layer["id"]
             self._checkpoint("Layer")
@@ -4972,10 +4981,10 @@ class Card(QWidget):
         if px is None:
             self._warn("Select something first, then press Ctrl+T.")
             return
-        if self.ctx is None:                                     # on the page: the selected part becomes a layer
-            self.layer_from_selection(cut=True, place=True)
+        if self.ctx is not None:
+            self._warn("Move / copy of a part is not possible inside a layer. To move the whole layer on the page use the 'Move' button in the Layers tab.")
             return
-        self._set_tool("transform")
+        self._set_tool("transform")                              # Ctrl+T only transforms; Ctrl+J afterwards makes it a layer
         self.canvas.start_transform(*px)
         self.tfBtns["free"].setChecked(True)
 
