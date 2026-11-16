@@ -30,6 +30,9 @@ jobs:
       - name: Undo-on-disk test
         continue-on-error: true
         run: python test_spill.py
+      - name: ID card cut test
+        continue-on-error: true
+        run: python test_idscan.py
       # Opens the real window invisibly and clicks through the main features.
       # If something is wrong the log shows exactly where; the exe is still built.
       - name: Self test
@@ -52,6 +55,26 @@ jobs:
               d.ellipse((84, 86, 108, 110), fill=(255, 255, 255, 255))
               im.save("icon.ico", sizes=[(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
       - run: pyinstaller --noconsole --onedir --name ImageFixer --icon icon.ico --collect-all pillow_heif --collect-all pypdfium2 --hidden-import buildinfo --hidden-import croplearn --exclude-module tkinter app.py
+      # Scanner helpers: a 64-bit and a 32-bit copy (many office scanners, e.g. Toshiba e-Studio, only have a 32-bit TWAIN driver).
+      - name: Build 64-bit scan helper
+        run: |
+          pip install pytwain pywin32
+          pyinstaller --noconsole --onedir --name ScanHelper64 --hidden-import twain --collect-submodules twain --hidden-import win32com.client --hidden-import win32timezone scanhelper.py
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: x86
+      - name: Build 32-bit scan helper
+        run: |
+          python -m pip install pyinstaller pytwain pywin32
+          python -m PyInstaller --noconsole --onedir --name ScanHelper32 --hidden-import twain --collect-submodules twain --hidden-import win32com.client --hidden-import win32timezone scanhelper.py
+      - name: Put the scan helpers next to the program
+        shell: python
+        run: |
+          import os, shutil
+          os.makedirs("dist/ImageFixer/scanhelpers", exist_ok=True)
+          for n in ("ScanHelper64", "ScanHelper32"):
+              shutil.copytree("dist/" + n, "dist/ImageFixer/scanhelpers/" + n)
       - uses: actions/upload-artifact@v4
         with:
           name: ImageFixer
