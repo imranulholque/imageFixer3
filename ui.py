@@ -522,6 +522,10 @@ class MainWindow(QMainWindow):
         self.items = {}
         self._sync = False
         self._hibernating = False
+        self._pre_timer = QTimer(self)                       # a little after the last edit: the print file is made in the background
+        self._pre_timer.setSingleShot(True)
+        self._pre_timer.setInterval(4000)
+        self._pre_timer.timeout.connect(self._pre_export)
         self.runner = JobRunner(self)
         self.runner.changed.connect(self._job_changed)
         self.phone = None
@@ -1512,7 +1516,22 @@ class MainWindow(QMainWindow):
         if n == 0:
             self.stack.setCurrentIndex(0)
 
+    def _pre_export(self):
+        """Print program chosen + the picture was edited and then left alone: its file is made now (background thread), so
+        Ctrl+P only has to start the program."""
+        try:
+            if self._hibernating or self.quitting or self.runner.busy:
+                return
+            if not self.settings.value("print_exe", "", type=str):
+                return
+            c = self.carousel.current()
+            if c is not None and c._loaded and not c._dead and c.is_edited() and c.export_ready() is None:
+                c.prepare_export()
+        except Exception:
+            pass
+
     def _card_edited(self, c):
+        self._pre_timer.start()
         it = self.items.get(c.uid)
         if it is not None:
             it.setText(self._label(c))
@@ -1661,6 +1680,7 @@ class MainWindow(QMainWindow):
         if not os.path.isfile(exe):
             self.say("The print program was not found. Choose it again in Settings > Print program.")
             return
+        self.say("Opening in %s ..." % (extprint.program_name(exe) or "the print program"))
         made, todo = {}, []
         for c in cards:
             p = c.export_ready()                             # untouched = its own file; edited = the file made before
@@ -1679,7 +1699,7 @@ class MainWindow(QMainWindow):
             name = extprint.program_name(exe) or exe
             self.say("Opened %d picture(s) in %s." % (len([f for f in files if f]), name))
             if self.settings.value("print_sleep", True, type=bool):
-                QTimer.singleShot(900, self.hibernate)
+                QTimer.singleShot(4000, self.hibernate)      # not at once: the print program is starting and needs the disk / CPU
 
         if not todo:
             finish()
@@ -1688,7 +1708,7 @@ class MainWindow(QMainWindow):
         def work(progress):
             for i, (c, src, path, ver) in enumerate(todo):
                 progress(i / len(todo), "%d / %d" % (i + 1, len(todo)))
-                core.save_image(src(), path, src=c.path)
+                core.save_image(src(), path, src=c.path, fast=True)
             return True
 
         def done(_):
@@ -1714,16 +1734,25 @@ class MainWindow(QMainWindow):
             self.tray.setToolTip("Image Fixer is sleeping (your work is kept). Click to open it.")
         else:
             self.showMinimized()
-        for c in self.carousel.cards:
-            c.hibernate()
+        cards = list(self.carousel.cards)
+
+        def step(i=0):                                       # one picture at a time: no burst of disk writes that freezes the PC
+            if not self._hibernating or i >= len(cards):
+                return
+            try:
+                cards[i].hibernate()
+            except Exception:
+                pass
+            QTimer.singleShot(150, lambda: step(i + 1))
+        QTimer.singleShot(1500, step)
         try:
             from PySide6.QtGui import QPixmapCache
             QPixmapCache.clear()
         except Exception:
             pass
         extprint.economy_mode(True)
-        extprint.trim_memory()
-        QTimer.singleShot(5000, lambda: extprint.trim_memory() if self._hibernating else None)
+        # giving memory back makes Windows write it to the disk: done late and only once, when the print program is up
+        QTimer.singleShot(15000, lambda: extprint.trim_memory() if self._hibernating else None)
 
     def _wake(self):
         if not self._hibernating:
@@ -1812,7 +1841,7 @@ class MainWindow(QMainWindow):
                 progress(i / len(entries), "%d / %d" % (i + 1, len(entries)))
                 if p is None:
                     p = export_path(stem, ext)
-                    core.save_image(src(), p, src=c.path)
+                    core.save_image(src(), p, src=c.path, fast=True)
                 out.append(p)
             qimg = QImage(out[0]) if len(out) == 1 else None
             return out, qimg

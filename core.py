@@ -1659,8 +1659,10 @@ def source_meta(path):
     return meta
 
 
-def save_image(img, path, src=None):
+def save_image(img, path, src=None, fast=False):
     """src = path of the original file (optional): its dpi and colour profile are written into the new file.
+    fast = a temporary file for printing / copying / dragging: PNG is packed lightly (several times faster to write,
+    the picture is exactly the same, the file is only bigger).
     EXIF is not copied on purpose: the picture is already turned upright, a copied orientation tag would turn it twice."""
     e = os.path.splitext(path)[1].lower()
     meta = source_meta(src) if src and os.path.isfile(src) else {}
@@ -1678,7 +1680,7 @@ def save_image(img, path, src=None):
     elif e == ".pdf":
         save_pdf([img], path)
     else:
-        img.save(path, "PNG", **kw)
+        img.save(path, "PNG", compress_level=1 if fast else 6, **kw)
 
 
 # ------------------------------------------------------------------- selection

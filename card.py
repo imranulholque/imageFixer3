@@ -5104,7 +5104,7 @@ class Card(QWidget):
 
         def work(progress):
             path = export_path(stem, ext)
-            core.save_image(core.render_full(*args), path, src=src_path)
+            core.save_image(core.render_full(*args), path, src=src_path, fast=True)
             return path
 
         def done(path):
@@ -5142,7 +5142,7 @@ class Card(QWidget):
             return ready
         stem, ext = self.out_name()
         path = export_path(stem, ext)
-        core.save_image(self.result_image(), path, src=self.path)
+        core.save_image(self.result_image(), path, src=self.path, fast=True)
         self.set_export(self._ver, path)
         return path
 
