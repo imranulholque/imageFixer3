@@ -730,7 +730,12 @@ function rankCands(cands,W,H){ // -> cands sorted best first
   const touch=qs[i].reduce((a,p)=>a+((p.x<mg||p.y<mg||p.x>w-mg||p.y>h-mg)?1:0),0)/4,f=[c.score/smax,tot/Math.max(n,1e-6),touch];
   c.rank=f.reduce((a,v,t)=>a+Wt[t]*(v-Mu[t])/Sd[t],0);});
  return cands.slice().sort((a,b)=>b.rank-a.rank);}
-function coarseQuad(d,w,h){const c=coarseCands(d,w,h);if(!c.length)return null;try{return rankCands(c,w,h)[0];}catch(e){}c.sort((a,b)=>b.score-a.score);return c[0];}
+let PRIOR=null;   // live camera: the outline that is locked right now (4 points, 0..1). Set only for one live look.
+function coarseQuad(d,w,h){const c=coarseCands(d,w,h);if(!c.length)return null;
+ if(PRIOR&&PRIOR.length===4){   // tracking: the candidate nearest to the locked page wins, so a header / photo inside the page can not steal the lock
+  let bi=-1,bd=1e9;for(let i=0;i<c.length;i++){let t=0;for(let k=0;k<4;k++)t+=Math.hypot(c[i].q[k].x/w-PRIOR[k].x,c[i].q[k].y/h-PRIOR[k].y);t/=4;if(t<bd){bd=t;bi=i;}}
+  if(bi>=0&&bd<0.09)return c[bi];}
+ try{return rankCands(c,w,h)[0];}catch(e){}c.sort((a,b)=>b.score-a.score);return c[0];}
 
 // straight-edge refinement: every side of the outline is moved onto the real edge in the picture (many samples + a robust line fit),
 // the corners are the meeting points of the 4 fitted lines -> straight sides, exact corners, no wobble.
@@ -853,7 +858,7 @@ let WARP=null;
 const toBm=c=>IS_W?createImageBitmap(c):Promise.resolve(c);
 const LOOKS=['orig','clean','gray','bw'];
 const IFE={
- async live(m){const r=detectLocal(m.bmp,true);if(IS_W&&m.bmp.close)m.bmp.close();return {quad:r.quad,found:r.found};},
+ async live(m){let r;PRIOR=m.prior||null;try{r=detectLocal(m.bmp,true);}finally{PRIOR=null;}if(IS_W&&m.bmp.close)m.bmp.close();return {quad:r.quad,found:r.found};},
  async find(m){const r=detectLocal(m.bmp);if(IS_W&&m.bmp.close)m.bmp.close();return {quad:r.quad,found:r.found};},
  async cut(m){ // cut the page out of the photo, keep it here, give back the chosen look + 4 small previews
   WARP=null;const w=warpLocal(m.bmp,m.quad,m.maxSide);WARP=w;const prevs={};
@@ -1316,7 +1321,7 @@ $('rUse').onclick=()=>{
 
 // ---------- live camera (DocScanner look): the whole camera picture is shown, the page outline glides over it, plain instructions, tap = focus
 const LIVE=()=>!!(window.isSecureContext&&navigator.mediaDevices&&navigator.mediaDevices.getUserMedia);
-let camS=null,camT=null,camIC=null,camTimer=0,camQ=null,camMiss=0,camStable=0,camBusy=false,camTap=null,camTorchOn=false,camSay='',camVib=false,camGrab=null,camGood=false,camLastLight=0,camLightN=0,camRaf=0,camFlashT=-1e9,camShown=new Float32Array(9);
+let camS=null,camT=null,camIC=null,camTimer=0,camQ=null,camMiss=0,camStable=0,camBusy=false,camTap=null,camTorchOn=false,camSay='',camVib=false,camGrab=null,camGood=false,camLastLight=0,camLightN=0,camRaf=0,camFlashT=-1e9,camShown=new Float32Array(9),camLock=false,camAlt=0,camSeenT=0,camFocQ=null,camFocT=0;
 if(!LIVE())$('liveHint').innerHTML='The live paper outline needs a secure link: use the <b>Internet</b> link of the computer, or on Android Chrome open <b>chrome://flags/#unsafely-treat-insecure-origin-as-secure</b>, add <b>'+location.origin+'</b>, enable it and restart Chrome. Until then the phone\'s own camera app opens.';
 let camLoop=0;
 const TIPS=['Put the paper on a darker flat table so all 4 corners show clearly','Hold the phone straight above the paper, not tilted. Less tilt = sharper text','Use even light, daylight is good. Keep your own and the phone\'s shadow off the paper','On glossy paper, shift the phone a little if glare shows. Shoot without flash; use it only when it is really dark','Tap the paper once to focus, then hold still and press the button. A green ring means it is good','Keep the whole paper in the frame, with a small gap all around'];
@@ -1324,12 +1329,12 @@ $('tipsL').innerHTML=TIPS.map((t,i)=>'<div class="ti"><i>'+(i+1)+'</i><span>'+t+
 function tipsShow(on){$('tips').classList.toggle('on',on);if(!on){try{localStorage.setItem('camtips','1');}catch(e){}}}
 $('camTipB').onclick=()=>tipsShow(true);$('tipsOk').onclick=()=>tipsShow(false);
 function stopCam(){clearTimeout(camTimer);camTimer=0;camLoop++;cancelAnimationFrame(camRaf);camRaf=0;if(camS){try{camS.getTracks().forEach(t=>t.stop());}catch(e){}}
- camS=camT=camIC=null;camQ=null;camStable=0;camBusy=false;camTorchOn=false;const v=$('camV');if(v){try{v.srcObject=null;}catch(e){}}}
+ camS=camT=camIC=null;camQ=null;camStable=0;camBusy=false;camTorchOn=false;camLock=false;camAlt=0;camSeenT=0;camFocQ=null;const v=$('camV');if(v){try{v.srcObject=null;}catch(e){}}}
 async function openLive(){
  let st;
  try{st=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:window.ImageCapture?1920:4096},height:{ideal:window.ImageCapture?1080:3072},frameRate:{ideal:24,max:30}},audio:false});}
  catch(e){toast('The camera is blocked here. Opening the phone\'s camera app.',true);nativeCam();return;}
- show('cam');camS=st;camT=st.getVideoTracks()[0];camQ=null;camMiss=0;camStable=0;camBusy=false;camTap=null;camTorchOn=false;camVib=false;camGood=false;camLastLight=0;camLightN=0;camShown.fill(0);camSay='';
+ show('cam');camS=st;camT=st.getVideoTracks()[0];camQ=null;camMiss=0;camStable=0;camBusy=false;camTap=null;camTorchOn=false;camVib=false;camGood=false;camLock=false;camAlt=0;camSeenT=0;camFocQ=null;camLastLight=0;camLightN=0;camShown.fill(0);camSay='';
  const v=$('camV');v.srcObject=st;try{await v.play();}catch(e){}
  for(let i=0;i<40&&!v.videoWidth;i++)await new Promise(r=>setTimeout(r,50));
  if(!v.videoWidth||camS!==st){stopCam();toast('Could not start the camera.',true);nativeCam();return;}
@@ -1351,6 +1356,11 @@ function camSet(kind,txt,sub){const m=$('camMsg'),key=kind+'|'+txt+'|'+(sub||'')
 async function camFocusAt(nx,ny){if(!camT)return;let caps={};try{caps=camT.getCapabilities();}catch(e){}
  const modes=caps.focusMode||[],mode=modes.includes('continuous')?'continuous':modes.includes('single-shot')?'single-shot':null;
  try{await camT.applyConstraints({advanced:[mode?{focusMode:mode,pointsOfInterest:[{x:nx,y:ny}]}:{pointsOfInterest:[{x:nx,y:ny}]}]});}catch(e){}}
+function camFocusLock(first){   // once the page is locked, the focus is locked on the middle of the page; it follows only when the page really moves
+ if(!camT||!camQ)return;const cx=camQ.reduce((a,p)=>a+p.x,0)/4,cy=camQ.reduce((a,p)=>a+p.y,0)/4,now=performance.now();
+ if(!first&&camFocQ&&(Math.hypot(cx-camFocQ.x,cy-camFocQ.y)<0.06||now-camFocT<1500))return;
+ camFocQ={x:cx,y:cy};camFocT=now;camFocusAt(cx,cy);
+ if(first){const g=camGeo(),o=$('camO');camTap={x:(g.ox+cx*g.dw)/o.width,y:(g.oy+cy*g.dh)/o.height,t:Date.now()};if(!camVib){camVib=true;buzz();}}}
 $('camO').onpointerdown=e=>{const o=$('camO'),r=o.getBoundingClientRect(),k=o.width/r.width,px=(e.clientX-r.left)*k,py=(e.clientY-r.top)*k,g=camGeo();
  const vx=Math.min(1,Math.max(0,(px-g.ox)/g.dw)),vy=Math.min(1,Math.max(0,(py-g.oy)/g.dh));
  camTap={x:px/o.width,y:py/o.height,t:Date.now()};camFocusAt(vx,vy);buzz();};
@@ -1366,7 +1376,7 @@ async function takeFull(){ // the live picture is only Full HD (light); the save
  if(st){try{return await camIC.takePhoto(st);}catch(e){}}
  return camIC.takePhoto();}
 $('camShot').onclick=async()=>{if(camBusy||!camS)return;camBusy=true;buzz();clearTimeout(camTimer);camFlashT=performance.now();
- let blob=null;const v=$('camV'),hint=camQ?camQ.map(p=>({x:p.x,y:p.y})):null,asp=v.videoWidth/v.videoHeight;
+ let blob=null;const v=$('camV'),hint=(camQ&&performance.now()-camSeenT<800)?camQ.map(p=>({x:p.x,y:p.y})):null,asp=v.videoWidth/v.videoHeight;
  if(camIC){try{blob=await Promise.race([takeFull(),new Promise((_,no)=>setTimeout(no,7000))]);}catch(e){blob=null;}}   // the camera's own still photo (sharper, focused), about 12 MP at most: enough for text, light for the phone
  if(!blob){try{const c=document.createElement('canvas');c.width=v.videoWidth;c.height=v.videoHeight;c.getContext('2d').drawImage(v,0,0);blob=await toBlob(c,0.92);}catch(e){}}
  if(!blob){camBusy=false;toast('Could not take the photo. Try again.',true);camTick();return;}
@@ -1378,11 +1388,28 @@ async function camTick(){clearTimeout(camTimer);if(!camS||camBusy)return;
    const m=320,s=Math.min(1,m/Math.max(v.videoWidth,v.videoHeight)),gw=Math.max(8,Math.round(v.videoWidth*s)),gh=Math.max(8,Math.round(v.videoHeight*s));
    if(!camGrab||camGrab.width!==gw||camGrab.height!==gh){camGrab=document.createElement('canvas');camGrab.width=gw;camGrab.height=gh;}
    const gx=camGrab.getContext('2d',{willReadFrequently:true});gx.drawImage(v,0,0,gw,gh);
-   const r=await heavy('live',asW=>asPic(camGrab,asW));          // the worker looks at the little frame; the page stays smooth
+   const prior=camLock&&camQ?camQ.map(p=>({x:p.x,y:p.y})):null;
+   const r=await heavy('live',async asW=>{const b=await asPic(camGrab,asW);b.msg.prior=prior;return b;});   // the worker looks at the little frame; the page stays smooth. A locked page is searched near where it was.
    if(camS!==st||my!==camLoop||camBusy)return;
-   let q=r.found?r.quad.map(p=>({x:p.x/gw,y:p.y/gh})):null,move=1;
-   if(q){if(camQ){move=q.reduce((a,p,i)=>a+Math.hypot(p.x-camQ[i].x,p.y-camQ[i].y),0)/4;q=q.map((p,i)=>({x:(p.x+camQ[i].x)/2,y:(p.y+camQ[i].y)/2}));}camQ=q;camMiss=0;
-    camStable=move<0.014?camStable+1:0;camJudge(v,gw,gh,gx);}
+   const now=performance.now(),qd=(a,b)=>a.reduce((t,p,i)=>t+Math.hypot(p.x-b[i].x,p.y-b[i].y),0)/4;
+   let q=r.found?r.quad.map(p=>({x:p.x/gw,y:p.y/gh})):null,move=1,seen=false;
+   if(q){
+    if(camLock&&camQ){   // LOCKED: a new look must agree with the locked page. Small hand movement = follow it softly, a strange outline = ignored.
+     const dm=qd(q,camQ);
+     if(dm<0.08){seen=true;move=dm;camAlt=0;if(dm>=0.004)camQ=q.map((p,i)=>({x:camQ[i].x+(p.x-camQ[i].x)*0.6,y:camQ[i].y+(p.y-camQ[i].y)*0.6}));}   // under 0.4 % = jitter: the outline stays dead still
+     else if(++camAlt>=6){camLock=false;camVib=false;camAlt=0;camQ=q;seen=true;move=1;}    // 6 looks in a row somewhere else = really another page: let go, take the new one
+    }
+    else{seen=true;if(camQ){move=qd(q,camQ);q=q.map((p,i)=>({x:(p.x+camQ[i].x)/2,y:(p.y+camQ[i].y)/2}));}camQ=q;}
+   }
+   if(seen){camMiss=0;camSeenT=now;
+    camStable=move<0.014?camStable+1:(camLock&&move<0.04?Math.max(0,camStable-1):0);    // a small shake does not throw the steady count away once locked
+    if(!camLock&&camStable>=3){camLock=true;camAlt=0;camFocusLock(true);}               // found + steady for 3 looks = LOCK
+    else if(camLock)camFocusLock(false);
+    camJudge(v,gw,gh,gx);}
+   else if(camLock&&camQ){   // locked but this look found nothing (hand moved / shadow / blur): HOLD the outline, do not give up
+    camMiss++;
+    if(now-camSeenT>4000){camLock=false;camVib=false;camQ=null;camStable=0;camGood=false;camSet(1,'Looking for the paper…','Put it on a darker table and keep all 4 corners in view');}   // lost for 4 s: let go
+    else if(camMiss>2){camGood=false;camStable=0;camSet(1,'Page locked, hold still…','Keep the phone steady, the paper is still tracked');}}
    else{camStable=0;camGood=false;if(++camMiss>2){camQ=null;camSet(1,'Looking for the paper…','Put it on a darker table and keep all 4 corners in view');}}
   }catch(e){}}
  if(camS!==st||my!==camLoop||camBusy)return;
@@ -1408,8 +1435,8 @@ function camJudge(v,gw,gh,gx){camGood=false;
  if(lightIssue===1)return camSet(0,'Too dark','Move to a brighter place or turn the flash on');
  if(lightIssue===2)return camSet(0,'Shadow on the paper','Move your hand or the phone\'s shadow away so the light is even');
  if(lightIssue===3)return camSet(0,'Glare on the paper','Shift the phone or turn the paper a little to avoid the reflection');
- if(camStable>=4){camGood=true;if(camAutoOn()&&camStable>=8&&!camBusy){setTimeout(()=>{if(camGood&&!camBusy&&camS)$('camShot').onclick();},0);}if(camStable===4){camFocusAt(cx0,cy0);if(!camVib){camVib=true;buzz();}}return camSet(2,'Good, take the photo','Hold still and tap the round button');}
- camVib=false;camSet(1,'Almost, hold still…','The paper is found');}
+ if(camStable>=4){camGood=true;if(camAutoOn()&&camStable>=8&&!camBusy){setTimeout(()=>{if(camGood&&!camBusy&&camS)$('camShot').onclick();},0);}return camSet(2,'Good, take the photo','Hold still and tap the round button');}
+ camSet(1,camLock?'Page locked, hold still…':'Almost, hold still…',camLock?'The paper is locked and in focus':'The paper is found');}
 function camFrame(){camRaf=0;if(!camS)return;camRaf=requestAnimationFrame(camFrame);
  const o=$('camO'),g=o.getContext('2d'),W=o.width,H=o.height,d=DPR(),G=camGeo(),now=performance.now();g.clearRect(0,0,W,H);
  const fl=Math.max(0,1-(now-camFlashT)/420),f=fl*fl*(3-2*fl),good=!!(camQ&&camGood),sh=camShown;     // f = the soft "got it" pulse after the shutter

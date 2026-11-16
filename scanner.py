@@ -1891,7 +1891,20 @@ def _detect_fast(img, want_debug=None):
     val, quad = pick[0], pick[1]
     v_, info_ = J.value(quad)
     if val <= 0.07 or info_["edge_mean"] < 1.12 * J.base:
-        return None
+        # the learned order may put an outline first that is too weak to trust: take the next outline (in the learned order)
+        # that is trustworthy instead of giving up on the whole fast finder
+        alt = None
+        for c in scored:
+            if c is pick:
+                continue
+            va, ia = J.value(c[1])
+            if c[0] > 0.07 and ia["edge_mean"] >= 1.12 * J.base:
+                alt = (c, va, ia)
+                break
+        if alt is None:
+            return None
+        pick, v_, info_ = alt
+        val, quad = pick[0], pick[1]
     pts = _order(quad)
     try:                                                       # page edge that is nearly the table's colour: find it by colour
         labs = cv2.cvtColor(mid.astype(np.float32) / 255.0, cv2.COLOR_RGB2LAB)
