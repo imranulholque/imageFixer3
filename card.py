@@ -2634,21 +2634,30 @@ class Card(QWidget):
         return qi
 
     def _sync_live(self):
-        """Draw every visible layer on the screen at full sharpness (the one being moved is drawn by the Transform box).
+        """Draw every visible layer on the screen at full sharpness (the one being moved is drawn by the Transform box,
+        the other selected ones by the canvas group, so they all move together).
         The page itself comes without layers; saving / printing never use this (they are made at full size)."""
         cv = getattr(self, "canvas", None)
         if cv is None or self.prev is None:
             return
         if self.ctx is not None or cv._bare is None:
             cv.set_live([])
+            cv.set_group([])
             return
         PH, PW = self.prev.shape[:2]
-        live = []
+        hid = set()
+        if self._tool == "transform" and self._place_id is not None and len(self.sel_group) > 1:
+            hid = set(self.sel_group) - {self._place_id}
+        live, ents = [], []
         for l in self.layers:
             if not l.get("visible", True) or l["id"] == self._hide_layer:
                 continue
             try:
-                live.append({"img": self._live_image(l), "pts": [(x * PW, y * PH) for x, y in l["grid"]], "n": l["n"]})
+                d = {"img": self._live_image(l), "pts": [(x * PW, y * PH) for x, y in l["grid"]], "n": l["n"]}
+                if l["id"] in hid:
+                    ents.append(dict(d, id=l["id"]))
+                else:
+                    live.append(d)
             except Exception:
                 _log("live layer")
                 cv.set_live([])
@@ -2656,6 +2665,7 @@ class Card(QWidget):
         if self._live_cache:
             self._live_cache = {k: v for k, v in self._live_cache.items() if any(x["id"] == k for x in self.layers)}
         cv.set_live(live)
+        cv.set_group(ents)
 
     def _compute(self):
         """Render on the spot (tests, small jobs)."""
@@ -3692,8 +3702,13 @@ class Card(QWidget):
             return
         self._checkpoint()
         self._replace_layer(lid, grid=grid, n=n)
+        for gid, gp in self.canvas.group_params():
+            if self._layer(gid) is not None:
+                self._replace_layer(gid, grid=[(x / PW, y / PH) for x, y in gp])
         self.ops += 1
         self._touch()
+        if self.sel_group:
+            self._sync_live()
         l2 = self._layer(lid)
         if l2.get("text") is not None and self.ctx is None:          # a text box: the font size follows the new size
             l3 = textbox.refit(l2, self.base.size)
@@ -3780,8 +3795,9 @@ class Card(QWidget):
         if QApplication.keyboardModifiers() & Qt.KeyboardModifier.ControlModifier:
             self._ctrl_toggle(lid)
             return
-        self.sel_group = set()
-        self.sel_main = False
+        if not (lid in self.sel_group and len(self.sel_group) > 1):
+            self.sel_group = set()
+            self.sel_main = False
         self.place_layer_tool(lid)
         self._show_text_tab_if_text(lid)
         self.canvas.begin_layer_drag(x, y, alt)                 # drag starts right away: click = select, drag = move, Alt + drag = copy
@@ -3935,6 +3951,10 @@ class Card(QWidget):
             self.sel_main = not self.sel_main          # Ctrl + click on the empty page: the page is edited too
             self.message.emit("The page is edited together with the selected layers." if self.sel_main
                               else "Only the selected layers are edited.")
+            return
+        if lid is not None and lid in self.sel_group and len(self.sel_group) > 1:
+            self.place_layer_tool(lid)                 # one of the selected pictures: they all stay selected, drag moves all
+            self.canvas.begin_layer_drag(x, y, False)
             return
         if lid is not None:
             self.sel_group = set()

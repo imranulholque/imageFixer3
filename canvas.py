@@ -64,6 +64,7 @@ class ImageCanvas(QWidget):
         self.setMinimumSize(240, 240)
         self._img = None
         self._bare = None                     # the page WITHOUT the layers (shown instead of _img while layers are drawn live)
+        self._grp, self._grp_ref = [], None    # the other selected layers (move / resize / rotate together with the open box)
         self._live = []                       # layers drawn live over it, at screen resolution: dicts img / pts / n
         self._live_small = {}
         self._src = None
@@ -863,6 +864,56 @@ class ImageCanvas(QWidget):
         self._live_small = {k: v for k, v in self._live_small.items() if k[0] in keep}
         self.update()
 
+    # ---- several selected layers (like pictures in Word): they all follow the box that is dragged
+    def set_group(self, entries):
+        """entries = [{'id', 'img' QImage, 'pts' [(x, y)] in preview pixels, 'n'}]: the selected layers besides the open box."""
+        if self._tf_drag is not None:
+            return
+        self._grp = list(entries)
+        t = self._tf
+        self._grp_ref = [QPointF(q) for q in self._corners()] if (self._grp and t is not None and t.get("layer")) else None
+        self.update()
+
+    def _grp_mapped(self):
+        if not self._grp or self._grp_ref is None or self._tf is None or not self._tf.get("layer"):
+            return []
+        try:
+            H = core.homography([(q.x(), q.y()) for q in self._grp_ref], [(q.x(), q.y()) for q in self._corners()])
+        except Exception:
+            return []
+        out = []
+        for e in self._grp:
+            pts = []
+            for x, y in e["pts"]:
+                d = H[2, 0] * x + H[2, 1] * y + H[2, 2]
+                d = d if abs(d) > 1e-9 else 1e-9
+                pts.append(QPointF((H[0, 0] * x + H[0, 1] * y + H[0, 2]) / d, (H[1, 0] * x + H[1, 1] * y + H[1, 2]) / d))
+            out.append((e, pts))
+        return out
+
+    def group_params(self):
+        """[(layer id, [(x, y) ...])] where the other selected layers are now (preview pixels)."""
+        return [(e["id"], [(q.x(), q.y()) for q in pts]) for e, pts in self._grp_mapped()]
+
+    def _paint_group(self, p):
+        gm = self._grp_mapped()
+        if not gm:
+            return
+        self._paint_live(p, [{"img": e["img"], "pts": [(q.x(), q.y()) for q in pts], "n": e["n"]} for e, pts in gm])
+
+    def _paint_group_boxes(self, p):
+        for e, pts in self._grp_mapped():
+            n = e["n"]
+            c = [self.to_wid(pts[0]), self.to_wid(pts[n]), self.to_wid(pts[-1]), self.to_wid(pts[n * (n + 1)])]
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(QColor(255, 255, 255), 1.4))
+            p.drawPolygon(QPolygonF(c))
+            p.setPen(QPen(QColor("#4f46e5"), 1.5))
+            p.setBrush(QBrush(QColor("white")))
+            marks = list(c) + [QPointF((c[i].x() + c[(i + 1) % 4].x()) / 2, (c[i].y() + c[(i + 1) % 4].y()) / 2) for i in range(4)]
+            for m in marks:
+                p.drawRect(QRectF(m.x() - 4, m.y() - 4, 8, 8))
+
     def _disp(self):
         return self._bare if (self._live and self._bare is not None) else self._img
 
@@ -875,12 +926,12 @@ class ImageCanvas(QWidget):
             self._live_small[key] = hit
         return hit
 
-    def _paint_live(self, p):
+    def _paint_live(self, p, layers=None):
         p.save()
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         dpr = self._dpr()
-        for L in self._live:
+        for L in (self._live if layers is None else layers):
             img, n = L["img"], L["n"]
             wp = [self.to_wid(QPointF(x, y)) for x, y in L["pts"]]
             a, b, c, d = wp[0], wp[n], wp[n * (n + 1)], wp[-1]
@@ -955,6 +1006,8 @@ class ImageCanvas(QWidget):
             p.restore()
         if self._live:
             self._paint_live(p)
+        if self._grp and self.mode == self.TRANSFORM:
+            self._paint_group(p)
         pv = self._preview_image() if (self.sel_preview and self.mode == self.SELECT) else None
         if pv is not None:                                  # Color range preview: white = selected, black = not
             p.save()
@@ -969,6 +1022,7 @@ class ImageCanvas(QWidget):
             self._paint_ants(p, "hl", (20, 30, 120, 255), (160, 190, 255, 255))
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         if self.mode == self.TRANSFORM:
+            self._paint_group_boxes(p)
             self._paint_transform(p)
         elif self.mode == self.CROP:
             self._paint_crop(p)
