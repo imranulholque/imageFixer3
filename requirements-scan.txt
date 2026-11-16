@@ -1,0 +1,3 @@
+# only needed by scanhelper.py (the scan helper program); the build installs them itself
+pytwain
+pywin32

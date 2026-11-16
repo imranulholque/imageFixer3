@@ -412,6 +412,7 @@ SHORTCUT_GROUPS = (
     ("Files and saving", (
         ("Ctrl+O", "Choose files"),
         ("Ctrl+V", "Paste pictures (or a PDF) from the clipboard"),
+        ("Ctrl+Shift+N", "Scan: opens the Scan window (TWAIN / WIA scanners, ID card front + back on one page; Enter there = scan)"),
         ("Ctrl+C", "Copy the picture (full quality)"),
         ("Ctrl+S", "Save (replaces the original; asked once)"),
         ("Ctrl+Shift+S", "Save all edited pictures"),
@@ -526,6 +527,7 @@ class MainWindow(QMainWindow):
         self.phone = None
         self.phone_tunnel = None
         self._phone_dlg = None
+        self._scan_dlg = None
         self.setWindowTitle("Image Fixer  -  by " + AUTHOR)
         self.setWindowIcon(make_icon())
         self.setAcceptDrops(True)
@@ -607,6 +609,9 @@ class MainWindow(QMainWindow):
         self.btnPhone = QPushButton("Add from phone")
         self.btnPhone.setToolTip("Use your phone as a wireless scanner / picture sender (QR code)")
         self.btnPhone.clicked.connect(self.open_phone)
+        self.btnScan = QPushButton("Scan")
+        self.btnScan.setToolTip("Scan from a TWAIN / WIA scanner, also ID card front + back on one page  (Ctrl+Shift+N)")
+        self.btnScan.clicked.connect(self.open_scan)
         self.btnPdfAll = QPushButton("Save all as PDF")
         self.btnPdfAll.setToolTip("One PDF with every open picture, one page each")
         self.btnPdfAll.clicked.connect(self.save_all_pdf)
@@ -616,6 +621,7 @@ class MainWindow(QMainWindow):
                                     "to all the other pictures. Crop, erase, move ... are never copied.")
         self.btnApplyAll.clicked.connect(lambda: self._with_loaded(self.apply_to_all))
         l.addWidget(self.btnChoose)
+        l.addWidget(self.btnScan)
         l.addWidget(self.btnPhone)
         l.addWidget(self.btnApplyAll)
         l.addStretch(1)
@@ -1037,6 +1043,7 @@ class MainWindow(QMainWindow):
         sc("Ctrl+Alt+Shift+Up", cur(lambda c: c.order_selected(1, True)), "Layer to front")
         sc("Ctrl+Alt+Shift+Down", cur(lambda c: c.order_selected(-1, True)), "Layer to back")
         # zoom
+        sc("Ctrl+Shift+N", self.open_scan)
         sc("Ctrl+0", cur(lambda c: c.canvas.fit()), "Fit to window")
         sc("Ctrl+1", cur(lambda c: c.canvas.zoom_to(1.0 / max(c.scale, 1e-6))), "Actual size")
         sc("Ctrl+=", cur(lambda c: c.canvas.zoom_by(1.25)), "Zoom in")
@@ -2163,6 +2170,36 @@ class MainWindow(QMainWindow):
         def done(p):
             self.say("PDF saved (%d pages): %s" % (len(cards), p))
         self.runner.run("Making the PDF", work, done, self._fail_box("PDF"))
+
+    # --------------------------------------------------------------- scanner
+    def open_scan(self):
+        from scandlg import ScanDialog
+        if self._scan_dlg is None:
+            self._scan_dlg = ScanDialog(self)
+        self._scan_dlg.show_front()
+
+    def scan_received(self, paths):
+        """Scanned pages (normal mode): every page is a new picture."""
+        for p in paths:
+            self._origin[p] = "paste"
+        self.add_files(paths)
+        self.say("Scanned %d page(s)." % len(paths))
+
+    def scan_id_page(self, page_path, items, tries=0):
+        """ID card: a white page is added as a new picture, front and back are put on it as two layers."""
+        if tries == 0:
+            self._origin[page_path] = "paste"
+            self.add_files([page_path])
+        card = next((c for c in self.carousel.cards if c.path == page_path), None)
+        if card is None or self._adding:
+            if tries < 100:
+                QTimer.singleShot(100, lambda: self.scan_id_page(page_path, items, tries + 1))
+            return
+        self.carousel.go_to(self.carousel.cards.index(card), animate=False)
+        self._current_changed(self.carousel.index)
+        card.ensure_loaded()
+        card.add_fixed_layers(items)
+        self.say("ID card page ready: Front and Back are layers (Layers tab).")
 
     # --------------------------------------------------------------- phone
     def open_phone(self):

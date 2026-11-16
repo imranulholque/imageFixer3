@@ -1,0 +1,208 @@
+"""ID card from a flatbed scan: find the card on the glass, cut it out, straighten it, and put FRONT and BACK together
+on one page (every card = its own layer, real size).
+
+A flatbed scan is the easy case: the background is the scanner lid (one colour, white or black) and the card is a rectangle
+of a known real size (about 85.6 x 54 mm; the scan DPI turns that into pixels).  So the card is looked for as a rectangle of
+about that size, in two ways (colour difference from the lid, and edges - a white card on a white lid only has edges).
+Nothing here needs the window: it works on PIL pictures, so it can be tested without a scanner."""
+import math
+
+import cv2
+import numpy as np
+from PIL import Image
+
+CARD_ASPECT = 85.6 / 54.0                 # ID-1 (bank card, NID, driving licence)
+# page sizes in millimetres
+PAGES_MM = {"A4": (210.0, 297.0), "A5": (148.0, 210.0), "Letter": (215.9, 279.4), "Legal": (215.9, 355.6)}
+
+
+def _rect_score(cnt, rect, scale, dpi, strict):
+    (cx, cy), (w, h), ang = rect
+    if w < 8 or h < 8:
+        return 0.0
+    area = cv2.contourArea(cnt)
+    fill = area / float(w * h)
+    if fill < 0.80:
+        return 0.0
+    long_, short = max(w, h), min(w, h)
+    asp = long_ / short
+    if strict:
+        inch = long_ / scale / float(dpi)                 # the long side in real inches (an ID card is 3.37")
+        if not (2.0 <= inch <= 5.4) or not (1.25 <= asp <= 2.0):
+            return 0.0
+        return fill * math.exp(-abs(math.log(asp / CARD_ASPECT)) * 2.5) * (0.5 + min(1.0, long_ * short / 90000.0))
+    return fill * min(1.0, w * h / 60000.0)
+
+
+def _contours(mask, min_area):
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7)))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
+    cs, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cs = [c for c in cs if cv2.contourArea(c) >= min_area]
+    cs.sort(key=cv2.contourArea, reverse=True)
+    return cs[:6]
+
+
+def _masks(small):
+    """Yields masks (uint8 0/255) that may contain the card: colour difference from the lid, then closed edges."""
+    h, w = small.shape[:2]
+    k = max(2, int(min(h, w) * 0.02))
+    ring = np.concatenate([small[:k].reshape(-1, 3), small[-k:].reshape(-1, 3),
+                           small[:, :k].reshape(-1, 3), small[:, -k:].reshape(-1, 3)])
+    bg = np.median(ring, axis=0)
+    blur = cv2.GaussianBlur(small, (5, 5), 0)
+    dist = np.abs(blur.astype(np.float32) - bg.astype(np.float32)).max(axis=2)
+    d8 = np.clip(dist * 2.5, 0, 255).astype(np.uint8)
+    t, m = cv2.threshold(d8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    if t < 30:                                            # nothing clearly different: a faint card, use a gentle limit
+        _, m = cv2.threshold(d8, 30, 255, cv2.THRESH_BINARY)
+    yield m
+    _, m2 = cv2.threshold(d8, 22, 255, cv2.THRESH_BINARY)         # a lower limit: pale cards / pale lids
+    yield m2
+    gray = cv2.cvtColor(blur, cv2.COLOR_RGB2GRAY)
+    edges = cv2.Canny(gray, 25, 80)
+    edges = cv2.dilate(edges, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
+    cs, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    filled = np.zeros_like(edges)
+    cv2.drawContours(filled, cs, -1, 255, thickness=cv2.FILLED)
+    yield filled
+
+
+def find_card_box(img, dpi=300):
+    """-> 4 corner points (full-size pixel coordinates, float32 4x2) of the card, or None."""
+    rgb = np.asarray(img.convert("RGB"))
+    H, W = rgb.shape[:2]
+    scale = min(1.0, 1000.0 / max(H, W))
+    small = cv2.resize(rgb, (max(8, int(W * scale)), max(8, int(H * scale))), interpolation=cv2.INTER_AREA) if scale < 1 else rgb
+    min_area = small.shape[0] * small.shape[1] * 0.004
+    for strict in (True, False):
+        best, best_s = None, 0.0
+        for m in _masks(small):
+            for c in _contours(m, min_area):
+                rect = cv2.minAreaRect(c)
+                s = _rect_score(c, rect, scale, dpi, strict)
+                if s > best_s:
+                    best, best_s = rect, s
+        if best is not None:
+            (cx, cy), (w, h), ang = best
+            pts = cv2.boxPoints(((cx / scale, cy / scale), (w / scale, h / scale), ang))
+            return pts.astype(np.float32)
+    return None
+
+
+def _order(pts):
+    """top-left, top-right, bottom-right, bottom-left"""
+    pts = np.asarray(pts, np.float32)
+    s = pts.sum(axis=1)
+    d = np.diff(pts, axis=1).reshape(-1)
+    return np.array([pts[np.argmin(s)], pts[np.argmin(d)], pts[np.argmax(s)], pts[np.argmax(d)]], np.float32)
+
+
+def _edge_pos(P, lo, hi, default, floor=9.0):
+    """P = (n, 3) mean colour along one line across an edge.  The place in [lo, hi) where the colour changes most = the card
+    edge.  No clear change: `default`."""
+    n = len(P)
+    lo, hi = max(1, int(lo)), min(n - 1, int(hi))
+    if hi - lo < 3:
+        return default
+    g = np.abs(P[2:] - P[:-2]).sum(axis=1)               # g[i-1] = change around i
+    g = np.convolve(g, np.ones(3) / 3.0, mode="same")
+    seg = g[lo - 1:hi - 1]
+    if seg.size == 0 or seg.max() < floor:
+        return default
+    return lo + int(np.argmax(seg))
+
+
+def already_card_sized(img, dpi):
+    """True when the scan is itself about card sized (2 - 5.6 inch long side, card-like shape): many scanners detect the
+    paper size and give only the card, so there is nothing to cut."""
+    long_, short = max(img.size), min(img.size)
+    inch = long_ / float(max(dpi, 1))
+    return 2.0 <= inch <= 5.6 and 1.25 <= long_ / float(short) <= 2.0
+
+
+def cut_card(img, dpi=300, keep_orientation=False):
+    """Scan (PIL) -> (card picture, found).  The card is straightened; its four edges are then found again at full
+    resolution (the first box is a little too big), and it is cut a hair inside its edge (no lid / shadow line).
+    Not found: the whole scan comes back with found = False."""
+    if already_card_sized(img, dpi):                       # the scanner itself cut out only the card (auto paper size)
+        card = img.convert("RGB")
+        if card.height > card.width and not keep_orientation:
+            card = card.rotate(90, expand=True)
+        return card, True
+    pts = find_card_box(img, dpi)
+    if pts is None:
+        return img.convert("RGB"), False
+    q = _order(pts)
+    w = float((np.linalg.norm(q[1] - q[0]) + np.linalg.norm(q[2] - q[3])) / 2)
+    h = float((np.linalg.norm(q[3] - q[0]) + np.linalg.norm(q[2] - q[1])) / 2)
+    if w < 40 or h < 40:
+        return img.convert("RGB"), False
+    m = max(12, int(dpi * 0.12))                           # look this far outside / inside the first box
+    pw, ph = int(round(w)) + 2 * m, int(round(h)) + 2 * m
+    dst = np.array([[m, m], [m + w - 1, m], [m + w - 1, m + h - 1], [m, m + h - 1]], np.float32)
+    M = cv2.getPerspectiveTransform(q, dst)
+    rgb = np.asarray(img.convert("RGB"))
+    patch = cv2.warpPerspective(rgb, M, (pw, ph), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE).astype(np.float32)
+    iw, ih = int(round(w)), int(round(h))
+    ya, yb = m + int(ih * 0.2), m + int(ih * 0.8)          # stay away from the rounded corners
+    xa, xb = m + int(iw * 0.2), m + int(iw * 0.8)
+    colsP = patch[ya:yb].mean(axis=0)                      # colour along x  (left / right edges)
+    rowsP = patch[:, xa:xb].mean(axis=1)                   # colour along y  (top / bottom edges)
+    xl = _edge_pos(colsP, 0, 2 * m, m)
+    xr = _edge_pos(colsP, iw, iw + 2 * m, m + iw)
+    yt = _edge_pos(rowsP, 0, 2 * m, m)
+    yb2 = _edge_pos(rowsP, ih, ih + 2 * m, m + ih)
+    inset = max(2, int(round(dpi * 0.010)))                # about 0.25 mm inside the edge
+    x0, x1, y0, y1 = xl + inset, xr - inset, yt + inset, yb2 - inset
+    if x1 - x0 < 40 or y1 - y0 < 40:
+        x0, x1, y0, y1 = m + inset, m + iw - inset, m + inset, m + ih - inset
+    card = Image.fromarray(np.clip(patch[y0:y1, x0:x1], 0, 255).astype(np.uint8))
+    if not keep_orientation and card.height > card.width:  # a card is shown lying down (turn with R if it is upside down)
+        card = card.rotate(90, expand=True)
+    return card, True
+
+
+def page_pixels(page, dpi):
+    mm = PAGES_MM.get(page, PAGES_MM["A4"])
+    return int(round(mm[0] / 25.4 * dpi)), int(round(mm[1] / 25.4 * dpi))
+
+
+def compose_page(front, back, dpi=300, page="A4", place="center", gap_mm=8.0):
+    """FRONT above BACK, real size, centred on a white page.
+    -> (page picture, [(name, picture, (x0, y0, x1, y1) as fractions of the page), ...])"""
+    dpi = max(150, int(dpi))
+    PW, PH = page_pixels(page, dpi)
+    cards = [("Front", front.convert("RGB")), ("Back", back.convert("RGB"))]
+    if back is None:
+        cards = cards[:1]
+    # both sides of one card are the same size: a few pixels of difference are crop noise, make them equal
+    if len(cards) == 2:
+        a, b = cards[0][1], cards[1][1]
+        if abs(a.width - b.width) <= 0.06 * a.width and abs(a.height - b.height) <= 0.06 * a.height:
+            cards[1] = (cards[1][0], b.resize(a.size, Image.Resampling.LANCZOS))
+    maxw = PW * 0.90
+    f = min(1.0, maxw / max(c.width for _, c in cards))
+    if f < 1.0:
+        cards = [(n, c.resize((max(1, int(c.width * f)), max(1, int(c.height * f))), Image.Resampling.LANCZOS)) for n, c in cards]
+    gap = int(round(gap_mm / 25.4 * dpi))
+    total = sum(c.height for _, c in cards) + gap * (len(cards) - 1)
+    if place == "top":
+        y = int(round(15.0 / 25.4 * dpi))
+    else:
+        y = max(0, (PH - total) // 2)
+    items = []
+    for name, c in cards:
+        x = (PW - c.width) // 2
+        items.append((name, c, (x / PW, y / PH, (x + c.width) / PW, (y + c.height) / PH)))
+        y += c.height + gap
+    return Image.new("RGB", (PW, PH), (255, 255, 255)), items
+
+
+def paste_preview(page_img, items):
+    """What the finished page looks like (for tests / a quick look)."""
+    out = page_img.copy()
+    W, H = out.size
+    for _, c, (x0, y0, x1, y1) in items:
+        out.paste(c, (int(round(x0 * W)), int(round(y0 * H))))
+    return out

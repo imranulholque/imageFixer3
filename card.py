@@ -3182,6 +3182,29 @@ class Card(QWidget):
             self.canvas.set_tf_image(self._layer_qimage(l))                # the finished picture of the text
             self.canvas.setFocus()
 
+    def add_fixed_layers(self, items):
+        """Pictures that are put on the page exactly where they belong (the scanned ID card: front and back).
+        items = [(name, PIL picture, (x0, y0, x1, y1) as fractions of the page)].  Nothing is cut away from them."""
+        self.ensure_loaded()
+        if not self._loaded or self.ctx is not None:
+            return
+        bg = dict(self.BG_DEFAULT, remove=False, opacity=100)
+        self._checkpoint("ID card")
+        new = []
+        for name, im, (x0, y0, x1, y1) in items:
+            self._layer_seq += 1
+            rgb = im.convert("RGB")
+            new.append({"id": self._layer_seq, "name": name, "rgb": rgb, "a": Image.new("L", rgb.size, 255), "src": rgb,
+                        "sa": None, "bg": bg, "grid": [(x0, y0), (x1, y0), (x0, y1), (x1, y1)], "n": 1,
+                        "opacity": 100, "visible": True})
+        self.layers = self.layers + new
+        self.ops += 1
+        self.sel_layer = None
+        self._touch()
+        self.show_tab(self.TAB_LAYERS)
+        self._refresh_layers_ui()
+        self._timer.start()
+
     def add_picture(self, path=None, image=None, name=None, keep_background=False):
         """A picture (signature, stamp ...) becomes a new layer: background removed, then placed on the page.
         image = a PIL picture that is already in memory (another picture of the carousel, as it looks now) instead of a

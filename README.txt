@@ -52,6 +52,14 @@ PHONE AS A SCANNER  ("Add from phone" at the top)
  devices on your local network can use it and only this program's page is reachable. The first time, Windows may ask
  to allow the program on private networks - allow it. If the Wi-Fi changes, the QR code updates by itself.
 
+SCANNER  ("Scan" button at the top, key Ctrl+Shift+N)
+ Finds TWAIN and WIA scanners (also old 32-bit-only TWAIN drivers, like a 32-bit Photoshop plugin: a small 32-bit helper program
+ is built and shipped in the folder "scanhelpers"). Press "Find scanners", choose one, press Scan (Enter). Paper size "Auto" = the scanner
+ decides (many scanners cut to the paper by themselves); or choose A4 / A5 / A3 / B5 / Letter / Legal. "Show the scanner's own window" opens the
+ driver window like Photoshop does. The document feeder (ADF) and both sides (duplex) can be chosen.
+ What to scan:  Normal = every page is a new picture.   ID card = Scan FRONT, turn the card, Scan BACK -> a new A4 / Letter page
+ with the front and the back as two separate layers, cut out, straightened, real size, one above the other (Layers tab, drag to move).
+
 HOW TO GET THE PROGRAM
  1. Make a new GitHub repository and upload everything in this folder (keep the folders, including .github).
  2. Actions tab -> "Build" -> latest run -> Artifacts -> ImageFixer -> download, unzip.
@@ -72,7 +80,7 @@ KEYS
  Ctrl + wheel zoom, Ctrl +/- zoom, Ctrl+0 fit, Ctrl+1 100%     Left / Right previous / next picture
  WHEEL goes to what is under the pointer: over the picture = up / down, Shift + wheel = left / right, Ctrl + wheel = zoom;
  over the thumbnails (bottom) = previous / next picture, one by one; over the side panel = scrolls the panel.
- Ctrl+S save, Ctrl+Shift+S save all edited, Ctrl+C copy picture
+ Ctrl+S save, Ctrl+Shift+S save all edited, Ctrl+C copy picture, Ctrl+Shift+N scan
 
 LAYERS (own tab: "Layers", right side after Aa): one list with every overlay picture and text box, with a small picture of each.
  DRAG a row up or down to change which one is in front (top of the list = front; the main picture is always at the bottom).
