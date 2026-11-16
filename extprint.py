@@ -96,3 +96,57 @@ def economy_mode(on):
         k32.SetProcessInformation(h, 4, ctypes.byref(st), ctypes.sizeof(st))      # 4 = ProcessPowerThrottling
     except Exception:
         pass
+
+
+# ------------------------------------------------------------------ "is the PC calm?" (so the sleeping never causes a hang)
+_last_times = None
+
+
+def cpu_load():
+    """Whole-PC CPU use (0.0 - 1.0) since the previous call.  The first call only sets the starting point (returns 0)."""
+    global _last_times
+    try:
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+            idle, kern, user = wintypes.FILETIME(), wintypes.FILETIME(), wintypes.FILETIME()
+            if not ctypes.windll.kernel32.GetSystemTimes(ctypes.byref(idle), ctypes.byref(kern), ctypes.byref(user)):
+                return 0.0
+            t = tuple((f.dwHighDateTime << 32) | f.dwLowDateTime for f in (idle, kern, user))
+        else:
+            c = os.cpu_count() or 1
+            return min(1.0, os.getloadavg()[0] / c)
+    except Exception:
+        return 0.0
+    prev, _last_times = _last_times, t
+    if prev is None:
+        return 0.0
+    d_idle, d_kern, d_user = (t[i] - prev[i] for i in range(3))
+    total = d_kern + d_user                      # kernel time already contains the idle time
+    if total <= 0:
+        return 0.0
+    return max(0.0, min(1.0, 1.0 - d_idle / total))
+
+
+def cpu_calm(limit=0.4):
+    """True when the PC is not busy right now (the print program has finished starting, nothing is heavy)."""
+    return cpu_load() < limit
+
+
+def other_app_in_front():
+    """True when the window in front belongs to another program (= the print program is open and shown)."""
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u32 = ctypes.windll.user32
+        u32.GetForegroundWindow.restype = wintypes.HWND
+        hwnd = u32.GetForegroundWindow()
+        if not hwnd:
+            return False
+        pid = wintypes.DWORD(0)
+        u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        return pid.value != os.getpid()
+    except Exception:
+        return True

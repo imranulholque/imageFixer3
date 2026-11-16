@@ -1699,7 +1699,8 @@ class MainWindow(QMainWindow):
             name = extprint.program_name(exe) or exe
             self.say("Opened %d picture(s) in %s." % (len([f for f in files if f]), name))
             if self.settings.value("print_sleep", True, type=bool):
-                QTimer.singleShot(4000, self.hibernate)      # not at once: the print program is starting and needs the disk / CPU
+                extprint.cpu_load()                          # starting point for the "is the PC calm?" check
+                QTimer.singleShot(1000, self._sleep_when_ready)   # not at once: the print program is starting and needs the disk / CPU
 
         if not todo:
             finish()
@@ -1720,13 +1721,24 @@ class MainWindow(QMainWindow):
         self.runner.run("Preparing %d picture(s) for %s" % (len(cards), extprint.program_name(exe) or "the print program"),
                         work, done, lambda msg: self.say("Could not prepare the pictures: " + msg.splitlines()[0]))
 
+    def _sleep_when_ready(self, waited=1000):
+        """Sleep as soon as the print program is open and the PC is calm (usually 2-3 seconds), never in the middle of its
+        start-up.  After 10 seconds it sleeps anyway."""
+        if self._hibernating or self.quitting:
+            return
+        if waited >= 10000 or (extprint.other_app_in_front() and extprint.cpu_calm(0.4)):
+            self.hibernate()
+            return
+        QTimer.singleShot(500, lambda: self._sleep_when_ready(waited + 500))
+
     def hibernate(self):
         """The print program is open: go to the tray and sleep.  Only what can be made again is dropped (old undo pictures
-        go to the disk, caches, free memory); the pictures, the edits and the undo steps stay."""
+        go to the disk, caches, free memory); the pictures, the edits and the undo steps stay.
+        The heavy parts (disk writes, giving memory back) wait for a calm PC, so the work never hangs."""
         if self._hibernating or self.quitting:
             return
         if self.runner.heavy_busy:                           # something is still being saved / made: try again soon
-            QTimer.singleShot(3000, self.hibernate)
+            QTimer.singleShot(2000, self.hibernate)
             return
         self._hibernating = True
         if self.tray is not None:
@@ -1735,24 +1747,37 @@ class MainWindow(QMainWindow):
         else:
             self.showMinimized()
         cards = list(self.carousel.cards)
+        extprint.cpu_load()
 
-        def step(i=0):                                       # one picture at a time: no burst of disk writes that freezes the PC
-            if not self._hibernating or i >= len(cards):
+        def trim(waits=0):                                   # memory is given back last, when the PC is quiet
+            if not self._hibernating:
+                return
+            if waits < 30 and not extprint.cpu_calm(0.3):
+                QTimer.singleShot(300, lambda: trim(waits + 1))
+                return
+            extprint.trim_memory()
+
+        def step(i=0, waits=0):                              # one picture at a time, and only while the PC is calm
+            if not self._hibernating:
+                return
+            if i >= len(cards):
+                QTimer.singleShot(1500, trim)
+                return
+            if waits < 20 and not extprint.cpu_calm(0.6):
+                QTimer.singleShot(300, lambda: step(i, waits + 1))
                 return
             try:
                 cards[i].hibernate()
             except Exception:
                 pass
             QTimer.singleShot(150, lambda: step(i + 1))
-        QTimer.singleShot(1500, step)
+        QTimer.singleShot(800, step)
         try:
             from PySide6.QtGui import QPixmapCache
             QPixmapCache.clear()
         except Exception:
             pass
         extprint.economy_mode(True)
-        # giving memory back makes Windows write it to the disk: done late and only once, when the print program is up
-        QTimer.singleShot(15000, lambda: extprint.trim_memory() if self._hibernating else None)
 
     def _wake(self):
         if not self._hibernating:

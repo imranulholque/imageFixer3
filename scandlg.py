@@ -137,10 +137,15 @@ class ScanDialog(QDialog):
         self.chkFeed = QCheckBox("Use the document feeder (ADF) instead of the glass")
         self.chkDuplex = QCheckBox("Feeder scans both sides (duplex)")
         self.chkDuplex.setToolTip("ID card: one scan gives front and back together")
+        self.chkClose = QCheckBox("Close this window by itself when the scan is finished")
+        self.chkClose.setToolTip("When the picture(s) are added to Image Fixer this window goes away. "
+                                 "(It stays open while an ID card still needs its back side.)")
+        self.chkClose.setChecked(True)
         self.chkFeed.toggled.connect(self._mode_changed)
         form.addRow("", self.chkUi)
         form.addRow("", self.chkFeed)
         form.addRow("", self.chkDuplex)
+        form.addRow("", self.chkClose)
 
         self.cmbPage = QComboBox()
         for p in idscan.PAGES_MM:
@@ -319,6 +324,7 @@ class ScanDialog(QDialog):
             self.chkUi.setChecked(self.st.value("scan/ui", False, type=bool))
             self.chkFeed.setChecked(self.st.value("scan/feeder", False, type=bool))
             self.chkDuplex.setChecked(self.st.value("scan/duplex", False, type=bool))
+            self.chkClose.setChecked(self.st.value("scan/autoclose", True, type=bool))
         except Exception:
             pass
 
@@ -329,6 +335,7 @@ class ScanDialog(QDialog):
         self.st.setValue("scan/ui", self.chkUi.isChecked())
         self.st.setValue("scan/feeder", self.chkFeed.isChecked())
         self.st.setValue("scan/duplex", self.chkDuplex.isChecked())
+        self.st.setValue("scan/autoclose", self.chkClose.isChecked())
         d = self.cmbDev.currentData()
         if d:
             self.st.setValue("scan/device", d["kind"] + "|" + d["id"])
@@ -471,7 +478,7 @@ class ScanDialog(QDialog):
     def _busy_set(self, busy):
         self._busy = busy
         for w in (self.cmbDev, self.btnRefresh, self.cmbMode, self.cmbSize, self.cmbDpi, self.cmbCol, self.chkUi,
-                  self.chkFeed, self.chkDuplex, self.cmbPage, self.cmbPlace, self.btnAgain):
+                  self.chkFeed, self.chkDuplex, self.chkClose, self.cmbPage, self.cmbPlace, self.btnAgain):
             w.setEnabled(not busy)
         if busy:
             self.btnScan.setText("Cancel")
@@ -642,6 +649,7 @@ class ScanDialog(QDialog):
                                 ("" if all_found else "  Note: a card was not found in a scan, the whole scan was used."))
             self._update_step()
             self._mode_changed()
+            self._auto_close()
         jobs.run_background(work, done, lambda m: self._fail(m), self._prog_proc)
 
     def _to_png(self, pages, dpi=300, fix=None):
@@ -665,4 +673,5 @@ class ScanDialog(QDialog):
             self.win.scan_received(outs)
             self._prog_hide(1200)
             self.lblMsg.setText("%d page%s added." % (len(outs), "" if len(outs) == 1 else "s"))
+            self._auto_close()
         jobs.run_background(work, done, lambda m: self._fail(m), self._prog_proc)
