@@ -2063,8 +2063,8 @@ class Card(QWidget):
         srow.addWidget(self.cornerSample)
         srow.addStretch(1)
         g2l.addLayout(srow)
-        hr = QLabel("Works on the ID card layers (Front / Back). With no layer selected it changes the ID card of this page "
-                    "and is also used for the next ID card scan.")
+        hr = QLabel("Works on the selected layer(s): pictures, QR codes, text boxes, ID cards. With no layer selected it changes the "
+                    "ID card of this page and is also used for the next ID card scan. The border follows the round corners.")
         hr.setObjectName("hint")
         hr.setWordWrap(True)
         g2l.addWidget(hr)
@@ -2796,7 +2796,7 @@ class Card(QWidget):
         """The layer's picture for drawing on screen: big (sharp when zoomed in), kept until the layer changes."""
         if self._live_cache is None:
             self._live_cache = {}
-        sig = (id(l["rgb"]), id(l["a"]), l.get("opacity", 100), l.get("border"))
+        sig = (id(l["rgb"]), id(l["a"]), l.get("opacity", 100), l.get("border"), l.get("rnd", 0))
         hit = self._live_cache.get(l["id"])
         if hit is not None and hit[0] == sig:
             return hit[2]
@@ -4538,7 +4538,7 @@ class Card(QWidget):
     def _round_targets(self):
         sel = self._border_targets()
         if sel:
-            return [i for i in sel if self._is_idcard(self._layer(i))]
+            return list(sel)                                # ANY selected layer (picture, QR, text box, ID card ...)
         return self._card_ids()
 
     def _round_enable_ui(self):
@@ -4575,8 +4575,11 @@ class Card(QWidget):
         new = []
         for l in self.layers:
             if l["id"] in ids:
-                a = idscan.round_alpha(l["rgb"].size, pct if on else 0)
-                l = dict(l, a=a, round_on=bool(on), round_pct=int(pct), idcard=True)
+                if self._is_idcard(l):                      # ID card: the corners are cut into its own alpha (real card shape)
+                    a = idscan.round_alpha(l["rgb"].size, pct if on else 0)
+                    l = dict(l, a=a, round_on=bool(on), round_pct=int(pct), idcard=True)
+                else:                                       # any other layer: a look that is drawn on top, nothing is lost
+                    l = dict(l, rnd=int(pct) if on else 0, round_on=bool(on), round_pct=int(pct))
             new.append(l)
         self.layers = new
         self.ops += 1
@@ -4596,8 +4599,9 @@ class Card(QWidget):
         try:
             if ids:
                 l = self._layer(ids[0])
-                self.chkRoundOn.setChecked(bool(l.get("round_on", True)))
-                self.roundRow.set_value(max(5, min(idscan.ROUND_MAX, int(l.get("round_pct", idscan.ROUND_PCT)))))
+                idc = self._is_idcard(l)
+                self.chkRoundOn.setChecked(bool(l.get("round_on", True)) if idc else bool(l.get("rnd", 0)))
+                self.roundRow.set_value(max(5, min(idscan.ROUND_MAX, int(l.get("round_pct", idscan.ROUND_PCT if idc else 60)))))
                 names = ", ".join(self._layer(i)["name"] for i in ids[:3]) + (" +%d more" % (len(ids) - 3) if len(ids) > 3 else "")
                 if self._border_targets():
                     self.lblRoundFor.setText("Corners of:  %s%s" % (names, "  (shows the first one)" if len(ids) > 1 else ""))
@@ -4608,8 +4612,8 @@ class Card(QWidget):
                 on, pct = self._round_pref()
                 self.chkRoundOn.setChecked(on)
                 self.roundRow.set_value(pct)
-                self.lblRoundFor.setText("The selected layer is not an ID card, or this page has no ID card: "
-                                         "these are the corners the next ID card scan will use.")
+                self.lblRoundFor.setText("No layer is selected and this page has no ID card: select a layer to round its corners. "
+                                         "These are the corners the next ID card scan will use.")
         finally:
             self._round_sync = False
         self._round_enable_ui()
@@ -4695,7 +4699,7 @@ class Card(QWidget):
         """A small picture of the layer for the list (kept until the layer changes)."""
         if self._icon_cache is None:
             self._icon_cache = {}
-        key = (l["id"], id(l["rgb"]), id(l["a"]), l.get("opacity", 100), l.get("border"))
+        key = (l["id"], id(l["rgb"]), id(l["a"]), l.get("opacity", 100), l.get("border"), l.get("rnd", 0))
         hit = self._icon_cache.get(key)
         if hit is not None:
             return hit[2]
@@ -4717,8 +4721,8 @@ class Card(QWidget):
         flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsDragEnabled
         for l in reversed(self.layers):                          # top layer first
             icon = self._layer_icon(l)
-            keep[(l["id"], id(l["rgb"]), id(l["a"]), l.get("opacity", 100), l.get("border"))] = self._icon_cache[
-                (l["id"], id(l["rgb"]), id(l["a"]), l.get("opacity", 100), l.get("border"))]
+            keep[(l["id"], id(l["rgb"]), id(l["a"]), l.get("opacity", 100), l.get("border"), l.get("rnd", 0))] = self._icon_cache[
+                (l["id"], id(l["rgb"]), id(l["a"]), l.get("opacity", 100), l.get("border"), l.get("rnd", 0))]
             it = QListWidgetItem(icon, l["name"])
             it.setData(Qt.ItemDataRole.UserRole, l["id"])
             it.setFlags(flags)

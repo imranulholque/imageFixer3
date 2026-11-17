@@ -597,27 +597,71 @@ def look_edited(l):
     return tone_active(l) or clarity_active(l) or shadow_active(l)
 
 
+def _luma(x):
+    return x[..., 0] * 0.299 + x[..., 1] * 0.587 + x[..., 2] * 0.114
+
+
+def _fit_gamut(x, Y=None):
+    """Bring float colours into 0..255 WITHOUT clipping a single channel (a hard clip turns an orange into yellow and a
+    vivid blue into cyan): the colour is moved towards the gray of the same brightness only as far as needed.
+    Brightness is kept, so a strong edit gives a softer colour instead of a burnt one."""
+    if Y is None:
+        Y = _luma(x)
+    Y = np.clip(Y, 0.0, 255.0)[..., None]
+    d = x - Y
+    lim = np.where(d > 0, (255.0 - Y) / np.maximum(d, 1e-3), Y / np.maximum(-d, 1e-3))
+    k = np.clip(lim.min(2, keepdims=True), 0.0, 1.0)
+    return Y + d * k
+
+
+def _tone_curve(t, c):
+    """Contrast curve on 0..1 lightness.  c > 0: smooth S-curve (0 stays 0, 1 stays 1, no hard clipping, shadows and
+    highlights roll off softly), c < 0: flatter.  Always rising (never turns a dark spot light)."""
+    if c > 0:
+        for a in (min(c / 50.0, 1.0), min(max(c - 50.0, 0.0) / 50.0, 1.0)):
+            if a > 0:
+                t = t + (t * t * (3.0 - 2.0 * t) - t) * a
+        return t
+    return 0.5 + (t - 0.5) * (1.0 + c / 100.0 * 0.75)
+
+
+def _remap_luma(x, fn):
+    """Change only the lightness of the picture with the curve fn (0..1 -> 0..1); colours keep their hue and their
+    strength relative to the lightness, then are fitted into range (no channel burns out)."""
+    Y = _luma(x)
+    Yn = np.clip(fn(np.clip(Y, 0.0, 255.0) / 255.0), 0.0, 1.0) * 255.0
+    r = np.minimum(Yn / np.maximum(Y, 1.0), 6.0)[..., None]
+    return _fit_gamut(x * r, Yn)
+
+
 def apply_tone(x, l):
-    """x float32 (...,3) 0..255 -> warmth, hue, saturation, brightness, contrast."""
+    """x float32 (...,3) 0..255 -> warmth, hue, saturation, brightness, contrast.
+    Everything works on lightness and colour separately, so a colourful picture keeps its colours (no burnt channels,
+    no colour casts from clipping) and a document keeps soft, clean paper and text."""
     if l["warm"]:
-        w = l["warm"] * 0.6
-        x = x + np.array([w, 0.0, -w], np.float32)
+        w = l["warm"] / 100.0                               # like a white-balance: the strongest channel stays, the others are lowered
+        gain = np.array([1.0, 1.0 - 0.08 * w, 1.0 - 0.26 * w] if w > 0 else
+                        [1.0 + 0.26 * w, 1.0 + 0.08 * w, 1.0], np.float32)
+        Y0 = _luma(x)
+        x = x * gain
+        Y1 = _luma(x)
+        x = x * (1.0 + (np.minimum(Y0 / np.maximum(Y1, 1.0), 1.12)[..., None] - 1.0) * 0.6)    # keep most of the brightness
+        x = _fit_gamut(x)
     if l["hue"]:
         a = -math.radians(l["hue"])
         c, s_ = math.cos(a), math.sin(a)
-        Y = x[..., 0] * 0.299 + x[..., 1] * 0.587 + x[..., 2] * 0.114
+        Y = _luma(x)
         I = x[..., 0] * 0.596 - x[..., 1] * 0.274 - x[..., 2] * 0.322
         Q = x[..., 0] * 0.211 - x[..., 1] * 0.523 + x[..., 2] * 0.312
         I2, Q2 = I * c - Q * s_, I * s_ + Q * c
-        x = np.stack([Y + 0.956 * I2 + 0.621 * Q2, Y - 0.272 * I2 - 0.647 * Q2, Y - 1.106 * I2 + 1.703 * Q2], -1)
+        x = _fit_gamut(np.stack([Y + 0.956 * I2 + 0.621 * Q2, Y - 0.272 * I2 - 0.647 * Q2, Y - 1.106 * I2 + 1.703 * Q2], -1), Y)
     x = _saturate(x, l["sat"], l.get("vib", 0))
     if l["bright"]:
-        t = np.clip(x, 0, 255) / 255.0
-        x = (t ** (2.0 ** (-l["bright"] / 50.0))) * 255.0
+        g = 2.0 ** (-l["bright"] / 85.0)                    # gentle: +-100 is a strong but clean change, not a wash-out
+        x = _remap_luma(x, lambda t: t ** g)
     if l["contrast"]:
-        c = l["contrast"]
-        f = (100.0 + c) / 100.0 if c < 0 else 1.0 + c / 50.0
-        x = (x - 128.0) * f + 128.0
+        c = float(l["contrast"])
+        x = _remap_luma(x, lambda t: _tone_curve(t, c))
     return x
 
 
@@ -2341,6 +2385,48 @@ def _apply_border(out, border, shape_alpha=None):
     return Image.fromarray(arr, "RGBA")
 
 
+ROUND_SHAPE_MAX = 400
+
+
+def round_shape_alpha(size, pct):
+    """Transparency (PIL 'L') of a rectangle of this size with round corners, for ANY picture / layer.
+    pct 0 = square, 100 = a small round, 400 = the shorter side is fully round (pill / circle).  Smooth edge."""
+    w, h = int(size[0]), int(size[1])
+    try:
+        pct = max(0.0, min(float(ROUND_SHAPE_MAX), float(pct)))
+    except Exception:
+        pct = 0.0
+    r = min(w, h) / 2.0 * pct / ROUND_SHAPE_MAX
+    m = Image.new("L", (w, h), 255)
+    if r < 0.6:
+        return m
+    ri = int(math.ceil(r))
+    S = 8
+    big = Image.new("L", (2 * ri * S, 2 * ri * S), 0)
+    ImageDraw.Draw(big).ellipse((0, 0, 2 * r * S - 1, 2 * r * S - 1), fill=255)
+    tile = big.crop((0, 0, ri * S, ri * S)).resize((ri, ri), Image.Resampling.LANCZOS)   # the top-left corner
+    tiles = ((tile, (0, 0)), (tile.transpose(Image.Transpose.FLIP_LEFT_RIGHT), (w - ri, 0)),
+             (tile.transpose(Image.Transpose.FLIP_TOP_BOTTOM), (0, h - ri)),
+             (tile.transpose(Image.Transpose.ROTATE_180), (w - ri, h - ri)))
+    for t, (x0, y0) in tiles:
+        box = (x0, y0, x0 + ri, y0 + ri)
+        m.paste(ImageChops.darker(m.crop(box), t), box)
+    return m
+
+
+def layer_shape_alpha(l):
+    """The layer's alpha with its rounded corners applied (the corners are a look of the layer, so the picture itself
+    and later edits / background changes keep working; ID card layers have their corners in 'a' already)."""
+    a = l["a"]
+    r = l.get("rnd", 0)
+    if r:
+        try:
+            a = ImageChops.multiply(a, round_shape_alpha(a.size, r))
+        except Exception:
+            pass
+    return a
+
+
 def layer_rgba(l, pend=True):
     """RGBA of a layer dict (rgb, a, opacity; an unfinished edit 'pend' = (adjs, look, sel) is applied too)."""
     rgb = l["rgb"]
@@ -2348,14 +2434,15 @@ def layer_rgba(l, pend=True):
         adjs, look, sel = l["pend"]
         rgb = render_full(rgb, adjs, look, sel)
     out = rgb.convert("RGBA")
-    a = l["a"]
+    shape = layer_shape_alpha(l)                                # the layer's shape (round corners included), full strength
+    a = shape
     faded = l.get("opacity", 100) < 100
     if faded:
-        a = a.point(lambda v, f=l["opacity"] / 100.0: int(v * f))
+        a = shape.point(lambda v, f=l["opacity"] / 100.0: int(v * f))
     out.putalpha(a)
     if l.get("border"):
         try:
-            out = _apply_border(out, l["border"], l["a"] if faded else None)
+            out = _apply_border(out, l["border"], shape if faded else None)
         except Exception:
             pass
     return out
@@ -2406,7 +2493,7 @@ def composite_layers_fast(base, layers, hide=None, cache=None):
         lid = l["id"]
         alive.add(lid)
         refs = (l["rgb"], l["a"], l.get("pend"))
-        sig = ((W, H), tuple(l["grid"]), l["n"], l.get("opacity", 100), l.get("border"), id(refs[0]), id(refs[1]), id(refs[2]))
+        sig = ((W, H), tuple(l["grid"]), l["n"], l.get("opacity", 100), l.get("border"), l.get("rnd", 0), id(refs[0]), id(refs[1]), id(refs[2]))
         with _LCACHE_LOCK:
             hit = cache.get(lid)
         if hit is not None and hit[0] == sig:
