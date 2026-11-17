@@ -10,7 +10,7 @@ import tempfile
 import time
 
 from PySide6.QtCore import QProcess, QTimer, Qt
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (QCheckBox, QColorDialog, QComboBox, QDialog, QFormLayout, QHBoxLayout, QLabel, QProgressBar,
                                QPushButton, QSlider, QVBoxLayout, QWidget)
 
@@ -87,6 +87,36 @@ def build_side(path, dpi, fix, quad, progress):
         card, ok = idscan.cut_quad(im, quad), True
     card, eff = scanfix.enhance(card, d, fix, progress)           # sharper card; eff = its real dpi now
     return {"path": path, "dpi": d, "card": card, "found": ok, "eff": eff, "quad": quad}
+
+
+class CornerSample(QWidget):
+    """A small card picture that shows how round the corners will be (same maths as the real cut, see idscan.corner_radius).
+    pct = 0 -> square corners."""
+    W, H = 112, 71                                       # the shape of a real card (85.6 x 54)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pct = idscan.ROUND_PCT
+        self.setFixedSize(self.W + 4, self.H + 4)
+        self.setToolTip("This is how the corners of the card will look")
+
+    def set_pct(self, pct):
+        self._pct = int(pct)
+        self.update()
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        # same proportion as the real cut (idscan.corner_radius) but without its 2 px minimum, so every step of the slider shows
+        r = min(idscan.CORNER_MM / 85.6 * self.W * 1.06 * self._pct / 100.0, self.H / 2.0) if self._pct > 0 else 0.0
+        p.setBrush(QColor("#e2e6ee"))
+        p.setPen(QPen(QColor("#4a5268"), 1))
+        rect = self.rect().adjusted(2, 2, -3, -3)
+        if r > 0:
+            p.drawRoundedRect(rect, r, r)
+        else:
+            p.drawRect(rect)
+        p.end()
 
 
 class ScanDialog(QDialog):
@@ -219,12 +249,15 @@ class ScanDialog(QDialog):
         self.lblRoundV = QLabel("")
         self.lblRoundV.setMinimumWidth(40)
         self.sldRound.valueChanged.connect(lambda v: self.lblRoundV.setText("%d%%" % v))
+        self.sampleRound = CornerSample()
+        self.sldRound.valueChanged.connect(lambda _v: self._round_sample())
         r5 = QHBoxLayout()
         r5.addWidget(self.chkRound)
         self.lblRoundT = QLabel("roundness")
         r5.addWidget(self.lblRoundT)
         r5.addWidget(self.sldRound, 1)
         r5.addWidget(self.lblRoundV)
+        r5.addWidget(self.sampleRound)
         self.lblRound = QLabel("Card corners")
         form.addRow(self.lblRound, r5)
         self.chkRound.toggled.connect(self._round_enable)
@@ -235,7 +268,7 @@ class ScanDialog(QDialog):
         form.addRow("", self.chkPreview)
         self._idrows = (self.cmbPage, self.cmbPlace, self.lblPage, self.chkBorder, self.btnBorderColor, self.sldBorder,
                         self.lblBorderW, self.lblBorder, self.chkPreview,
-                        self.chkRound, self.sldRound, self.lblRoundV, self.lblRound, self.lblRoundT)
+                        self.chkRound, self.sldRound, self.lblRoundV, self.lblRound, self.lblRoundT, self.sampleRound)
         root.addLayout(form)
 
         self.lblStep = QLabel("")
@@ -420,6 +453,11 @@ class ScanDialog(QDialog):
 
     def _round_enable(self, *_):
         self.sldRound.setEnabled(self.chkRound.isChecked())
+        self._round_sample()
+
+    def _round_sample(self):
+        """The small card picture next to the slider: round corners as chosen, or square when Round is off."""
+        self.sampleRound.set_pct(self._round())
 
     def _round(self):
         """How round the card corners are: 0 = square (switched off), else percent of a real card's corner."""
