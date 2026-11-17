@@ -75,20 +75,32 @@ def g_move(p):
     _line(p, 6, 9, 3, 12, 6, 15); _line(p, 18, 9, 21, 12, 18, 15)
 def g_erase(p): _line(p, 4, 16, 13, 5, 20, 12, 12, 20, 8, 20, 4, 16); _line(p, 8, 9, 16, 17); _line(p, 12, 20, 21, 20)
 def g_crop(p): _line(p, 7, 2.5, 7, 17, 21.5, 17); _line(p, 2.5, 7, 17, 7, 17, 21.5)
-def g_layer(p): _rrect(p, 8, 8, 12, 12, 2); _line(p, 4, 15, 4, 4, 15, 4)
+def g_layer(p): _rrect(p, 3.5, 3.5, 11, 11, 2); _rrect(p, 9.5, 9.5, 11, 11, 2)
 def g_text(p): _line(p, 5, 6, 5, 4, 19, 4, 19, 6); _line(p, 12, 4, 12, 20); _line(p, 9, 20, 15, 20)
 def g_prev(p): _line(p, 15, 5, 8, 12, 15, 19)
 def g_next(p): _line(p, 9, 5, 16, 12, 9, 19)
 def g_pl(p): _line(p, 11, 6, 5, 12, 11, 18); _line(p, 5, 12, 20, 12)
 def g_pr(p): _line(p, 13, 6, 19, 12, 13, 18); _line(p, 19, 12, 4, 12)
-def g_drop(p): _line(p, 12, 3, 6.5, 11); _line(p, 12, 3, 17.5, 11); _arc(p, 12, 14, 6.2, 207, -234)
+def g_drop(p):
+    path = QPainterPath()
+    path.moveTo(12, 3)
+    path.cubicTo(15.5, 7.5, 18.5, 10.5, 18.5, 14.5)
+    path.arcTo(QRectF(5.5, 8, 13, 13), 0, -180)
+    path.cubicTo(5.5, 10.5, 8.5, 7.5, 12, 3)
+    p.drawPath(path)
 def g_sun(p):
     import math
     p.drawEllipse(QPointF(12, 12), 4, 4)
     for i in range(8):
         a = math.radians(i * 45)
         _line(p, 12 + 6.6 * math.cos(a), 12 + 6.6 * math.sin(a), 12 + 9 * math.cos(a), 12 + 9 * math.sin(a))
-def g_sharp(p): _line(p, 12, 3, 14, 10, 21, 12, 14, 14, 12, 21, 10, 14, 3, 12, 10, 10, 12, 3)
+def g_sharp(p): _line(p, 12, 4, 21, 20, 3, 20, 12, 4); _line(p, 12, 10, 16, 17, 8, 17, 12, 10)
+def g_contrast(p):
+    p.drawEllipse(QPointF(12, 12), 8.5, 8.5)
+    p.setBrush(p.pen().color())
+    p.drawPie(QRectF(3.5, 3.5, 17, 17), 90 * 16, -180 * 16)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+def g_applyall(p): _rrect(p, 3, 8, 12, 13, 2); _line(p, 8, 8, 8, 4, 20, 4, 20, 16, 15, 16); _line(p, 6.5, 14.5, 8.5, 16.5, 12, 12)
 def g_image(p): _rrect(p, 3, 4, 18, 16); _dot(p, 8.5, 9.5, 1.8, False); _line(p, 4, 18, 10, 12, 14, 16, 17, 13, 20, 16)
 def g_aa(p): _line(p, 2.5, 19, 7.5, 5, 12.5, 19); _line(p, 4.4, 14.5, 10.6, 14.5); p.drawEllipse(QPointF(17.5, 15.2), 3.3, 3.3); _line(p, 20.8, 11.5, 20.8, 19)
 def g_layers(p): _line(p, 12, 3, 21, 8, 12, 13, 3, 8, 12, 3); _line(p, 3, 12.5, 12, 17.5, 21, 12.5); _line(p, 3, 16.5, 12, 21.5, 21, 16.5)
@@ -100,7 +112,7 @@ def g_keys(p): _rrect(p, 2.5, 6, 19, 12, 2.5); [_dot(p, x, 10, 0.8) for x in (7,
 
 
 GLYPHS = {k[2:]: v for k, v in list(globals().items()) if k.startswith("g_") and callable(v)}
-GLYPHS.update({"adjust": g_apply, "color": g_drop, "shadow": g_sun, "textfix": g_sharp, "picture": g_image,
+GLYPHS.update({"adjust": g_apply, "color": g_drop, "shadow": g_contrast, "textfix": g_sharp, "apply": g_applyall, "picture": g_image,
                "files": g_add, "phone": g_phone, "pageL": g_pl, "pageR": g_pr, "settings": g_gear, "shortcuts": g_keys})
 
 
@@ -194,3 +206,15 @@ def style_button(btn, name, text, keys="", size=20, label=None, caret=False, ext
     btn.style().unpolish(btn)
     btn.style().polish(btn)
     return btn
+
+
+def label_button(btn, text):
+    """Icon + short text when there is room (text = ""  ->  icon only)."""
+    text = text or ""
+    if btn.text() == text and bool(btn.property("lbl")) == bool(text):
+        return
+    btn.setText(text)
+    btn.setProperty("ico", not text)
+    btn.setProperty("lbl", bool(text))
+    btn.style().unpolish(btn)
+    btn.style().polish(btn)

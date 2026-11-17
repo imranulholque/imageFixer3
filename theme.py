@@ -200,6 +200,10 @@ QPushButton[chip="true"] { padding: 4px 12px 4px 8px; border-radius: 15px; }
 QPushButton[accent="true"][save="true"] { background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #16a34a, stop:1 #22c55e); }
 QPushButton[accent="true"][save="true"]:hover { background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #22c55e, stop:1 #4ade80); }
 QPushButton[ico="true"]:hover, QToolButton[ico="true"]:hover { background: #2a3150; border-color: #4a5380; }
+QPushButton[lbl="true"], QToolButton[lbl="true"] { background: transparent; border: 1px solid transparent; border-radius: 8px; padding: 4px 10px 4px 6px; font-weight: 600; font-size: 12px; }
+QPushButton[lbl="true"]:hover, QToolButton[lbl="true"]:hover { background: #2a3150; border-color: #4a5380; }
+QPushButton[lbl="true"]:checked, QToolButton[lbl="true"][active="true"] { background: #4f46e5; border-color: #6366f1; color: white; }
+QPushButton[lbl="true"]:disabled, QToolButton[lbl="true"]:disabled { background: transparent; border-color: transparent; color: #5d6475; }
 QFrame#vsep { background: #2a3042; max-width: 1px; min-width: 1px; margin: 6px 3px; }
 QPushButton#nav { min-width: 30px; max-width: 30px; padding: 2px; font-size: 14px; }
 QToolTip { border-radius: 6px; }

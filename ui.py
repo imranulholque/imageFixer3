@@ -20,7 +20,7 @@ import winutil
 from card import CLIP_FILES, CROP_KEYS, EXPORT_DIR, TOOL_KEYS, Card, export_path
 from feedback import DropOverlay, install_ripples
 from flow import ElidedLabel
-from icons import icon as _ico, style_button as _sb
+from icons import icon as _ico, style_button as _sb, label_button as _lb
 from savedlg import SaveAllDialog
 from jobs import JobRunner
 from updatedlg import UpdateManager
@@ -1221,6 +1221,17 @@ class MainWindow(QMainWindow):
         small = w < 700
         lay.setContentsMargins(*((6, 4, 6, 4) if small else (12, 6, 12, 6)))
         lay.setSpacing(2 if small else 4)
+
+        words = ((self.btnBlank, "Blank"), (self.btnScan, "Scan"), (self.btnPhone, "Phone"), (self.btnApplyAll, "Apply to all"))
+        for b_, word in words:                              # a word next to each icon - only if the whole bar still fits
+            _lb(b_, word)
+        for b_ in (self.lblBrand, self.btnFolder, self.btnOpenDir, self.btnClear, self.btnApplyAll, self.btnPhone, self.lblLogo):
+            b_.setVisible(True)
+        self.btnMore.setVisible(False)
+        lay.invalidate()
+        if lay.sizeHint().width() > w:
+            for b_, word in words:
+                _lb(b_, "")
 
         def step(k):
             self.lblBrand.setVisible(k < 1)

@@ -27,7 +27,7 @@ from compare import CompareOverlay
 from fullview import FullViewOverlay
 import scanner
 from flow import ElidedLabel, FlowLayout
-from icons import icon as _ico, style_button as _style_btn, color_of as _ico_color
+from icons import icon as _ico, style_button as _style_btn, color_of as _ico_color, label_button as _label_btn
 from jobs import _log, run_background
 
 EXPORT_DIR = os.path.join(tempfile.gettempdir(), "imagefixer_export")
@@ -960,9 +960,10 @@ class Card(QWidget):
         if ico:                                   # icon only (a tiny arrow shows it opens a menu); name + keys in the tooltip
             b.setIcon(_ico(ico, 20, caret=True))
             b.setIconSize(QSize(22, 22))
-            b.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
-            b.setText("")
-            b.setProperty("ico", True)
+            b.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+            b.setText(text)
+            b.setProperty("lbl", True)
+            b.iconmenu = True
             b.setToolTip(text + ("   " + keys if keys else "") + ("\n" + tip if tip else ""))
             b.base_tip = b.toolTip()
         return b
@@ -988,6 +989,9 @@ class Card(QWidget):
         S(self.btnLayerDone, "prev", "Back to the page", "Esc", label="Back")
         S(self.btnApply, "check", "Apply", "Enter", label="Apply")
         S(self.btnCancel, "close", "Cancel", "Esc", label="Cancel")
+        for b_, word in ((self.btnHand, "Hand"), (self.btnPick, "Pick"), (self.btnPaint, "Paint"),
+                         (self.btnLayerTop, "Layer"), (self.btnText, "Text")):
+            _label_btn(b_, word)
         for b in (self.btnLayerDone, self.btnApply, self.btnCancel):
             b.setProperty("ico", False)
             b.style().unpolish(b)
@@ -1554,6 +1558,10 @@ class Card(QWidget):
         # --- text of the top row
         self.lblInfo.setVisible(not narrow)
         self.lblState.setVisible(w >= 520)
+        wide = w >= 880
+        for b_, word in ((self.btnCompare, "Compare"), (self.btnPreview, "Preview"), (self.btnUpscale, "Upscale"),
+                         (self.btnReset, "Reset"), (self.btnPanel, "Panel")):
+            _label_btn(b_, word if wide else "")
         self._r1.setSpacing(4 if compact else 8)
         self._root.setContentsMargins(*((6, 4, 4, 2) if compact or short else (10, 6, 8, 4)))
         self._root.setSpacing(3 if short else 4)
@@ -1664,12 +1672,12 @@ class Card(QWidget):
                 b.setToolTip("Add / remove a border on the selected layer(s) and choose its colour and thickness.\n"
                              "Only this tab changes a border: brightness, sharpness, shadow removal ... never touch it.")
             _style_btn(b, ("adjust", "color", "shadow", "textfix", "picture", "aa", "layers", "border")[i], n,
-                       "", extra_tip=b.toolTip())
+                       "", label=("Textbox" if n == "Aa" else n), size=18, extra_tip=b.toolTip())
             b.setProperty("tab", True)
             _tc = _ico_color(("adjust", "color", "shadow", "textfix", "picture", "aa", "layers", "border")[i])
             b.setStyleSheet("QPushButton:checked { border-bottom: 3px solid %s; background: #1a1f2e; }" % _tc)
             self.tabGroup.addButton(b, i)
-            tabs.addWidget(b, 0, i)
+            tabs.addWidget(b, i // 3, i % 3)
         self.tabGroup.button(0).setChecked(True)
         v.addLayout(tabs)
 
@@ -5608,7 +5616,7 @@ class Card(QWidget):
         for fam, keys in (("select", SELECT_KEYS), ("move", MOVE_KEYS), ("erase", ERASE_KEYS), ("crop", CROP_KEYS)):
             b = self.menus[fam]
             on = key in keys
-            if b.toolButtonStyle() == Qt.ToolButtonStyle.ToolButtonIconOnly:
+            if getattr(b, "iconmenu", False):
                 b.setToolTip(b.base_tip + (("\n\u25cf Active: " + NAMES[key]) if on else ""))
             else:
                 b.setText((b.base_text + ": " + NAMES[key] if on else b.base_text) + "  ▾")
