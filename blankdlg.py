@@ -18,6 +18,7 @@ PRESETS = [("White", "#ffffff"), ("Black", "#000000"), ("Light grey", "#d9d9d9")
 # (label, width px, height px).  Paper sizes at 200 dpi, like the pages of a PDF are drawn.
 SIZES = [("A4 portrait  (1654 x 2339)", 1654, 2339), ("A4 landscape  (2339 x 1654)", 2339, 1654),
          ("A5 portrait  (1169 x 1654)", 1169, 1654), ("Letter portrait  (1700 x 2200)", 1700, 2200),
+         ("Legal portrait  (1700 x 2800)", 1700, 2800),
          ("Square  (1080 x 1080)", 1080, 1080), ("Full HD  (1920 x 1080)", 1920, 1080),
          ("Phone story  (1080 x 1920)", 1080, 1920), ("ID card page, A4 at 300 dpi  (2480 x 3508)", 2480, 3508)]
 MAX_SIDE = 8000
