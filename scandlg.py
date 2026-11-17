@@ -10,9 +10,11 @@ import tempfile
 import time
 
 from PySide6.QtCore import QProcess, QTimer, Qt
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QFormLayout, QHBoxLayout, QLabel, QProgressBar, QPushButton,
-                               QVBoxLayout, QWidget)
+from PySide6.QtGui import QColor
+from PySide6.QtWidgets import (QCheckBox, QColorDialog, QComboBox, QDialog, QFormLayout, QHBoxLayout, QLabel, QProgressBar,
+                               QPushButton, QSlider, QVBoxLayout, QWidget)
 
+import idpreview
 import idscan
 import jobs
 import scanfix
@@ -66,6 +68,27 @@ def read_events(path):
     return out
 
 
+def build_side(path, dpi, fix, quad, progress):
+    """One scanned page -> one card side (worker thread).  quad = the 4 corners chosen by hand (Corner crop), or None =
+    find the card by itself.  -> {"path", "dpi", "card", "found", "eff", "quad"}"""
+    from PIL import Image
+    im = Image.open(path)
+    im.load()
+    d = dpi
+    try:                                       # the scanner may have used another dpi than asked: the file knows
+        m = im.info.get("dpi")
+        if m and 100 <= float(m[0]) <= 1200 and abs(float(m[0]) - dpi) > 0.05 * dpi:
+            d = float(m[0])
+    except Exception:
+        pass
+    if quad is None:
+        card, ok = idscan.cut_card(im, d)
+    else:
+        card, ok = idscan.cut_quad(im, quad), True
+    card, eff = scanfix.enhance(card, d, fix, progress)           # sharper card; eff = its real dpi now
+    return {"path": path, "dpi": d, "card": card, "found": ok, "eff": eff, "quad": quad}
+
+
 class ScanDialog(QDialog):
     def __init__(self, win):
         super().__init__(win)
@@ -78,6 +101,8 @@ class ScanDialog(QDialog):
         self._procs = []                  # running list jobs
         self._proc = None                 # the running scan
         self._front = None                # ID card: the FRONT picture while we wait for the BACK
+        self._front_side = None           # ... and everything about it (scan file, corners) for the Corner crop
+        self._bcolor = idscan.BORDER_COLOR
         self._busy = False
         self._n = 0
         self._found = []
@@ -159,6 +184,37 @@ class ScanDialog(QDialog):
         self.lblPage = QLabel("ID card page")
         form.addRow(self.lblPage, r3)
         self._r3 = (self.cmbPage, self.cmbPlace)
+
+        # border of the card layers: colour + thickness (they can be changed later in the Border tab, too)
+        self.chkBorder = QCheckBox("Border")
+        self.chkBorder.setToolTip("A frame around each card (front and back). Colour and thickness can be changed any time\n"
+                                  "later in the Border tab; nothing else (brightness, sharpness ...) changes it.")
+        self.btnBorderColor = QPushButton()
+        self.btnBorderColor.setFixedSize(40, 26)
+        self.btnBorderColor.setToolTip("Border colour")
+        self.btnBorderColor.clicked.connect(self._pick_border_color)
+        self.sldBorder = QSlider(Qt.Orientation.Horizontal)
+        self.sldBorder.setRange(1, 40)
+        self.sldBorder.setToolTip("Border thickness")
+        self.lblBorderW = QLabel("")
+        self.lblBorderW.setMinimumWidth(24)
+        self.sldBorder.valueChanged.connect(lambda v: self.lblBorderW.setText(str(v)))
+        r4 = QHBoxLayout()
+        r4.addWidget(self.chkBorder)
+        r4.addWidget(self.btnBorderColor)
+        r4.addWidget(QLabel("thickness"))
+        r4.addWidget(self.sldBorder, 1)
+        r4.addWidget(self.lblBorderW)
+        self.lblBorder = QLabel("Card border")
+        form.addRow(self.lblBorder, r4)
+        self.chkBorder.toggled.connect(self._border_enable)
+        self.chkPreview = QCheckBox("Preview each side (front, back) before joining")
+        self.chkPreview.setToolTip("After the FRONT and again after the BACK you see how the card will look (corners + border).\n"
+                                   "OK = go on, Corner crop = drag the 4 corners yourself, Scan again = scan this side again.\n"
+                                   "Switch it off to put the card on the page at once.")
+        form.addRow("", self.chkPreview)
+        self._idrows = (self.cmbPage, self.cmbPlace, self.lblPage, self.chkBorder, self.btnBorderColor, self.sldBorder,
+                        self.lblBorderW, self.lblBorder, self.chkPreview)
         root.addLayout(form)
 
         self.lblStep = QLabel("")
@@ -325,8 +381,39 @@ class ScanDialog(QDialog):
             self.chkFeed.setChecked(self.st.value("scan/feeder", False, type=bool))
             self.chkDuplex.setChecked(self.st.value("scan/duplex", False, type=bool))
             self.chkClose.setChecked(self.st.value("scan/autoclose", True, type=bool))
+            self.chkPreview.setChecked(self.st.value("scan/preview", True, type=bool))
         except Exception:
             pass
+        self._load_border()
+
+    def _load_border(self):
+        """The border settings are shared with the Border tab (when no layer is selected it changes these)."""
+        try:
+            self.chkBorder.setChecked(self.st.value("scan/border_on", True, type=bool))
+            self._bcolor = str(self.st.value("scan/border_color", idscan.BORDER_COLOR, type=str) or idscan.BORDER_COLOR)
+            self.sldBorder.setValue(max(1, min(40, int(self.st.value("scan/border_w", idscan.BORDER_W) or idscan.BORDER_W))))
+        except Exception:
+            pass
+        self.lblBorderW.setText(str(self.sldBorder.value()))
+        self._paint_border_color()
+        self._border_enable()
+
+    def _paint_border_color(self):
+        self.btnBorderColor.setStyleSheet("background: %s; border-radius: 6px; border: 1px solid #4a5268;" % self._bcolor)
+
+    def _border_enable(self, *_):
+        on = self.chkBorder.isChecked()
+        self.btnBorderColor.setEnabled(on)
+        self.sldBorder.setEnabled(on)
+
+    def _pick_border_color(self):
+        c = QColorDialog.getColor(QColor(self._bcolor), self, "Border colour")
+        if c.isValid():
+            self._bcolor = c.name()
+            self._paint_border_color()
+
+    def _border(self):
+        return idscan.make_border(self.chkBorder.isChecked(), self._bcolor, self.sldBorder.value())
 
     def _save_settings(self):
         for key, cmb in (("mode", self.cmbMode), ("size", self.cmbSize), ("dpi", self.cmbDpi), ("fix", self.cmbFix), ("color", self.cmbCol),
@@ -336,6 +423,10 @@ class ScanDialog(QDialog):
         self.st.setValue("scan/feeder", self.chkFeed.isChecked())
         self.st.setValue("scan/duplex", self.chkDuplex.isChecked())
         self.st.setValue("scan/autoclose", self.chkClose.isChecked())
+        self.st.setValue("scan/preview", self.chkPreview.isChecked())
+        self.st.setValue("scan/border_on", self.chkBorder.isChecked())
+        self.st.setValue("scan/border_color", self._bcolor)
+        self.st.setValue("scan/border_w", int(self.sldBorder.value()))
         d = self.cmbDev.currentData()
         if d:
             self.st.setValue("scan/device", d["kind"] + "|" + d["id"])
@@ -343,6 +434,8 @@ class ScanDialog(QDialog):
     # ------------------------------------------------------------ show
     def show_front(self):
         first = not self.isVisible()
+        if first:
+            self._load_border()               # the Border tab may have changed the shared settings meanwhile
         self.show()
         self.raise_()
         self.activateWindow()
@@ -446,7 +539,7 @@ class ScanDialog(QDialog):
 
     def _mode_changed(self, *_):
         idm = self._id_mode()
-        for w in (self.cmbPage, self.cmbPlace, self.lblPage):
+        for w in self._idrows:
             w.setVisible(idm)
         self.chkDuplex.setVisible(self.chkFeed.isChecked())
         self.btnAgain.setVisible(idm and self._front is not None)
@@ -475,6 +568,7 @@ class ScanDialog(QDialog):
 
     def _reset_id(self):
         self._front = None
+        self._front_side = None
         self.lblMsg.setText("")
         self._update_step()
 
@@ -488,8 +582,14 @@ class ScanDialog(QDialog):
     def _busy_set(self, busy):
         self._busy = busy
         for w in (self.cmbDev, self.btnRefresh, self.cmbMode, self.cmbSize, self.cmbDpi, self.cmbCol, self.chkUi,
-                  self.chkFeed, self.chkDuplex, self.chkClose, self.cmbPage, self.cmbPlace, self.btnAgain):
+                  self.chkFeed, self.chkDuplex, self.chkClose, self.cmbPage, self.cmbPlace, self.btnAgain,
+                  self.chkBorder, self.chkPreview, self.cmbFix):
             w.setEnabled(not busy)
+        if not busy:
+            self._border_enable()
+        else:
+            self.btnBorderColor.setEnabled(False)
+            self.sldBorder.setEnabled(False)
         if busy:
             self.btnScan.setText("Cancel")
             self.btnScan.setEnabled(True)
@@ -592,58 +692,117 @@ class ScanDialog(QDialog):
             self._to_png(pages, dpi, fix)
             return
         self.lblMsg.setText("Cutting the card out ...")
-        front, back = self._front, None
         both = self._both_in_one()
-        page, place = self.cmbPage.currentData(), self.cmbPlace.currentData()
-        want_back = front is not None
+        want_back = self._front_side is not None
 
         def work(progress):
-            from PIL import Image
-            imgs = [Image.open(p) for p in pages]
-            for im in imgs:
-                im.load()
-            cards = []
-            for i, im in enumerate(imgs):
-                progress(i / len(imgs), "cutting the card out")
-                d = dpi
-                try:                                      # the scanner may have used another dpi than asked: the file knows
-                    m = im.info.get("dpi")
-                    if m and 100 <= float(m[0]) <= 1200 and abs(float(m[0]) - dpi) > 0.05 * dpi:
-                        d = float(m[0])
-                except Exception:
-                    pass
-                card, ok = idscan.cut_card(im, d)
-                card, eff = scanfix.enhance(card, d, fix,           # sharper card; eff = its real dpi now
-                                            lambda f, t="", i=i: progress((i + 0.3 + 0.7 * f) / len(imgs), t))
-                cards.append((card, ok, eff))
-            return cards
+            sides = []
+            for i, p in enumerate(pages):
+                progress(i / len(pages), "cutting the card out")
+                sides.append(build_side(p, dpi, fix, None,
+                                        lambda f, t="", i=i: progress((i + 0.3 + 0.7 * f) / len(pages), t)))
+            return sides
 
-        def done(cards):
-            nonlocal front, back, dpi
-            found = [c[1] for c in cards]
-            dpi = int(round(max(c[2] for c in cards)))            # the page is made at the dpi of the (enlarged) cards
-            cards = [(c[0], c[1]) for c in cards]
-            if both and len(cards) >= 2:
-                front, back = cards[0][0], cards[1][0]
+        def done(sides):
+            if both and len(sides) >= 2:
+                self._review(sides[:2], "both")
             elif both:
-                front = cards[0][0]
-                self._front = front
-                self._prog_hide(600)        # the work is finished: stop the bar / timer (it stayed at 99% and kept counting)
+                self._front_side = sides[0]
+                self._front = sides[0]["card"]
+                self._prog_hide(600)        # the work is finished: stop the bar / timer
                 self.lblMsg.setText("The scanner gave only 1 page. Scan the BACK now.")
                 self._update_step()
-                return
             elif not want_back:
-                self._front = cards[0][0]
-                self._prog_hide(600)        # the work is finished: stop the bar / timer (it stayed at 99% and kept counting)
-                self.lblMsg.setText("Front scanned%s." % ("" if found[0] else " (the card was not found, the whole scan is used)"))
-                self._update_step()
-                self._mode_changed()
-                return
+                self._review([sides[0]], "front")
             else:
-                back = cards[0][0]
-            self._front = None
-            self._finish_id(front, back, dpi, page, place, all(found))
+                self._review([self._front_side, sides[0]], "back")
         jobs.run_background(work, done, lambda m: self._fail(m), self._prog_proc)
+
+    # ------------------------------------------------------------ preview / corner crop / OK
+    def _review(self, sides, stage):
+        """stage: "front" (only the front is done), "back" (front kept + the back just scanned), "both" (duplex)."""
+        self._prog_hide(600)                      # the work is finished: stop the bar / timer
+        if not self.chkPreview.isChecked():       # preview switched off: everything is accepted at once
+            self._review_ok(sides, stage)
+            return
+        self._show_preview(sides, stage)
+
+    def _show_preview(self, sides, stage):
+        names = ["Front"] if stage == "front" else ["Front", "Back"]
+        image = idscan.preview_image([(s["card"], s["found"]) for s in sides], self._border())
+        lost = [n for n, s in zip(names, sides) if not s["found"]]
+        text = {"front": "FRONT: this is how it will look on the page. OK, then you scan the BACK.",
+                "back": "FRONT and BACK: this is how they will look. OK puts them together on one page.",
+                "both": "FRONT and BACK: this is how they will look. OK puts them together on one page."}[stage]
+        if lost:
+            text += "\n(The card was not found in the scan of: %s. Use Corner crop to mark it.)" % ", ".join(lost)
+        dlg = idpreview.PreviewDialog(self, "ID card preview", text, image, names)
+        dlg.exec()
+        act = dlg.action
+        if act == "ok":
+            self._review_ok(sides, stage)
+        elif isinstance(act, tuple):
+            self._crop_side(sides, stage, act[1])
+        else:
+            self._review_again(stage)
+
+    def _crop_side(self, sides, stage, i):
+        """Corner crop: the person drags the 4 corners onto the card; the side is cut again from the original scan."""
+        from PIL import Image
+        s = sides[i]
+        try:
+            im = Image.open(s["path"])
+            im.load()
+            quad = s.get("quad")
+            if quad is None:
+                quad, _ = idscan.initial_quad(im, s["dpi"])
+            dlg = idpreview.CornerDialog(self, im, [tuple(p) for p in quad],
+                                         "Corner crop: " + ("Front" if i == 0 else "Back"))
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                self._show_preview(sides, stage)
+                return
+        except Exception as ex:
+            self.lblMsg.setText("Corner crop failed: %s" % ex)
+            self._show_preview(sides, stage)
+            return
+        q = dlg.quad()
+        fix = self.cmbFix.currentData()
+        self.lblMsg.setText("Cutting the card with your corners ...")
+
+        def work(progress):
+            return build_side(s["path"], s["dpi"], fix, q, progress)
+
+        def done(ns):
+            sides[i] = ns
+            if i == 0 and stage == "back":                # the kept front changed
+                self._front_side, self._front = ns, ns["card"]
+            self.lblMsg.setText("")
+            self._show_preview(sides, stage)
+        jobs.run_background(work, done, lambda m: self._fail(m), self._prog_proc)
+
+    def _review_again(self, stage):
+        if stage == "back":                                # the front stays, only the back is scanned again
+            self.lblMsg.setText("Scan the BACK again.")
+        else:
+            self._front = None
+            self._front_side = None
+            self.lblMsg.setText("Scan the FRONT again." if stage == "front" else "Scan the card again.")
+        self._update_step()
+        self._mode_changed()
+
+    def _review_ok(self, sides, stage):
+        if stage == "front":
+            self._front_side = sides[0]
+            self._front = sides[0]["card"]
+            self.lblMsg.setText("Front scanned%s." % ("" if sides[0]["found"] else " (the card was not found, the whole scan is used)"))
+            self._update_step()
+            self._mode_changed()
+            return
+        dpi = int(round(max(s["eff"] for s in sides)))           # the page is made at the dpi of the (enlarged) cards
+        page, place = self.cmbPage.currentData(), self.cmbPlace.currentData()
+        self._front = None
+        self._front_side = None
+        self._finish_id(sides[0]["card"], sides[1]["card"], dpi, page, place, all(s["found"] for s in sides))
 
     def _fail(self, msg):
         self._prog_hide()
@@ -651,6 +810,8 @@ class ScanDialog(QDialog):
         self._update_step()
 
     def _finish_id(self, front, back, dpi, page, place, all_found):
+        border = self._border()                                  # colour + thickness chosen now (changeable later: Border tab)
+
         def work(progress):
             progress(0.9, "putting the page together")
             pg, items = idscan.compose_page(front, back, dpi, page, place, rounded=all_found)
@@ -660,7 +821,7 @@ class ScanDialog(QDialog):
 
         def done(r):
             path, items = r
-            self.win.scan_id_page(path, items)
+            self.win.scan_id_page(path, items, border)
             self._prog_hide(1200)
             self.lblMsg.setText("ID card page is ready (front and back are two layers)." +
                                 ("" if all_found else "  Note: a card was not found in a scan, the whole scan was used."))

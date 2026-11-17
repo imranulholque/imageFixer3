@@ -285,3 +285,20 @@ NEW (update notice)
 - The update question pops up at EVERY start of the program (and every time the window comes back from the tray) while an update waits.
   The update found is remembered, so it is shown even if the internet is not ready yet at start.
 - The check runs 2.5 s after start, then every 3 minutes; a failed check is tried again after 45 s.  It needs a PUBLIC repository.
+
+
+ID CARD: BORDER, PREVIEW AND CORNER CROP
+----------------------------------------
+Scan window, "ID card" mode:
+  * Card border: switch on / off, choose the COLOUR and the THICKNESS (1 - 40) before the scan.
+  * "Preview each side (front, back) before joining": after the FRONT you see a small preview (round corners + border),
+    after the BACK you see both. OK = go on / put them on one page, Scan again = scan that side again,
+    Corner crop = drag the 4 corners onto the card yourself (use it when the card was cut out wrong).
+    Switch the checkbox off to put the card on the page at once.
+Border tab (side panel, new):
+  * Select a layer (Layers tab or click it on the page; Ctrl + click = several) and change its border: add / remove,
+    colour, thickness, "Use this border on ALL layers". It works on every layer (pictures and text boxes), also on
+    layers that are not from an ID card scan, and every change is one Undo step.
+  * With no layer selected the tab shows the border that the next ID card scan will use.
+  * The border is drawn on the finished layer: brightness, contrast, sharpness, shadow removal, colours, tint and
+    opacity never change its colour. Only the Border tab changes it.

@@ -11,12 +11,14 @@ import numpy as np
 from PIL import Image, ImageChops, ImageFilter, ImageOps
 from PySide6.QtCore import QEvent, QMimeData, QObject, QPointF, QRectF, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtCore import QRect
+from PySide6.QtWidgets import QGridLayout
 from PySide6.QtGui import QColor, QDrag, QIcon, QImage, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (QSplitter, QApplication, QButtonGroup, QCheckBox, QColorDialog, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu,
                                QAbstractItemView, QAbstractButton, QAbstractSlider, QAbstractSpinBox, QComboBox, QPushButton, QScrollArea, QSizePolicy, QSlider, QStackedWidget, QStyle, QStyledItemDelegate, QToolButton,
                                QVBoxLayout, QWidget)
 
 import core
+import idscan
 import spill
 import textbox
 from canvas import ImageCanvas, np_to_qimage
@@ -759,7 +761,7 @@ class LayerList(QListWidget):
 
 
 class Card(QWidget):
-    TAB_ADJUST, TAB_COLOR, TAB_SHADOW, TAB_TEXT, TAB_PICTURE, TAB_TEXTBOX, TAB_LAYERS = range(7)   # order of the side tabs
+    TAB_ADJUST, TAB_COLOR, TAB_SHADOW, TAB_TEXT, TAB_PICTURE, TAB_TEXTBOX, TAB_LAYERS, TAB_BORDER = range(8)   # order of the side tabs
     SIDE_W = 350                                                                     # width of the side panel (shared, drag to change)
     NARROW_W = 720                                                                   # a narrower picture card: the panel goes UNDER the picture
     SHORT_H = 520                                                                    # a lower card: the hint line is hidden (warnings still show)
@@ -1537,12 +1539,13 @@ class Card(QWidget):
         v = QVBoxLayout(side)
         v.setContentsMargins(12, 8, 6, 8)
         v.setSpacing(6)
-        tabs = QHBoxLayout()
-        tabs.setSpacing(0)
+        tabs = QGridLayout()
+        tabs.setHorizontalSpacing(0)
+        tabs.setVerticalSpacing(0)
         self.tabGroup = QButtonGroup(self)
         self.tabGroup.setExclusive(True)
         self.stackPages = QStackedWidget()
-        names = ("Adjust", "Color", "Shadow", "Text", "Picture", "Aa", "Layers")
+        names = ("Adjust", "Color", "Shadow", "Text", "Picture", "Aa", "Layers", "Border")
         for i, n in enumerate(names):
             b = QPushButton(n)
             b.setCheckable(True)
@@ -1553,8 +1556,11 @@ class Card(QWidget):
                 b.setToolTip("Text box: write Bangla / English text on the page (font, size, color, bold ...)")
             elif n == "Layers":
                 b.setToolTip("All pictures and text boxes on the page: drag up / down to change which one is in front")
+            elif n == "Border":
+                b.setToolTip("Add / remove a border on the selected layer(s) and choose its colour and thickness.\n"
+                             "Only this tab changes a border: brightness, sharpness, shadow removal ... never touch it.")
             self.tabGroup.addButton(b, i)
-            tabs.addWidget(b, 1)
+            tabs.addWidget(b, i // 4, i % 4)
         self.tabGroup.button(0).setChecked(True)
         v.addLayout(tabs)
 
@@ -1917,6 +1923,58 @@ class Card(QWidget):
         lay.addWidget(g)
         lay.addStretch(1)
         self.stackPages.addWidget(pg)
+
+        # ---------------- Border: a frame around the selected layer(s); colour + thickness; only changed HERE
+        pg, lay = self._page()
+        g, gl = self._group_box("Border", collapsible=False)
+        self._border_sync = False
+        self._border_hex = idscan.BORDER_COLOR
+        self.lblBorderFor = QLabel("")
+        self.lblBorderFor.setObjectName("hint")
+        self.lblBorderFor.setWordWrap(True)
+        gl.addWidget(self.lblBorderFor)
+        self.chkBorderOn = QCheckBox("Show a border  (switch off = remove the border)")
+        gl.addWidget(self.chkBorderOn)
+        crow = QHBoxLayout()
+        crow.setSpacing(6)
+        self.btnBorderColor = QPushButton()
+        self.btnBorderColor.setFixedSize(40, 30)
+        self.btnBorderColor.setToolTip("Border colour. Click to choose another colour.")
+        self.edBorderHex = QLineEdit()
+        self.edBorderHex.setFixedWidth(84)
+        self.edBorderHex.setMaxLength(7)
+        self.edBorderHex.setToolTip("Colour as #RRGGBB")
+        crow.addWidget(QLabel("Colour"))
+        crow.addWidget(self.btnBorderColor)
+        crow.addWidget(self.edBorderHex)
+        crow.addStretch(1)
+        gl.addLayout(crow)
+        self.borderRow = SliderRow("Thickness", 1, 40, idscan.BORDER_W, ("thin", "", "thick"),
+                                   "How thick the border is (relative to the size of the picture).", "")
+        gl.addWidget(self.borderRow)
+        self.btnBorderAll = QPushButton("Use this border on ALL layers")
+        self.btnBorderAll.setToolTip("Puts the border you see here on every picture / text box of the page\n"
+                                     "(with 'Show a border' switched off it removes the border from all of them).")
+        gl.addWidget(self.btnBorderAll)
+        hb = QLabel("Select one layer (or Ctrl + click several) in the Layers tab or on the page, then change its border here. "
+                    "The border is drawn on the finished layer, so brightness, sharpness, shadow removal, colours and "
+                    "opacity never change its colour: only this tab does.")
+        hb.setObjectName("hint")
+        hb.setWordWrap(True)
+        gl.addWidget(hb)
+        lay.addWidget(g)
+        lay.addStretch(1)
+        self.stackPages.addWidget(pg)
+        self._border_icon_timer = QTimer(self)
+        self._border_icon_timer.setSingleShot(True)
+        self._border_icon_timer.setInterval(250)
+        self._border_icon_timer.timeout.connect(self._fill_layer_list)
+        self.chkBorderOn.toggled.connect(lambda _=False: self._border_changed("on"))
+        self.btnBorderColor.clicked.connect(self._pick_border_color)
+        self.edBorderHex.editingFinished.connect(self._border_hex_edited)
+        self.borderRow.changed.connect(lambda v: self._border_changed("width"))
+        self.btnBorderAll.clicked.connect(self._border_all)
+        self._paint_border_swatch()
 
         # ---------------- Save / share: no tab any more - the window's top bar (Save v) calls the same actions.
         # These buttons are kept (not shown) so the existing enable / disable and signals keep working.
@@ -2620,7 +2678,7 @@ class Card(QWidget):
         """The layer's picture for drawing on screen: big (sharp when zoomed in), kept until the layer changes."""
         if self._live_cache is None:
             self._live_cache = {}
-        sig = (id(l["rgb"]), id(l["a"]), l.get("opacity", 100))
+        sig = (id(l["rgb"]), id(l["a"]), l.get("opacity", 100), l.get("border"))
         hit = self._live_cache.get(l["id"])
         if hit is not None and hit[0] == sig:
             return hit[2]
@@ -3400,9 +3458,10 @@ class Card(QWidget):
             self.canvas.set_tf_image(self._layer_qimage(l))                # the finished picture of the text
             self.canvas.setFocus()
 
-    def add_fixed_layers(self, items):
+    def add_fixed_layers(self, items, border=None):
         """Pictures that are put on the page exactly where they belong (the scanned ID card: front and back).
-        items = [(name, PIL picture, (x0, y0, x1, y1) as fractions of the page)].  Nothing is cut away from them."""
+        items = [(name, PIL picture, (x0, y0, x1, y1) as fractions of the page)].  Nothing is cut away from them.
+        border = ((r, g, b), thickness) chosen in the Scan window, or None = no border (the Border tab changes it later)."""
         self.ensure_loaded()
         if not self._loaded or self.ctx is not None:
             return
@@ -3416,7 +3475,7 @@ class Card(QWidget):
             new.append({"id": self._layer_seq, "name": name, "rgb": rgb, "a": alpha, "src": rgb,
                         "sa": None, "bg": bg, "grid": [(x0, y0), (x1, y0), (x0, y1), (x1, y1)], "n": 1,
                         "opacity": 100, "visible": True,
-                        "border": ((135, 135, 135), 0.006)})      # grey frame: a white card is seen on the white page
+                        "border": border})
         self.layers = self.layers + new
         self.ops += 1
         self.sel_layer = None
@@ -4184,15 +4243,133 @@ class Card(QWidget):
             self.message.emit("Background problem: " + msg.splitlines()[0])
         run_background(work, done, fail)
 
-    # ---- the Layers tab
-    _skip_click = False
+    # ---- the Border tab
+    def _border_targets(self):
+        """The layers the Border tab works on: the selected one, or all Ctrl-selected ones (text boxes too)."""
+        ids = set(self.sel_group)
+        if self.sel_layer is not None:
+            ids.add(self.sel_layer)
+        if self._place_id is not None:
+            ids.add(self._place_id)
+        return [l["id"] for l in self.layers if l["id"] in ids]
+
+    def _border_state(self):
+        return idscan.make_border(self.chkBorderOn.isChecked(), self._border_hex, self.borderRow.value())
+
+    def _paint_border_swatch(self):
+        self.btnBorderColor.setStyleSheet("background: %s; border-radius: 7px; border: 1px solid #4a5268;" % self._border_hex)
+        self.edBorderHex.setText(self._border_hex)
+
+    def _border_enable_ui(self):
+        on = self.chkBorderOn.isChecked()
+        for w in (self.btnBorderColor, self.edBorderHex, self.borderRow):
+            w.setEnabled(on)
+
+    def _pick_border_color(self):
+        c = QColorDialog.getColor(QColor(self._border_hex), self, "Border colour")
+        if c.isValid():
+            self._border_hex = c.name()
+            self._paint_border_swatch()
+            self.chkBorderOn.blockSignals(True)
+            self.chkBorderOn.setChecked(True)          # choosing a colour means: I want the border
+            self.chkBorderOn.blockSignals(False)
+            self._border_changed("color")
+
+    def _border_hex_edited(self):
+        t = self.edBorderHex.text().strip()
+        if not t.startswith("#"):
+            t = "#" + t
+        if len(t) == 7 and all(ch in "0123456789abcdefABCDEF" for ch in t[1:]):
+            self._border_hex = t.lower()
+            self._paint_border_swatch()
+            self._border_changed("color")
+        else:
+            self.edBorderHex.setText(self._border_hex)
+
+    def _border_changed(self, what):
+        """what = "on" | "color" | "width".  With a layer selected its border changes (one Undo step; a drag of the
+        thickness slider is one step); with no layer selected these are the settings of the NEXT ID card scan."""
+        if self._border_sync:
+            return
+        self._border_enable_ui()
+        ids = self._border_targets()
+        b = self._border_state()
+        if not ids or not self._loaded:
+            try:                                           # shared with the Scan window
+                p = _prefs()
+                p.setValue("scan/border_on", self.chkBorderOn.isChecked())
+                p.setValue("scan/border_color", self._border_hex)
+                p.setValue("scan/border_w", int(self.borderRow.value()))
+            except Exception:
+                pass
+            return
+        if what == "width":
+            self._begin_change()
+        else:
+            self._checkpoint("Border")
+        self._set_border(ids, b)
+
+    def _set_border(self, ids, b):
+        ids = set(ids)
+        self.layers = [dict(l, border=b) if l["id"] in ids else l for l in self.layers]
+        self.ops += 1
+        self._touch()
+        self._sync_live()
+        self._timer.start()
+        pid = self._place_id
+        if self._tool == "transform" and pid in ids and self._layer(pid) is not None:
+            self.canvas.set_tf_image(self._layer_qimage(self._layer(pid)))
+        self._border_icon_timer.start()                    # the small pictures in the Layers tab follow a moment later
+
+    def _border_all(self):
+        if not self.layers or not self._loaded:
+            return
+        self._checkpoint("Border")
+        self._set_border([l["id"] for l in self.layers], self._border_state())
+        self._notify("border", "Border on every layer" if self.chkBorderOn.isChecked() else "Border removed from every layer", "")
+
+    def _sync_border_ui(self):
+        """The Border tab shows the border of the selected layer(s) - or, with nothing selected, the settings that the
+        next ID card scan will use."""
+        if not hasattr(self, "borderRow"):
+            return
+        ids = self._border_targets()
+        self._border_sync = True
+        try:
+            if ids:
+                ls = [self._layer(i) for i in ids]
+                b = ls[0].get("border")
+                if b:
+                    (r, g, bl), frac = b
+                    self._border_hex = "#%02x%02x%02x" % (r, g, bl)
+                    self.borderRow.set_value(max(1, min(40, int(round(frac * 1000)))))
+                self.chkBorderOn.setChecked(bool(b))
+                names = ", ".join(l["name"] for l in ls[:3]) + (" +%d more" % (len(ls) - 3) if len(ls) > 3 else "")
+                self.lblBorderFor.setText("Border of:  %s%s" % (names, "  (shows the first one)" if len(ls) > 1 else ""))
+            else:
+                p = _prefs()
+                self.chkBorderOn.setChecked(p.value("scan/border_on", True, type=bool))
+                self._border_hex = str(p.value("scan/border_color", idscan.BORDER_COLOR, type=str) or idscan.BORDER_COLOR)
+                try:
+                    self.borderRow.set_value(max(1, min(40, int(p.value("scan/border_w", idscan.BORDER_W) or idscan.BORDER_W))))
+                except Exception:
+                    self.borderRow.set_value(idscan.BORDER_W)
+                self.lblBorderFor.setText("No layer is selected: this is the border the next ID card scan will use. "
+                                          "Click a layer (Layers tab or on the page) to change its own border.")
+            self._paint_border_swatch()
+        finally:
+            self._border_sync = False
+        self._border_enable_ui()
+        self.btnBorderAll.setEnabled(bool(self.layers))
+
+    def _fill_layer_list(self):    _skip_click = False
     _icon_cache = None
 
     def _layer_icon(self, l):
         """A small picture of the layer for the list (kept until the layer changes)."""
         if self._icon_cache is None:
             self._icon_cache = {}
-        key = (l["id"], id(l["rgb"]), id(l["a"]), l.get("opacity", 100))
+        key = (l["id"], id(l["rgb"]), id(l["a"]), l.get("opacity", 100), l.get("border"))
         hit = self._icon_cache.get(key)
         if hit is not None:
             return hit[2]
@@ -4214,8 +4391,8 @@ class Card(QWidget):
         flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsDragEnabled
         for l in reversed(self.layers):                          # top layer first
             icon = self._layer_icon(l)
-            keep[(l["id"], id(l["rgb"]), id(l["a"]), l.get("opacity", 100))] = self._icon_cache[
-                (l["id"], id(l["rgb"]), id(l["a"]), l.get("opacity", 100))]
+            keep[(l["id"], id(l["rgb"]), id(l["a"]), l.get("opacity", 100), l.get("border"))] = self._icon_cache[
+                (l["id"], id(l["rgb"]), id(l["a"]), l.get("opacity", 100), l.get("border"))]
             it = QListWidgetItem(icon, l["name"])
             it.setData(Qt.ItemDataRole.UserRole, l["id"])
             it.setFlags(flags)
@@ -4323,6 +4500,7 @@ class Card(QWidget):
                                       "use the Layers tab.")
         self.btnLayerDone.setVisible(self.ctx is not None)
         self._sync_target_sliders()
+        self._sync_border_ui()
         self._sync_live()
         l = None if self.sel_layer is None else self._layer(self.sel_layer)
         self.bgGroup.setEnabled(self.ctx is None and l is not None and l.get("text") is None)

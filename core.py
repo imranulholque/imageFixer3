@@ -2265,12 +2265,16 @@ def content_box(alpha, pad=0.03, thr=14):
     return (max(0, b[0] - px), max(0, b[1] - px), min(w, b[2] + px), min(h, b[3] + px))
 
 
-def _apply_border(out, border):
-    """A thin grey frame along the inside edge of the layer (follows the rounded corners).  It is drawn here, on the
-    finished picture, so brightness / contrast / sharpness / colour changes of the card never touch it."""
+def _apply_border(out, border, shape_alpha=None):
+    """A frame along the inside edge of the layer (follows the rounded corners), colour and thickness from 'border' =
+    ((r, g, b), thickness as a fraction of the picture's long side).  It is drawn here, on the finished picture, so
+    brightness / contrast / sharpness / shadow removal / colour changes of the card never touch it - only the Border
+    tab changes it.  shape_alpha = the layer's alpha BEFORE the opacity was applied: the frame keeps its own full
+    strength even when the layer is made see-through (the opacity slider fades the card, not its frame)."""
     color, frac = border
     arr = np.array(out)                                         # RGBA copy
-    a = arr[:, :, 3]
+    a_now = arr[:, :, 3].astype(np.float32)                     # alpha with the opacity applied
+    a = np.asarray(shape_alpha, dtype=np.uint8) if shape_alpha is not None else arr[:, :, 3]
     bw = max(2, int(round(max(out.size) * float(frac))))
     pad = bw + 2
     ap = np.pad(a, pad)                                         # zeros around: the picture edge counts as an edge too
@@ -2281,9 +2285,12 @@ def _apply_border(out, border):
     except Exception:
         inner = np.asarray(Image.fromarray(ap).filter(_PilFilter.MinFilter(2 * bw + 1)))[pad:-pad, pad:-pad]
     af = a.astype(np.float32)
-    w = np.clip((af - inner.astype(np.float32)) / np.maximum(af, 1.0), 0.0, 1.0)[..., None]
+    w = np.clip((af - inner.astype(np.float32)) / np.maximum(af, 1.0), 0.0, 1.0)
     col = np.array(color, np.float32)
-    arr[:, :, :3] = np.clip(arr[:, :, :3].astype(np.float32) * (1.0 - w) + col * w, 0, 255).astype(np.uint8)
+    w3 = w[..., None]
+    arr[:, :, :3] = np.clip(arr[:, :, :3].astype(np.float32) * (1.0 - w3) + col * w3, 0, 255).astype(np.uint8)
+    if shape_alpha is not None:                                 # the frame is not faded by the opacity
+        arr[:, :, 3] = np.clip(a_now * (1.0 - w) + af * w + 0.5, 0, 255).astype(np.uint8)
     return Image.fromarray(arr, "RGBA")
 
 
@@ -2295,12 +2302,13 @@ def layer_rgba(l, pend=True):
         rgb = render_full(rgb, adjs, look, sel)
     out = rgb.convert("RGBA")
     a = l["a"]
-    if l.get("opacity", 100) < 100:
+    faded = l.get("opacity", 100) < 100
+    if faded:
         a = a.point(lambda v, f=l["opacity"] / 100.0: int(v * f))
     out.putalpha(a)
     if l.get("border"):
         try:
-            out = _apply_border(out, l["border"])
+            out = _apply_border(out, l["border"], l["a"] if faded else None)
         except Exception:
             pass
     return out
@@ -2350,7 +2358,7 @@ def composite_layers_fast(base, layers, hide=None, cache=None):
         lid = l["id"]
         alive.add(lid)
         refs = (l["rgb"], l["a"], l.get("pend"))
-        sig = ((W, H), tuple(l["grid"]), l["n"], l.get("opacity", 100), id(refs[0]), id(refs[1]), id(refs[2]))
+        sig = ((W, H), tuple(l["grid"]), l["n"], l.get("opacity", 100), l.get("border"), id(refs[0]), id(refs[1]), id(refs[2]))
         with _LCACHE_LOCK:
             hit = cache.get(lid)
         if hit is not None and hit[0] == sig:

@@ -226,3 +226,82 @@ def paste_preview(page_img, items):
     for _, c, (x0, y0, x1, y1) in items:
         out.paste(c, (int(round(x0 * W)), int(round(y0 * H))), c if c.mode == "RGBA" else None)
     return out
+
+
+# ------------------------------------------------------------------------------------------ corner crop (by hand)
+def initial_quad(img, dpi=300):
+    """-> (4 corner points TL, TR, BR, BL of the card in the scan as float32 4x2, found).  These are the corners the
+    corner-crop window starts with: what the card finder saw; the whole picture when the scanner itself gave only the
+    card; the whole picture (found = False) when nothing was seen."""
+    W, H = img.size
+    whole = np.array([[0, 0], [W - 1, 0], [W - 1, H - 1], [0, H - 1]], np.float32)
+    if already_card_sized(img, dpi):
+        return whole, True
+    pts = find_card_box(img, dpi)
+    if pts is None:
+        return whole, False
+    return _order(pts), True
+
+
+def cut_quad(img, quad, keep_orientation=False):
+    """The area inside 4 corners (picture pixels, any order) becomes a straight card: a flatbed has no perspective, so
+    the card's own edge lengths are its size.  A card standing up is turned to lie down (like cut_card)."""
+    q = _order(quad)
+    w = float((np.linalg.norm(q[1] - q[0]) + np.linalg.norm(q[2] - q[3])) / 2)
+    h = float((np.linalg.norm(q[3] - q[0]) + np.linalg.norm(q[2] - q[1])) / 2)
+    w, h = max(40, int(round(w))), max(40, int(round(h)))
+    dst = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], np.float32)
+    M = cv2.getPerspectiveTransform(q, dst)
+    rgb = np.asarray(img.convert("RGB"))
+    out = cv2.warpPerspective(rgb, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+    card = Image.fromarray(out)
+    if not keep_orientation and card.height > card.width:
+        card = card.rotate(90, expand=True)
+    return card
+
+
+# ------------------------------------------------------------------------------------------ border + preview
+BORDER_COLOR = "#878787"                  # the grey frame: a white card is seen on the white page
+BORDER_W = 6                              # thickness: 6 = 0.6 % of the card's long side (1 .. 40)
+
+
+def make_border(on=True, color=BORDER_COLOR, width=BORDER_W):
+    """Settings -> the 'border' of a layer: ((r, g, b), thickness as a fraction of the long side), or None (no border)."""
+    if not on:
+        return None
+    try:
+        c = str(color).lstrip("#")
+        rgb = (int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16))
+    except Exception:
+        rgb = (135, 135, 135)
+    try:
+        w = max(1, min(40, int(width)))
+    except Exception:
+        w = BORDER_W
+    return rgb, w / 1000.0
+
+
+def preview_image(sides, border=None, width=360, bg=(226, 230, 238), pad=14):
+    """How the cards will look on the page (round corners + border), side by side, small.
+    sides = [(card picture, found), ...] -> PIL RGB."""
+    import core
+    tiles = []
+    for card, found in sides:
+        c = card.convert("RGB")
+        if c.width != width:
+            c = c.resize((width, max(1, int(round(c.height * width / float(c.width))))), Image.Resampling.LANCZOS)
+        t = rounded_card(c) if found else c.convert("RGBA")
+        if border:
+            try:
+                t = core._apply_border(t, border)
+            except Exception:
+                pass
+        tiles.append(t)
+    W = sum(t.width for t in tiles) + pad * (len(tiles) + 1)
+    H = max(t.height for t in tiles) + 2 * pad
+    out = Image.new("RGB", (W, H), bg)
+    x = pad
+    for t in tiles:
+        out.paste(t, (x, (H - t.height) // 2), t)
+        x += t.width + pad
+    return out
