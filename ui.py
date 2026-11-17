@@ -1708,9 +1708,24 @@ class MainWindow(QMainWindow):
             return
 
         def work(progress):
-            for i, (c, src, path, ver) in enumerate(todo):
-                progress(i / len(todo), "%d / %d" % (i + 1, len(todo)))
-                core.save_image(src(), path, src=c.path, fast=True)
+            # Rendering the next picture and packing (zlib, no GIL) the previous one run at the same time; at most 2
+            # big pictures are in memory at once.  The files are exactly the same (lossless) as before.
+            from concurrent.futures import ThreadPoolExecutor
+
+            def write(img, path, srcp):
+                try:
+                    core.save_image(img, path, src=srcp, fast=True)
+                finally:
+                    del img
+            pending = []
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                for i, (c, src, path, ver) in enumerate(todo):
+                    progress(i / len(todo), "%d / %d" % (i + 1, len(todo)))
+                    while len(pending) >= 2:
+                        pending.pop(0).result()
+                    pending.append(pool.submit(write, src(), path, c.path))
+                for f in pending:
+                    f.result()
             return True
 
         def done(_):
@@ -2171,7 +2186,9 @@ class MainWindow(QMainWindow):
             self.say("Nothing to save: no edited picture.")
             return
         n_rep = sum(1 for c in todo if c.can_replace())
-        dlg = SaveAllDialog(self, len(todo), n_rep, self._dir(), self.settings.value("saveall_mode", "replace", type=str))
+        n_all = len(self.carousel.cards)
+        dlg = SaveAllDialog(self, len(todo), n_rep, self._dir(), self.settings.value("saveall_mode", "replace", type=str),
+                            n_all=n_all)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         r = dlg.result_values()
@@ -2182,13 +2199,15 @@ class MainWindow(QMainWindow):
             self._refresh_dir()
         if r["mode"] == "replace" and not self._confirm_replace(n_rep):
             return
+        if r["mode"] == "folder" and r.get("all"):                 # every open picture, not only the edited ones
+            todo = list(self.carousel.cards)
         taken, entries = set(), []
         for c in todo:
             if r["mode"] == "replace" and c.can_replace():
                 entries.append((c, c.path, True))
             else:
                 entries.append((c, self._folder_path(c, folder, r["fmt"] if r["mode"] == "folder" else "same", taken), False))
-        self._write_job(entries, "Saving %d pictures" % len(entries))
+        self._write_job(entries, ("Saving %d PDF files" if r["fmt"] == "pdf" and r["mode"] == "folder" else "Saving %d pictures") % len(entries))
 
     def _pdf_mode(self):
         items = ["Same shape as the picture (nothing cut or padded)", "A4 paper (turned to fit each picture)",

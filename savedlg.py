@@ -6,7 +6,7 @@ from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QComboBox, QDialog, QFil
 
 
 class SaveAllDialog(QDialog):
-    def __init__(self, parent, n_total, n_replace, folder, last_mode="replace"):
+    def __init__(self, parent, n_total, n_replace, folder, last_mode="replace", n_all=None):
         super().__init__(parent)
         self.setWindowTitle("Save all")
         self.setMinimumWidth(520)
@@ -42,8 +42,12 @@ class SaveAllDialog(QDialog):
         self.cbFmt.addItem("Same as the original (JPG or PNG)", "same")
         self.cbFmt.addItem("JPG", "jpg")
         self.cbFmt.addItem("PNG", "png")
+        self.cbFmt.addItem("PDF  (one PDF file for each picture)", "pdf")
         frow.addWidget(self.cbFmt, 1)
         v.addLayout(frow)
+        self.chkAll = QCheckBox("Also the pictures that are not edited  (%d in all)" % (n_all or n_total))
+        self.chkAll.setVisible(bool(n_all) and n_all > n_total)
+        v.addWidget(self.chkAll)
         self.chkRemember = QCheckBox("Remember this folder for every save")
         self.chkRemember.setChecked(True)
         v.addWidget(self.chkRemember)
@@ -71,6 +75,7 @@ class SaveAllDialog(QDialog):
         for w in (self.edDir, self.btnBrowse, self.chkRemember):
             w.setEnabled(need_dir)
         self.cbFmt.setEnabled(self.rbFolder.isChecked())
+        self.chkAll.setEnabled(self.rbFolder.isChecked())
 
     def _browse(self):
         d = QFileDialog.getExistingDirectory(self, "Choose the folder", self.edDir.text() or os.path.expanduser("~"))
@@ -95,4 +100,4 @@ class SaveAllDialog(QDialog):
 
     def result_values(self):
         return {"mode": "replace" if self.rbReplace.isChecked() else "folder", "folder": self.edDir.text().strip(),
-                "fmt": self.cbFmt.currentData(), "remember": self.chkRemember.isChecked()}
+                "fmt": self.cbFmt.currentData(), "all": self.chkAll.isVisible() and self.chkAll.isChecked() and self.rbFolder.isChecked(), "remember": self.chkRemember.isChecked()}
