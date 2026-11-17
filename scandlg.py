@@ -10,7 +10,7 @@ import tempfile
 import time
 
 from PySide6.QtCore import QProcess, QTimer, Qt
-from PySide6.QtGui import QColor, QPainter, QPen
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (QCheckBox, QColorDialog, QComboBox, QDialog, QFormLayout, QHBoxLayout, QLabel, QProgressBar,
                                QPushButton, QSlider, QVBoxLayout, QWidget)
 
@@ -87,36 +87,6 @@ def build_side(path, dpi, fix, quad, progress):
         card, ok = idscan.cut_quad(im, quad), True
     card, eff = scanfix.enhance(card, d, fix, progress)           # sharper card; eff = its real dpi now
     return {"path": path, "dpi": d, "card": card, "found": ok, "eff": eff, "quad": quad}
-
-
-class CornerSample(QWidget):
-    """A small card picture that shows how round the corners will be (same maths as the real cut, see idscan.corner_radius).
-    pct = 0 -> square corners."""
-    W, H = 112, 71                                       # the shape of a real card (85.6 x 54)
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._pct = idscan.ROUND_PCT
-        self.setFixedSize(self.W + 4, self.H + 4)
-        self.setToolTip("This is how the corners of the card will look")
-
-    def set_pct(self, pct):
-        self._pct = int(pct)
-        self.update()
-
-    def paintEvent(self, _e):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        # same proportion as the real cut (idscan.corner_radius) but without its 2 px minimum, so every step of the slider shows
-        r = min(idscan.CORNER_MM / 85.6 * self.W * 1.06 * self._pct / 100.0, self.H / 2.0) if self._pct > 0 else 0.0
-        p.setBrush(QColor("#e2e6ee"))
-        p.setPen(QPen(QColor("#4a5268"), 1))
-        rect = self.rect().adjusted(2, 2, -3, -3)
-        if r > 0:
-            p.drawRoundedRect(rect, r, r)
-        else:
-            p.drawRect(rect)
-        p.end()
 
 
 class ScanDialog(QDialog):
@@ -249,7 +219,7 @@ class ScanDialog(QDialog):
         self.lblRoundV = QLabel("")
         self.lblRoundV.setMinimumWidth(40)
         self.sldRound.valueChanged.connect(lambda v: self.lblRoundV.setText("%d%%" % v))
-        self.sampleRound = CornerSample()
+        self.sampleRound = idpreview.CornerSample()
         self.sldRound.valueChanged.connect(lambda _v: self._round_sample())
         r5 = QHBoxLayout()
         r5.addWidget(self.chkRound)
@@ -817,8 +787,12 @@ class ScanDialog(QDialog):
                 "both": "FRONT and BACK: this is how they will look. OK puts them together on one page."}[stage]
         if lost:
             text += "\n(The card was not found in the scan of: %s. Use Corner crop to mark it.)" % ", ".join(lost)
-        dlg = idpreview.PreviewDialog(self, "ID card preview", text, image, names)
+        dlg = idpreview.PreviewDialog(self, "ID card preview", text, image, names,
+                                      cards=[(s["card"], s["found"]) for s in sides],
+                                      border={"on": self.chkBorder.isChecked(), "color": self._bcolor, "width": int(self.sldBorder.value())},
+                                      rnd={"on": self.chkRound.isChecked(), "pct": int(self.sldRound.value())})
         dlg.exec()
+        self._take_look(dlg)                         # border / corners changed in the preview are used for the page, too
         act = dlg.action
         if act == "ok":
             self._review_ok(sides, stage)
@@ -826,6 +800,21 @@ class ScanDialog(QDialog):
             self._crop_side(sides, stage, act[1])
         else:
             self._review_again(stage)
+
+    def _take_look(self, dlg):
+        """Border and corner settings that were changed in the preview window become the settings of this window."""
+        try:
+            self.chkBorder.setChecked(bool(dlg.border["on"]))
+            self._bcolor = str(dlg.border["color"])
+            self.sldBorder.setValue(int(dlg.border["width"]))
+            self.lblBorderW.setText(str(self.sldBorder.value()))
+            self._paint_border_color()
+            self._border_enable()
+            self.chkRound.setChecked(bool(dlg.rnd["on"]))
+            self.sldRound.setValue(int(dlg.rnd["pct"]))
+            self._round_enable()
+        except Exception:
+            pass
 
     def _crop_side(self, sides, stage, i):
         """Corner crop: the person drags the 4 corners onto the card; the side is cut again from the original scan."""

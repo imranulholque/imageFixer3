@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (QSplitter, QApplication, QButtonGroup, QCheckBox,
 import core
 import idscan
 import spill
+from idpreview import CornerSample
 import textbox
 from canvas import ImageCanvas, np_to_qimage
 from compare import CompareOverlay
@@ -2056,7 +2057,14 @@ class Card(QWidget):
         self.roundRow = SliderRow("Roundness", 5, idscan.ROUND_MAX, idscan.ROUND_PCT, ("sharper", "real card", "rounder"),
                                   "How round the corners are. 100% = the corner of a real ID card, less = sharper, more = rounder.", "%")
         g2l.addWidget(self.roundRow)
-        hr = QLabel("Works on the ID card layers (Front / Back). With no layer selected these are the settings of the next ID card scan.")
+        self.cornerSample = CornerSample()                 # a small card: the corners as they are now, moves with the slider
+        srow = QHBoxLayout()
+        srow.addStretch(1)
+        srow.addWidget(self.cornerSample)
+        srow.addStretch(1)
+        g2l.addLayout(srow)
+        hr = QLabel("Works on the ID card layers (Front / Back). With no layer selected it changes the ID card of this page "
+                    "and is also used for the next ID card scan.")
         hr.setObjectName("hint")
         hr.setWordWrap(True)
         g2l.addWidget(hr)
@@ -4467,16 +4475,17 @@ class Card(QWidget):
         if self._border_sync:
             return
         self._border_enable_ui()
-        ids = self._border_targets()
+        ids = self._border_ids()
         b = self._border_state()
-        if not ids or not self._loaded:
-            try:                                           # shared with the Scan window
+        if not self._border_targets():                     # nothing selected: also the settings of the next scan (shared with the Scan window)
+            try:
                 p = _prefs()
                 p.setValue("scan/border_on", self.chkBorderOn.isChecked())
                 p.setValue("scan/border_color", self._border_hex)
                 p.setValue("scan/border_w", int(self.borderRow.value()))
             except Exception:
                 pass
+        if not ids or not self._loaded:
             return
         if what == "width":
             self._begin_change()
@@ -4514,11 +4523,28 @@ class Card(QWidget):
         except Exception:
             return True, idscan.ROUND_PCT
 
+    @staticmethod
+    def _is_idcard(l):
+        """A Front / Back layer made by the ID card scan."""
+        return bool(l) and l.get("text") is None and (bool(l.get("idcard")) or l.get("name") in ("Front", "Back"))
+
+    def _card_ids(self):
+        return [l["id"] for l in self.layers if self._is_idcard(l)]
+
+    def _border_ids(self):
+        """What the Border tab changes: the selected layer(s); with nothing selected the ID card layers (Front + Back) of this page."""
+        return self._border_targets() or self._card_ids()
+
     def _round_targets(self):
-        return [i for i in self._border_targets() if (self._layer(i) or {}).get("idcard")]
+        sel = self._border_targets()
+        if sel:
+            return [i for i in sel if self._is_idcard(self._layer(i))]
+        return self._card_ids()
 
     def _round_enable_ui(self):
         self.roundRow.setEnabled(self.chkRoundOn.isChecked())
+        if hasattr(self, "cornerSample"):
+            self.cornerSample.set_pct(int(self.roundRow.value()) if self.chkRoundOn.isChecked() else 0)
 
     def _round_changed(self, what):
         """what = "on" | "pct".  With ID card layer(s) selected their corners change (one Undo step; a drag of the
@@ -4528,13 +4554,14 @@ class Card(QWidget):
         self._round_enable_ui()
         on, pct = self.chkRoundOn.isChecked(), int(self.roundRow.value())
         ids = self._round_targets()
-        if not ids or not self._loaded:
+        if not self._border_targets():                     # nothing selected: also the settings of the next scan (shared with the Scan window)
             try:
                 p = _prefs()
                 p.setValue("scan/round_on", on)
                 p.setValue("scan/round_pct", pct)
             except Exception:
                 pass
+        if not ids or not self._loaded:
             return
         if what == "pct":
             self._begin_change()
@@ -4548,11 +4575,8 @@ class Card(QWidget):
         new = []
         for l in self.layers:
             if l["id"] in ids:
-                try:
-                    a = idscan.round_alpha(l["rgb"].size, pct if on else 0)
-                    l = dict(l, a=a, round_on=bool(on), round_pct=int(pct))
-                except Exception:
-                    pass
+                a = idscan.round_alpha(l["rgb"].size, pct if on else 0)
+                l = dict(l, a=a, round_on=bool(on), round_pct=int(pct), idcard=True)
             new.append(l)
         self.layers = new
         self.ops += 1
@@ -4575,12 +4599,17 @@ class Card(QWidget):
                 self.chkRoundOn.setChecked(bool(l.get("round_on", True)))
                 self.roundRow.set_value(max(5, min(idscan.ROUND_MAX, int(l.get("round_pct", idscan.ROUND_PCT)))))
                 names = ", ".join(self._layer(i)["name"] for i in ids[:3]) + (" +%d more" % (len(ids) - 3) if len(ids) > 3 else "")
-                self.lblRoundFor.setText("Corners of:  %s%s" % (names, "  (shows the first one)" if len(ids) > 1 else ""))
+                if self._border_targets():
+                    self.lblRoundFor.setText("Corners of:  %s%s" % (names, "  (shows the first one)" if len(ids) > 1 else ""))
+                else:
+                    self.lblRoundFor.setText("No layer is selected: the corners change on the ID card of this page (%s) "
+                                             "and are used for the next ID card scan, too." % names)
             else:
                 on, pct = self._round_pref()
                 self.chkRoundOn.setChecked(on)
                 self.roundRow.set_value(pct)
-                self.lblRoundFor.setText("No ID card layer is selected: these are the corners the next ID card scan will use.")
+                self.lblRoundFor.setText("The selected layer is not an ID card, or this page has no ID card: "
+                                         "these are the corners the next ID card scan will use.")
         finally:
             self._round_sync = False
         self._round_enable_ui()
@@ -4623,7 +4652,8 @@ class Card(QWidget):
         next ID card scan will use."""
         if not hasattr(self, "borderRow"):
             return
-        ids = self._border_targets()
+        explicit = bool(self._border_targets())
+        ids = self._border_ids()
         self._border_sync = True
         try:
             if ids:
@@ -4635,7 +4665,11 @@ class Card(QWidget):
                     self.borderRow.set_value(max(1, min(40, int(round(frac * 1000)))))
                 self.chkBorderOn.setChecked(bool(b))
                 names = ", ".join(l["name"] for l in ls[:3]) + (" +%d more" % (len(ls) - 3) if len(ls) > 3 else "")
-                self.lblBorderFor.setText("Border of:  %s%s" % (names, "  (shows the first one)" if len(ls) > 1 else ""))
+                if explicit:
+                    self.lblBorderFor.setText("Border of:  %s%s" % (names, "  (shows the first one)" if len(ls) > 1 else ""))
+                else:
+                    self.lblBorderFor.setText("No layer is selected: the border changes on the ID card of this page (%s) "
+                                              "and is used for the next ID card scan, too." % names)
             else:
                 p = _prefs()
                 self.chkBorderOn.setChecked(p.value("scan/border_on", True, type=bool))
