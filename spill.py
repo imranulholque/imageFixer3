@@ -237,14 +237,14 @@ def demote(st):
     """A copy of the undo step with its big pictures / masks replaced by Refs (the step itself is not changed)."""
     new = dict(st)
     new["_spilled"] = True
-    for k in ("base", "shadow_src", "alpha", "sel"):
+    for k in ("base", "shadow_src", "alpha", "palpha", "sel"):
         if k in new:
             new[k] = _out(new[k])
     if new.get("layers"):
         new["layers"] = [dict(l, **{k: _out(l[k]) for k in _LAYER_KEYS if l.get(k) is not None}) for l in new["layers"]]
     stash = new.get("stash")
     if stash:
-        new["stash"] = dict(stash, **{k: _out(stash[k]) for k in ("base", "shadow_src", "sel") if stash.get(k) is not None})
+        new["stash"] = dict(stash, **{k: _out(stash[k]) for k in ("base", "shadow_src", "palpha", "sel") if stash.get(k) is not None})
     return new
 
 
@@ -252,14 +252,14 @@ def promote(st):
     """The undo step with real pictures again (a copy; Refs are read back from the disk)."""
     new = dict(st)
     new.pop("_spilled", None)
-    for k in ("base", "shadow_src", "alpha", "sel"):
+    for k in ("base", "shadow_src", "alpha", "palpha", "sel"):
         if k in new:
             new[k] = _in(new[k])
     if new.get("layers"):
         new["layers"] = [dict(l, **{k: _in(l[k]) for k in _LAYER_KEYS if isinstance(l.get(k), Ref)}) for l in new["layers"]]
     stash = new.get("stash")
     if stash:
-        new["stash"] = dict(stash, **{k: _in(stash[k]) for k in ("base", "shadow_src", "sel") if isinstance(stash.get(k), Ref)})
+        new["stash"] = dict(stash, **{k: _in(stash[k]) for k in ("base", "shadow_src", "palpha", "sel") if isinstance(stash.get(k), Ref)})
     return new
 
 

@@ -355,6 +355,44 @@ def t_crop_shapes():
     assert a3.getpixel((1, 1)) == 0 and a3.getpixel((60, 60)) == 255
 step("crop to circle / oval / rounded box / selection shape", t_crop_shapes)
 
+def t_page_transparent():
+    # a page cropped to a shape keeps NOTHING behind it: the outside is transparent, saved as RGBA (PNG)
+    cc = cardmod.Card(p); cc.message.connect(lambda t: None); cc.ensure_loaded()
+    cc._set_tool("crop_circle"); cc.apply_pending()
+    assert cc.palpha is not None and cc.palpha.size == cc.base.size, "the page must get a transparency mask"
+    assert cc.palpha.getpixel((0, 0)) == 0 and cc.palpha.getpixel((cc.base.size[0] // 2, cc.base.size[1] // 2)) == 255
+    out = cc.result_image()
+    assert out.mode == "RGBA" and out.getpixel((0, 0))[3] == 0, "outside the circle must be transparent"
+    assert cc.out_name()[1] == ".png"
+    cc.undo_step()
+    assert cc.palpha is None, "Undo brings the full page back"
+    # plain page: no transparency, normal RGB result
+    c2 = cardmod.Card(p); c2.message.connect(lambda t: None); c2.ensure_loaded()
+    assert c2.palpha is None and c2.result_image().mode == "RGB"
+step("page cropped to a shape is transparent outside (no background)", t_page_transparent)
+
+def t_live_round_box():
+    # Box select: Roundness / Round corners change the box selected LAST, live; earlier parts stay as they were
+    cc = cardmod.Card(p); cc.message.connect(lambda t: None); cc.ensure_loaded()
+    cc._set_tool("rect")
+    cc.chkCropRound.setChecked(True); cc.sldCropRound.setValue(10)
+    cc._on_select("rect", (20, 20, 120, 100), None)
+    cc._on_select("rect", (300, 300, 400, 380), "add")
+    assert cc.sel[25, 25] > 0.5 and cc.sel[305, 305] > 0.5, "10% corners: the corner points are still inside"
+    cc.sldCropRound.setValue(50)
+    assert cc.sel[305, 305] < 0.5, "the last box became much rounder, after it was selected"
+    assert cc.sel[25, 25] > 0.5, "the box selected before did NOT change"
+    cc.chkCropRound.setChecked(False)
+    assert cc.sel[305, 305] > 0.5, "corners off: square again"
+step("Box select: roundness changes the last selection live", t_live_round_box)
+
+def t_blank_page():
+    import blankdlg
+    im = blankdlg.make_page((10, 90, 160), (300, 200))
+    assert im.size == (300, 200) and im.getpixel((5, 5)) == (10, 90, 160)
+    assert blankdlg.make_page((0, 0, 0), (99999, 1)).size == (blankdlg.MAX_SIDE, blankdlg.MIN_SIDE)
+step("blank solid-colour page", t_blank_page)
+
 
 def t_scanner_v2():
     import scanner, math

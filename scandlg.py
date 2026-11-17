@@ -15,7 +15,6 @@ from PySide6.QtWidgets import (QCheckBox, QColorDialog, QComboBox, QDialog, QFor
                                QPushButton, QSlider, QVBoxLayout, QWidget)
 
 import idpreview
-from colorchoice import ColorChoice
 import idscan
 import jobs
 import scanfix
@@ -185,11 +184,6 @@ class ScanDialog(QDialog):
         self.lblPage = QLabel("ID card page")
         form.addRow(self.lblPage, r3)
         self._r3 = (self.cmbPage, self.cmbPlace)
-        # colour of the page itself: white, solid black or any colour
-        self.cmbPageColor = ColorChoice([("White", (255, 255, 255)), ("Black", (0, 0, 0))])
-        self.cmbPageColor.setToolTip("The colour of the ID card page behind the cards: white, solid black, or any colour you choose.")
-        self.lblPageColor = QLabel("Page color")
-        form.addRow(self.lblPageColor, self.cmbPageColor)
 
         # border of the card layers: colour + thickness (they can be changed later in the Border tab, too)
         self.chkBorder = QCheckBox("Border")
@@ -241,8 +235,7 @@ class ScanDialog(QDialog):
         form.addRow("", self.chkPreview)
         self._idrows = (self.cmbPage, self.cmbPlace, self.lblPage, self.chkBorder, self.btnBorderColor, self.sldBorder,
                         self.lblBorderW, self.lblBorder, self.chkPreview,
-                        self.chkRound, self.sldRound, self.lblRoundV, self.lblRound, self.lblRoundT,
-                        self.cmbPageColor, self.lblPageColor)
+                        self.chkRound, self.sldRound, self.lblRoundV, self.lblRound, self.lblRoundT)
         root.addLayout(form)
 
         self.lblStep = QLabel("")
@@ -410,7 +403,6 @@ class ScanDialog(QDialog):
             self.chkDuplex.setChecked(self.st.value("scan/duplex", False, type=bool))
             self.chkClose.setChecked(self.st.value("scan/autoclose", True, type=bool))
             self.chkPreview.setChecked(self.st.value("scan/preview", True, type=bool))
-            self.cmbPageColor.set_hex(self.st.value("scan/page_color", "#ffffff", type=str))
         except Exception:
             pass
         self._load_border()
@@ -474,7 +466,6 @@ class ScanDialog(QDialog):
         self.st.setValue("scan/border_on", self.chkBorder.isChecked())
         self.st.setValue("scan/border_color", self._bcolor)
         self.st.setValue("scan/border_w", int(self.sldBorder.value()))
-        self.st.setValue("scan/page_color", self.cmbPageColor.hex() or "#ffffff")
         self.st.setValue("scan/round_on", self.chkRound.isChecked())
         self.st.setValue("scan/round_pct", int(self.sldRound.value()))
         d = self.cmbDev.currentData()
@@ -633,7 +624,7 @@ class ScanDialog(QDialog):
         self._busy = busy
         for w in (self.cmbDev, self.btnRefresh, self.cmbMode, self.cmbSize, self.cmbDpi, self.cmbCol, self.chkUi,
                   self.chkFeed, self.chkDuplex, self.chkClose, self.cmbPage, self.cmbPlace, self.btnAgain,
-                  self.chkBorder, self.chkRound, self.cmbPageColor, self.chkPreview, self.cmbFix):
+                  self.chkBorder, self.chkRound, self.chkPreview, self.cmbFix):
             w.setEnabled(not busy)
         if not busy:
             self._border_enable()
@@ -863,13 +854,11 @@ class ScanDialog(QDialog):
 
     def _finish_id(self, front, back, dpi, page, place, all_found):
         border = self._border()                                  # colour + thickness chosen now (changeable later: Border tab)
-        pcol = self.cmbPageColor.rgb() or (255, 255, 255)        # solid page colour (white, black, any colour)
         rpct = self._round()                                     # corner roundness chosen now (0 = square; changeable later: Border tab)
 
         def work(progress):
             progress(0.9, "putting the page together")
-            pg, items = idscan.compose_page(front, back, dpi, page, place, rounded=all_found and rpct > 0, round_pct=rpct,
-                                         page_color=pcol)
+            pg, items = idscan.compose_page(front, back, dpi, page, place, rounded=all_found and rpct > 0, round_pct=rpct)
             path = os.path.join(self.work, "idcard_%s.png" % time.strftime("%H%M%S"))
             pg.save(path, compress_level=1)
             return path, items

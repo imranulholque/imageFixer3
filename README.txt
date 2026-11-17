@@ -23,9 +23,12 @@ Clean many text pictures (WhatsApp photos, scans) and print them. One big card p
  - Erase v:     Brush / Box / Ellipse / Freehand: filled from around. Alt + click = copy from that spot.
  - Crop v:      AUTO CROP (key A), Crop (C), Straighten (S, 4 corners), Crop to circle / oval / rounded box / the selection shape, Rotate left / right.
                 CORNERS OF A BOX: Crop to rounded box, Crop, Select > Box and Erase > Box all have "Round corners" (on / off) and
-                "Roundness" (bar above the picture). Rounded box starts ON, the others start OFF (square). Crop / Rounded box on a page:
-                "Outside" = the colour outside the round corners (paper colour, solid black, white or any colour); a picture layer
-                becomes transparent there.
+                "Roundness" (bar above the picture). Rounded box starts ON, the others start OFF (square). Crop / Rounded box / Circle / Oval /
+                selection shape: nothing is left behind the shape - the outside is TRANSPARENT (a page and a picture layer alike).
+                Save a shaped page as PNG (a JPG cannot keep transparency; it is then saved as a new PNG, the original stays).
+                A small sample box next to "Roundness" shows how the corners look while you move the slider.
+                BOX SELECT: after the box is drawn, "Round corners" and "Roundness" still change it, live - only the box selected
+                LAST changes (parts selected before it with Shift / Add stay as they are).
                 Layers tab: "Opacity of the selected layer" (Ctrl + click several layers = together).  Color tab: "Fill opacity".
                 ROUNDED BOX: in the bar above the picture, "Round corners" switches the corners on / off and "Roundness" (1-50 % of the shorter side) makes them sharper / rounder.
                 AUTO CROP finds the paper / ID card / book page / newspaper in the photo (on a plain, wooden, cloth or busy background),
@@ -37,8 +40,14 @@ Clean many text pictures (WhatsApp photos, scans) and print them. One big card p
                 A picture you placed (signature, stamp ...): select it, then pick any crop - it is cropped alone and becomes
                 transparent outside the shape. (Click outside the picture first to crop the page instead.)
 Slow work shows a progress bar at the bottom; the window stays usable.
- RIGHT CLICK: on a picture / text box layer = Duplicate, Copy picture, order (front / back), turn, flip, hide, delete.  On the page = Undo / Redo,
+ RIGHT CLICK: on a picture / text box layer = Duplicate, Copy picture, Opacity (slider in the menu), order (front / back), turn, flip, hide, delete.  On the page = Undo / Redo,
                 selection actions (new layer, delete, inverse), Copy, Paste, Transform, Turn, Save, Print.  (Right-click + drag still moves the view.)
+
+BLANK PAGE (Ctrl+N, button "Blank page" at the top)
+ A page of one solid colour in any colour and size (A4, Letter, square, Full HD, custom ...), like a new page in Picsart or Word.
+ "New page" = opens it as a new picture in the row, ready to work on (draw, paste, text box, pictures ...).
+ "Add on this page (overlay)" = puts the colour on the page you are working on as a layer: move, resize, turn, Opacity (Layers tab or right-click),
+ order. "Same as this page" makes it cover the whole page.
 
 PDF FILES
  Open, drag in, or paste (Ctrl+V) a PDF like a picture: every page becomes its own picture (its own card), like Photoshop.
@@ -67,7 +76,7 @@ SCANNER  ("Scan" button at the top, key Ctrl+Shift+N)
  driver window like Photoshop does. The document feeder (ADF) and both sides (duplex) can be chosen.
  ID card corners: in the Scan window (ID card mode) "Card corners" = Round on / off + roundness (100 % = a real ID card, less = sharper, more = rounder).
                 Later: Border tab > "Card corners" changes the corners of the Front / Back layer again, any time (Undo works; the picture is never cut away).
- ID card page options: Page color (white, black or any colour), Card border, Card corners (Round on / off + roundness: 100% = real card,
+ ID card page options: Card border, Card corners (Round on / off + roundness: 100% = real card,
  less = sharper, more = rounder). Corner roundness can be changed later in the Border tab (Card corners) - nothing is lost.
  What to scan:  Normal = every page is a new picture.   ID card = Scan FRONT, turn the card, Scan BACK -> a new A4 / Letter page
  with the front and the back as two separate layers, cut out, straightened, real size, one above the other (Layers tab, drag to move).

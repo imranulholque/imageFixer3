@@ -831,9 +831,11 @@ def render(rgb, adjs, look=None, lab=None, cache=None, chunk_rows=0, sel=None):
     return out8
 
 
-def render_full(img, adjs, look=None, sel=None, layers=None):
+def render_full(img, adjs, look=None, sel=None, layers=None, page_alpha=None):
     """Full resolution result as a PIL image.  sel = selection mask at preview size (or None).
-    layers = pictures placed on the page (signature, stamp ...), put on top after the page settings."""
+    layers = pictures placed on the page (signature, stamp ...), put on top after the page settings.
+    page_alpha = the transparency of the PAGE itself (PIL 'L', same size as img) after a crop to a shape: the result is then
+    an RGBA picture, transparent outside the shape (layers on top of it stay visible where they are)."""
     look = look or DEFAULT_LOOK
     if not active_adjs(adjs) and not look_edited(look):
         out = img
@@ -841,7 +843,23 @@ def render_full(img, adjs, look=None, sel=None, layers=None):
         arr = np.asarray(img)
         full_sel = None if sel is None else resize_mask(sel, img.size)
         out = Image.fromarray(render(arr, adjs, look, chunk_rows=700, sel=full_sel))
+    if page_alpha is not None:
+        pa = page_alpha if page_alpha.size == out.size else page_alpha.resize(out.size, Image.Resampling.BILINEAR)
+        out = out.convert("RGB")
+        out.putalpha(pa.convert("L"))
+        return composite_layers(out, layers, keep_alpha=True) if layers else out
     return composite_layers(out, layers) if layers else out
+
+
+def flatten(img, bg=(255, 255, 255)):
+    """A picture with transparency -> plain RGB on a solid colour (JPG, BMP, PDF and printing have no transparency).
+    A picture without transparency is returned as RGB unchanged."""
+    if img.mode in ("RGBA", "LA", "PA") or (img.mode == "P" and "transparency" in img.info):
+        rgba = img.convert("RGBA")
+        out = Image.new("RGB", rgba.size, tuple(bg))
+        out.paste(rgba, mask=rgba.getchannel("A"))
+        return out
+    return img.convert("RGB")
 
 
 # -------------------------------------------------------- shade detection
@@ -1248,7 +1266,8 @@ def outline_mask(size, shape, radius=0.22):
 def crop_to_shape(img, alpha, box, shape, mask=None, fill=None, radius=0.22):
     """Cut 'box' out of the picture in a shape.  Returns (rgb, alpha).
     alpha (PIL 'L' or None) = the picture's transparency: outside the shape it becomes transparent.
-    With alpha None the outside is filled with 'fill' (the paper colour) instead.
+    With alpha None the outside is transparent too (the returned alpha is the shape); only when a solid 'fill' colour is
+    given the outside is filled with it and no alpha is returned.
     mask = an own mask of the whole picture (selection shape) instead of a ready-made shape.
     radius = for the 'round' shape: how round the corners are, as a fraction of the shorter side (0 = square, 0.5 = most)."""
     rgb = crop_box(img, box)
@@ -1259,7 +1278,9 @@ def crop_to_shape(img, alpha, box, shape, mask=None, fill=None, radius=0.22):
     if alpha is not None:
         a = crop_box(alpha.convert("L"), box).convert("L")
         return rgb, ImageChops.multiply(a, m)
-    bg = Image.new("RGB", rgb.size, fill or border_color(img))
+    if fill is None:                                   # normal: nothing behind the shape, the outside is transparent
+        return rgb, m
+    bg = Image.new("RGB", rgb.size, fill)              # an old-style solid colour outside (only when asked for)
     return Image.composite(rgb, bg, m), None
 
 
@@ -1679,6 +1700,8 @@ def save_image(img, path, src=None, fast=False):
     kw = {"dpi": meta.get("dpi", (EXPORT_DPI, EXPORT_DPI))}
     if "icc_profile" in meta:
         kw["icc_profile"] = meta["icc_profile"]
+    if e in (".jpg", ".jpeg", ".bmp", ".pdf"):
+        img = flatten(img)                                                      # these formats have no transparency
     if e in (".jpg", ".jpeg"):
         img.save(path, "JPEG", quality=98, subsampling=0, optimize=True, **kw)   # 4:4:4 keeps thin text sharp
     elif e == ".webp":
@@ -1892,6 +1915,18 @@ def rotate_image(img, deg_ccw):
     return img.rotate(d, resample=Image.Resampling.BICUBIC, expand=True, fillcolor=border_color(img))
 
 
+def rotate_mask(mask, deg_ccw):
+    """Same turn as rotate_image, for a transparency mask: the new corners are transparent (0), not a border colour."""
+    d = float(deg_ccw) % 360.0
+    if abs(d) < 1e-6 or abs(d - 360.0) < 1e-6:
+        return mask
+    for angle, t in ((90.0, Image.Transpose.ROTATE_90), (180.0, Image.Transpose.ROTATE_180),
+                     (270.0, Image.Transpose.ROTATE_270)):
+        if abs(d - angle) < 1e-6:
+            return mask.transpose(t)
+    return mask.rotate(d, resample=Image.Resampling.BICUBIC, expand=True, fillcolor=0)
+
+
 # ------------------------------------------------------------------ PDF as pictures (like Photoshop)
 def is_pdf(path):
     return os.path.splitext(str(path))[1].lower() == PDF_EXT
@@ -1980,7 +2015,7 @@ def save_pdf(sources, path, mode="fit", quality=95, progress=None):
             if progress:
                 progress(i / n, "Page %d of %d" % (i + 1, n))
             im = src() if callable(src) else src
-            im = im.convert("RGB")
+            im = flatten(im)                                  # transparent parts (a shaped page) become white paper
             w, h = im.size
             buf = io.BytesIO()
             im.save(buf, "JPEG", quality=quality, subsampling=0, optimize=True)
@@ -2326,8 +2361,9 @@ def layer_rgba(l, pend=True):
     return out
 
 
-def composite_layers(base, layers, hide=None):
-    """PIL RGB page + layers (placed with a normalised net 'grid', n) -> PIL RGB."""
+def composite_layers(base, layers, hide=None, keep_alpha=False):
+    """PIL RGB page + layers (placed with a normalised net 'grid', n) -> PIL RGB (keep_alpha: the page may be RGBA
+    and the result stays RGBA, so the transparent part of a shaped page stays transparent)."""
     if not layers:
         return base
     W, H = base.size
@@ -2348,7 +2384,7 @@ def composite_layers(base, layers, hide=None):
             up = int(tw * 1.5)
             patch = patch.resize((up, max(1, int(round(up * patch.height / patch.width)))), Image.Resampling.LANCZOS)
         out = Image.alpha_composite(out, warp_layer_hq(patch, (W, H), grid, n))
-    return out.convert("RGB")
+    return out if keep_alpha else out.convert("RGB")
 
 
 _LCACHE_LOCK = threading.Lock()

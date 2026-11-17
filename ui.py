@@ -411,6 +411,7 @@ def _k(tool):
 SHORTCUT_GROUPS = (
     ("Files and saving", (
         ("Ctrl+O", "Choose files"),
+        ("Ctrl+N", "New blank page of any color (like Picsart / Word); or put a color on this page as an overlay"),
         ("Ctrl+V", "Paste pictures (or a PDF) from the clipboard"),
         ("Ctrl+Shift+N", "Scan: opens the Scan window (TWAIN / WIA scanners, ID card front + back on one page; Enter there = scan)"),
         ("Ctrl+C", "Copy the picture (full quality)"),
@@ -613,6 +614,9 @@ class MainWindow(QMainWindow):
         self.btnPhone = QPushButton("Add from phone")
         self.btnPhone.setToolTip("Use your phone as a wireless scanner / picture sender (QR code)")
         self.btnPhone.clicked.connect(self.open_phone)
+        self.btnBlank = QPushButton("Blank page")
+        self.btnBlank.setToolTip("A new blank page of any color and size, or a color put on this page as an overlay  (Ctrl+N)")
+        self.btnBlank.clicked.connect(self.open_blank)
         self.btnScan = QPushButton("Scan")
         self.btnScan.setToolTip("Scan from a TWAIN / WIA scanner, also ID card front + back on one page  (Ctrl+Shift+N)")
         self.btnScan.clicked.connect(self.open_scan)
@@ -625,6 +629,7 @@ class MainWindow(QMainWindow):
                                     "to all the other pictures. Crop, erase, move ... are never copied.")
         self.btnApplyAll.clicked.connect(lambda: self._with_loaded(self.apply_to_all))
         l.addWidget(self.btnChoose)
+        l.addWidget(self.btnBlank)
         l.addWidget(self.btnScan)
         l.addWidget(self.btnPhone)
         l.addWidget(self.btnApplyAll)
@@ -661,6 +666,7 @@ class MainWindow(QMainWindow):
             a.triggered.connect(lambda _=False: fn())
             m.addAction(a)
             return a
+        act("New blank page...", self.open_blank)
         act("Apply last setting to all", lambda: self._with_loaded(self.apply_to_all))
         act("Choose save folder...", self.choose_dir)
         self.actMoreOpen = act("Open save folder", self.open_dir)
@@ -839,6 +845,11 @@ class MainWindow(QMainWindow):
         z.addWidget(s)
         z.addSpacing(8)
         z.addWidget(b, 0, Qt.AlignmentFlag.AlignCenter)
+        b2 = QPushButton("New blank page")
+        b2.setToolTip("Start with an empty page of any color (Ctrl+N)")
+        b2.setMinimumHeight(34)
+        b2.clicked.connect(self.open_blank)
+        z.addWidget(b2, 0, Qt.AlignmentFlag.AlignCenter)
         z.addSpacing(10)
         credit = QLabel("Made by " + AUTHOR)
         credit.setObjectName("muted")
@@ -1010,6 +1021,7 @@ class MainWindow(QMainWindow):
         sc("Ctrl+C", cur(lambda c: self.copy_cards([c])), "Copy picture")
         sc("Ctrl+P", cur(lambda c: self.print_cards(self.print_targets())), "Print")
         sc("Ctrl+O", self.choose_files)
+        sc("Ctrl+N", self.open_blank)
         sc("Ctrl+S", cur(self.save_card), "Save")
         sc("Ctrl+Shift+S", self.save_all, "Save all edited")
         # history
@@ -1128,6 +1140,7 @@ class MainWindow(QMainWindow):
             self.lblBrand.setVisible(k < 1)
             self.btnPhone.setText("Add from phone" if k < 2 else "Phone")
             self.btnChoose.setText("+  Choose files" if k < 2 else "+  Files")
+            self.btnBlank.setText("Blank page" if k < 2 else "Blank")
             self.btnApplyAll.setText("Apply last setting to all" if k < 2 else "Apply to all")
             more = k >= 3                                  # folder, open, clear, apply-to-all go into the ... menu
             for b in (self.btnFolder, self.btnOpenDir, self.btnClear, self.btnApplyAll):
@@ -1828,7 +1841,7 @@ class MainWindow(QMainWindow):
             out = []
             for i, src in enumerate(sources):
                 progress(i / len(sources), "%d / %d" % (i + 1, len(sources)))
-                im = src().convert("RGB")
+                im = core.flatten(src())                      # a shaped page: the transparent outside prints as white paper
                 out.append((im.width, im.height, im.tobytes()))
             return out
 
@@ -2042,6 +2055,8 @@ class MainWindow(QMainWindow):
 
     def _basic_ext(self, card):
         e = os.path.splitext(card.name)[1].lower()
+        if card._has_transparency():                      # a shaped page (transparent outside) needs PNG
+            return ".png"
         return ".jpg" if e in (".jpg", ".jpeg") else ".png"
 
     def _folder_path(self, card, folder, fmt="same", taken=None):
@@ -2150,8 +2165,12 @@ class MainWindow(QMainWindow):
             if self._confirm_replace(1):
                 self._write_job([(card, card.path, True)], "Saving " + card.name)
             return
-        d = self._need_dir("This picture came from the phone or the clipboard, so there is no original file to replace.\n\n"
-                           "Choose the folder where such pictures are saved. It is remembered and used every time\n"
+        if card.origin == "file" and card._has_transparency():
+            why = ("This picture was cropped to a shape and is transparent outside it, which a JPG cannot keep, so it is saved "
+                   "as a new PNG and the original file stays as it is.\n\n")
+        else:
+            why = "This picture came from the phone or the clipboard, so there is no original file to replace.\n\n"
+        d = self._need_dir(why + "Choose the folder where such pictures are saved. It is remembered and used every time\n"
                            "(change it with 'Save as...' or the folder button at the top).")
         if d:
             self._write_job([(card, self._folder_path(card, d), False)], "Saving " + card.name)
@@ -2250,6 +2269,56 @@ class MainWindow(QMainWindow):
         self.runner.run("Making the PDF", work, done, self._fail_box("PDF"))
 
     # --------------------------------------------------------------- scanner
+    # ------------------------------------------------------- blank page (solid color)
+    def open_blank(self):
+        """A page of one solid color, any size: opened as a new page, or put on the current page as an overlay."""
+        from blankdlg import BlankPageDialog, _hex_rgb
+        c = self.carousel.current()
+        ready = c is not None and getattr(c, "_loaded", False) and not self.runner.heavy_busy
+        size = None
+        if ready:
+            try:
+                size = c.page_pixel_size()
+            except Exception:
+                size = None
+        try:
+            start = _hex_rgb(self.settings.value("blank/color", "#ffffff", type=str))
+        except Exception:
+            start = (255, 255, 255)
+        dlg = BlankPageDialog(self, size, bool(ready and size), start)
+        dlg.newPage.connect(self._blank_page)
+        dlg.newOverlay.connect(self._blank_overlay)
+        dlg.exec()
+
+    def _remember_blank(self, rgb):
+        try:
+            self.settings.setValue("blank/color", "#%02x%02x%02x" % tuple(rgb))
+        except Exception:
+            pass
+
+    def _blank_page(self, rgb, size):
+        import blankdlg
+        self._remember_blank(rgb)
+        im = blankdlg.make_page(rgb, size)
+        path = core.unique_path(self.tmp, "Blank page", ".png")
+        im.save(path, compress_level=1)
+        self._origin[path] = "paste"
+        self.show_front()
+        self.add_files([path])
+        self.say("New blank page %d x %d px." % im.size)
+
+    def _blank_overlay(self, rgb, size):
+        import blankdlg
+        self._remember_blank(rgb)
+        c = self.carousel.current()
+        if c is None or not getattr(c, "_loaded", False):
+            return
+        page = c.page_pixel_size()
+        fill = size is None or tuple(size) == tuple(page)
+        im = blankdlg.make_page(rgb, page if size is None else size)
+        c.add_picture(image=im, name="Color page", keep_background=True, fill_page=fill)
+        self.say("Color added on this page as an overlay (Layers tab: opacity, order, move, resize).")
+
     def open_scan(self):
         from scandlg import ScanDialog
         if self._scan_dlg is None:

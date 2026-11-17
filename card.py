@@ -11,7 +11,7 @@ import numpy as np
 from PIL import Image, ImageChops, ImageFilter, ImageOps
 from PySide6.QtCore import QEvent, QMimeData, QObject, QPointF, QRectF, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtCore import QRect
-from PySide6.QtWidgets import QGridLayout
+from PySide6.QtWidgets import QGridLayout, QWidgetAction
 from PySide6.QtGui import QColor, QDrag, QIcon, QImage, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (QSplitter, QApplication, QButtonGroup, QCheckBox, QColorDialog, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu,
                                QAbstractItemView, QAbstractButton, QAbstractSlider, QAbstractSpinBox, QComboBox, QPushButton, QScrollArea, QSizePolicy, QSlider, QStackedWidget, QStyle, QStyledItemDelegate, QToolButton,
@@ -25,7 +25,6 @@ from canvas import ImageCanvas, np_to_qimage
 from compare import CompareOverlay
 from fullview import FullViewOverlay
 import scanner
-from colorchoice import ColorChoice
 from flow import ElidedLabel, FlowLayout
 from jobs import _log, run_background
 
@@ -131,7 +130,7 @@ HINTS = {
     "persp": "Drag the 4 corner points onto the 4 corners of the page, then Apply (Enter).",
     "crop_circle": "Drag the box: a circle fits in its shorter side.  Apply (Enter).  A picture (signature, stamp ...) becomes transparent outside the circle.",
     "crop_oval": "Drag the box: an oval (ellipse) fits in it.  Apply (Enter).  A picture becomes transparent outside the oval.",
-    "crop_round": "Drag the box: its corners will be rounded (switch the corners on / off and choose how round in the bar above).  Apply (Enter).  A picture becomes transparent outside.",
+    "crop_round": "Drag the box: its corners will be rounded (switch the corners on / off and choose how round in the bar above).  Apply (Enter).  The outside becomes transparent.",
     "erase_brush": "Paint over what you want to remove: it is filled with what surrounds it.  Alt + click = copy from there.",
     "erase_rect": "Drag a box over what you want to remove.",
     "erase_ellipse": "Drag an ellipse over what you want to remove.",
@@ -212,6 +211,40 @@ def dir_words(dx, dy):
 class NoWheelSlider(QSlider):
     def wheelEvent(self, e):
         e.ignore()
+
+
+class CornerPreview(QWidget):
+    """A tiny sample box that shows the corners as they are now (round on / off + roundness), so the slider can be
+    watched while it moves.  pct = roundness in percent of the shorter side (0 = square corners)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pct = 0
+        self.setFixedSize(60, 42)
+        self.setToolTip("Preview of the corners")
+
+    def set_corners(self, on, pct):
+        self._pct = int(pct) if on else 0
+        self.update()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        frame = QRectF(0.5, 0.5, self.width() - 1.0, self.height() - 1.0)
+        p.setPen(QPen(QColor(74, 82, 104), 1.0, Qt.PenStyle.DashLine))            # the "page" the sample box sits on
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(frame, 4, 4)
+        box = frame.adjusted(7, 6, -7, -6)
+        r = min(box.width(), box.height()) * max(0, min(50, self._pct)) / 100.0
+        path = QPainterPath()
+        if r > 0.4:
+            path.addRoundedRect(box, r, r)
+        else:
+            path.addRect(box)
+        p.setPen(QPen(QColor(165, 180, 252), 1.6))
+        p.setBrush(QColor(99, 102, 241, 150))
+        p.drawPath(path)
+        p.end()
 
 
 class SliderRow(QWidget):
@@ -795,6 +828,7 @@ class Card(QWidget):
         self.shadow_opts = dict(core.SHADOW_DEFAULTS)
         self.fill_rgb = (255, 255, 255)
         self.sel = None                            # selection mask at preview size (or None)
+        self._last_box = None                      # the Box selection made last (rounded corners can still be changed)
         self.sel_mode = "add"
         self._sel_ver = 0
         self.undo = []
@@ -808,6 +842,7 @@ class Card(QWidget):
         self.layers = []                           # pictures placed on the page (signature, stamp ...), each its own layer
         self.ctx = None                            # id of the picture layer that is being edited (None = the page)
         self.alpha = None                          # transparency of that layer ('L'); self.base is then the layer's colours
+        self.palpha = None                         # transparency of the PAGE after a crop to a shape ('L', None = fully solid)
         self._stash = None                         # the page's own state while a layer is edited
         self._hide_layer = None                    # a layer that is being moved is not drawn twice
         self._place_id = None
@@ -1240,27 +1275,14 @@ class Card(QWidget):
         except Exception:
             pass
         self._rsync = False
-        self.cropOutW = QWidget()                       # the colour outside the round corners (a page only; a picture layer becomes transparent)
-        cow = QHBoxLayout(self.cropOutW)
-        cow.setContentsMargins(0, 0, 0, 0)
-        cow.setSpacing(6)
-        self.cmbCropOut = ColorChoice([("Paper color", None), ("Black", (0, 0, 0)), ("White", (255, 255, 255))])
-        self.cmbCropOut.setToolTip("What is outside the rounded corners on a page: the paper color (automatic), solid black, white or any color.\n"
-                                   "A picture layer (signature, stamp, ID card ...) becomes transparent there instead.")
-        try:
-            self.cmbCropOut.set_hex(_prefs().value("crop/outside", "", type=str))
-        except Exception:
-            pass
-        cow.addWidget(self._label("Outside"))
-        cow.addWidget(self.cmbCropOut)
         self.chkCropRound.toggled.connect(lambda _=False: self._crop_round_changed())
         self.sldCropRound.valueChanged.connect(lambda _=0: self._crop_round_changed())
-        self.cmbCropOut.changed.connect(self._crop_out_changed)
         rbl.addWidget(self.chkCropRound)
         rbl.addWidget(self._label("Roundness"))
         rbl.addWidget(self.sldCropRound)
         rbl.addWidget(self.lblCropRound)
-        rbl.addWidget(self.cropOutW)
+        self.cornerPreview = CornerPreview()
+        rbl.addWidget(self.cornerPreview)
         a.addWidget(self.roundBox)
         self.sizeBox = QWidget()
         sb = QHBoxLayout(self.sizeBox)
@@ -2428,7 +2450,10 @@ class Card(QWidget):
             out = core.render_full(*args)
             progress(0.8, "showing it")
             rgb = out.convert("RGB")
-            return np_to_qimage(np.asarray(rgb)), rgb.size
+            arr = np.asarray(rgb)
+            if out.mode == "RGBA":                                   # a shaped page: the outside is shown as a chess-board
+                arr = core.show_alpha(arr, out.getchannel("A"))
+            return np_to_qimage(arr), rgb.size
 
         def done(r):
             q, size = r
@@ -2471,8 +2496,10 @@ class Card(QWidget):
             self._warn("Already as big as it can get. The limit is %d px on the long side." % core.MAX_UPSCALE_SIDE)
             return
         am = (lambda progress: core.upscale_image(alpha, f, mask=True)) if self.ctx is not None and alpha is not None else None
+        pm = lambda progress, pa: core.upscale_image(pa, f, mask=True)
         self._fx_hint = {"title": "Upscaled", "detail": lambda: "%d \u00d7 %d px  (\u00d7%g)" % (self.base.size[0], self.base.size[1], f)}
-        self._edit_base("Upscaling", lambda progress: core.upscale_image(base, f), keep_sel=False, refit=True, alpha_make=am)
+        self._edit_base("Upscaling", lambda progress: core.upscale_image(base, f), keep_sel=False, refit=True, alpha_make=am,
+                        palpha_make=pm)
 
     # ------------------------------------------------ auto crop
     @staticmethod
@@ -2526,6 +2553,7 @@ class Card(QWidget):
         def make(progress):
             return scanner.straighten(base, quad)
         am = (lambda progress: scanner.straighten(alpha.convert("RGB"), quad).convert("L")) if inlayer else None
+        pm = lambda progress, pa: scanner.straighten(pa.convert("RGB"), quad).convert("L")
 
         def after():
             self._clear_clone()
@@ -2534,7 +2562,7 @@ class Card(QWidget):
                 self._auto_back = False
                 self.leave_layer()
         self._fx_hint = {"title": title, "detail": lambda: "%d \u00d7 %d px" % self.base.size}
-        self._edit_base("Cropping", make, keep_sel=False, refit=True, after=after, alpha_make=am)
+        self._edit_base("Cropping", make, keep_sel=False, refit=True, after=after, alpha_make=am, palpha_make=pm)
 
     def _cmp_mode(self):
         if self._cmp is None:
@@ -2663,14 +2691,17 @@ class Card(QWidget):
             QApplication.restoreOverrideCursor()
 
     @staticmethod
-    def _build_view(base, adjs, look, sel, deco=None):
+    def _build_view(base, adjs, look, sel, deco=None, palpha=None):
         """Everything slow about showing a picture (preview, colour maths, first render). Runs in a worker thread.
-        deco(out) puts the picture layers on the page (or the chess-board behind a layer)."""
+        deco(out) puts the picture layers on the page (or the chess-board behind a layer).
+        palpha = the transparency of a page that was cropped to a shape: the outside is shown as a chess-board."""
         prev, scale = core.make_preview(base)
         cache = {}
         lab = core.rgb_to_lab(prev) if core.active_adjs(adjs) else None
         out = core.render(prev, adjs, look, lab=lab, cache=cache,
                           sel=sel if (sel is not None and sel.shape == prev.shape[:2]) else None)
+        if palpha is not None:
+            out = core.show_alpha(out, palpha)
         bare = np_to_qimage(out) if deco is not None else None       # the page without its layers (they are drawn live)
         if deco is not None:
             out = deco(out)
@@ -2734,7 +2765,8 @@ class Card(QWidget):
         self._update_buttons()
 
     def _rebuild_preview(self, refit=True):
-        v = self._build_view(self.base, self.adjs, self.look, self.sel, self._deco())
+        v = self._build_view(self.base, self.adjs, self.look, self.sel, self._deco(),
+                             self.palpha if self.ctx is None else None)
         self._adopt_view(v, refit)
 
     def _get_lab(self):
@@ -2910,8 +2942,8 @@ class Card(QWidget):
         layers = self._layers_now()
         if self.ctx is not None and self._stash is not None:          # a layer is open: the result is still the whole page
             st = self._stash
-            return (st["base"], copy.deepcopy(st["adjs"]), dict(st["look"]), st["sel"], layers)
-        return (self.base, copy.deepcopy(self.adjs), dict(self.look), self.sel, layers)
+            return (st["base"], copy.deepcopy(st["adjs"]), dict(st["look"]), st["sel"], layers, st.get("palpha"))
+        return (self.base, copy.deepcopy(self.adjs), dict(self.look), self.sel, layers, self.palpha)
 
     def _layers_now(self):
         """The layers as they are right now (the one being edited with its unfinished settings)."""
@@ -2962,18 +2994,28 @@ class Card(QWidget):
 
     def can_replace(self):
         """Save can replace the original file: opened from the disk (not phone / clipboard) and writable."""
+        if self._has_transparency() and os.path.splitext(self.path)[1].lower() in (".jpg", ".jpeg", ".bmp"):
+            return False                                   # the transparent outside would be lost: save a new PNG instead
         return (self.origin == "file" and os.path.isfile(self.path) and os.access(self.path, os.W_OK)
                 and os.access(os.path.dirname(self.path) or ".", os.W_OK))
 
     def out_name(self):
         stem = os.path.splitext(self.name)[0]
-        return stem + "_edited", core.out_ext(self.name)
+        ext = core.out_ext(self.name)
+        if self._has_transparency() and ext in (".jpg", ".jpeg", ".bmp"):
+            ext = ".png"                                  # a shaped page keeps its transparent outside only in PNG / WEBP / TIF
+        return stem + "_edited", ext
+
+    def _has_transparency(self):
+        """The page was cropped to a shape (its outside is transparent)."""
+        pa = self.palpha if self.ctx is None else (self._stash or {}).get("palpha")
+        return pa is not None
 
     # ------------------------------------------------- history (undo / redo)
     def _snap(self):
         return {"base": self.base, "adjs": copy.deepcopy(self.adjs), "look": dict(self.look),
                 "shadow": self._shadow_done, "sel": self.sel, "ops": self.ops, "shadow_src": self.shadow_src,
-                "ctx": self.ctx, "alpha": self.alpha, "stash": self._stash, "layers": list(self.layers)}
+                "ctx": self.ctx, "alpha": self.alpha, "palpha": self.palpha, "stash": self._stash, "layers": list(self.layers)}
 
     KEEP_RESIDENT = 2          # the newest steps stay in memory (instant undo); older ones live on the disk, lossless
 
@@ -3040,6 +3082,7 @@ class Card(QWidget):
         self.ops = st["ops"]
         self.shadow_src = st.get("shadow_src")
         self.ctx, self.alpha, self._stash = st.get("ctx"), st.get("alpha"), st.get("stash")
+        self.palpha = st.get("palpha")
         self.layers = list(st.get("layers", []))
         if self.sel_layer is not None and not any(l["id"] == self.sel_layer for l in self.layers):
             self.sel_layer = None
@@ -3053,7 +3096,8 @@ class Card(QWidget):
         if self._tool in CROP_KEYS or self._tool == "transform":
             self._go_move()
         self._clear_clone()
-        if st["base"] is self.base and st.get("ctx") == self.ctx and st.get("alpha") is self.alpha:   # same picture: only values / selection changed
+        if st["base"] is self.base and st.get("ctx") == self.ctx and st.get("alpha") is self.alpha \
+                and st.get("palpha") is self.palpha:   # same picture: only values / selection changed
             self._set_fields(st)
             self.canvas.set_selection(self.sel)
             self._hl_key = None
@@ -3064,7 +3108,8 @@ class Card(QWidget):
 
         def work(progress):
             return self._build_view(st["base"], st["adjs"], core.new_look(**st["look"]), st.get("sel"),
-                                    self._deco_from(st.get("ctx"), st.get("alpha"), st.get("layers", [])))
+                                    self._deco_from(st.get("ctx"), st.get("alpha"), st.get("layers", [])),
+                                    st.get("palpha") if st.get("ctx") is None else None)
 
         def done(v):
             self._set_fields(st)
@@ -3140,7 +3185,8 @@ class Card(QWidget):
         fx.pulse("redo")
 
     def _edit_base(self, label, make, keep_sel=True, refit=False, after=None, msg=None, shadow_src=None, merge=False,
-                   checkpoint=True, fail=None, alpha_make=None):
+                   checkpoint=True, fail=None, alpha_make=None, palpha_make=None, clear_palpha=False,
+                   palpha_start=False):
         """Change the picture itself (erase, crop, rotate, move ...) in a worker thread, then show it.
         make(progress) -> new PIL image, or (new image, new selection)."""
         hint, self._fx_hint = (getattr(self, "_fx_hint", None) or {}), None
@@ -3152,6 +3198,7 @@ class Card(QWidget):
         adjs = copy.deepcopy(self.adjs)
         look, sel_in = dict(self.look), self.sel
         ctx_in, alpha_in, layers_in, hide_in = self.ctx, self.alpha, self.layers, self._hide_layer
+        pa_in = self.palpha if ctx_in is None else None           # the page's own transparency (a shaped page)
 
         def work(progress):
             res = make(progress)
@@ -3160,13 +3207,18 @@ class Card(QWidget):
             else:
                 new, sel_out = res, (sel_in if keep_sel else None)
             na = alpha_make(progress) if (alpha_make is not None and ctx_in is not None) else alpha_in
+            if clear_palpha:
+                npa = None
+            elif palpha_make is not None and ctx_in is None and (pa_in is not None or palpha_start):
+                npa = palpha_make(progress, pa_in)
+            else:
+                npa = pa_in
             progress(0.9, "Showing")
-            return new, sel_out, self._build_view(new, adjs, look, sel_out, self._deco_from(ctx_in, na, layers_in, hide_in)), na
+            return (new, sel_out, self._build_view(new, adjs, look, sel_out, self._deco_from(ctx_in, na, layers_in, hide_in), npa),
+                    na, npa)
 
         def done(r):
-            new, sel_out, v, na = r
-            if ctx_in is not None and self.ctx == ctx_in:
-                self.alpha = na
+            new, sel_out, v, na, npa = r
             if not checkpoint:
                 self.ops += 1
             elif merge and self._gest:               # a live shadow slider drag is ONE undo step
@@ -3178,6 +3230,10 @@ class Card(QWidget):
                     self._gest = True
                     self._gest_timer.start(2500)
             self.shadow_src = shadow_src
+            if ctx_in is not None and self.ctx == ctx_in:         # (after the undo step above: it keeps the picture as it was)
+                self.alpha = na
+            if ctx_in is None and self.ctx is None:
+                self.palpha = npa
             self.base = new
             self.sel = sel_out
             self._sel_ver += 1
@@ -3566,7 +3622,12 @@ class Card(QWidget):
         self._refresh_layers_ui()
         self._timer.start()
 
-    def add_picture(self, path=None, image=None, name=None, keep_background=False):
+    def page_pixel_size(self):
+        """(width, height) in pixels of the PAGE (also while a picture layer is opened alone)."""
+        base = self._stash["base"] if (self.ctx is not None and self._stash) else self.base
+        return tuple(base.size)
+
+    def add_picture(self, path=None, image=None, name=None, keep_background=False, fill_page=False):
         """A picture (signature, stamp ...) becomes a new layer: background removed, then placed on the page.
         image = a PIL picture that is already in memory (another picture of the carousel, as it looks now) instead of a
         file; keep_background = put it as it is, do not take its paper / background away."""
@@ -3574,7 +3635,7 @@ class Card(QWidget):
         if not self._loaded:
             return
         if self.ctx is not None:
-            self.leave_layer(lambda: self.add_picture(path, image, name, keep_background))
+            self.leave_layer(lambda: self.add_picture(path, image, name, keep_background, fill_page))
             return
         if path is None and image is None:
             path, _ = QFileDialog.getOpenFileName(self, "Add picture (signature, stamp ...)", "",
@@ -3614,6 +3675,8 @@ class Card(QWidget):
             if hn > 0.6:
                 wn, hn = wn * 0.6 / hn, 0.6
             x0, y0 = 0.5 - wn / 2, 0.5 - hn / 2
+            if fill_page:                                           # a color that covers the whole page
+                x0, y0, wn, hn = 0.0, 0.0, 1.0, 1.0
             layer = {"id": self._layer_seq, "name": label or "Picture %d" % self._layer_seq,
                      "rgb": cut.convert("RGB"), "a": cut.split()[3], "src": rgb, "sa": sa, "bg": bg,
                      "grid": [(x0, y0), (x0 + wn, y0), (x0, y0 + hn), (x0 + wn, y0 + hn)], "n": 1,
@@ -4015,6 +4078,29 @@ class Card(QWidget):
         idx = next((k for k, x in enumerate(self.layers) if x["id"] == lid), 0)
         top, bottom = idx >= len(self.layers) - 1, idx <= 0
         m = QMenu(self)
+        # opacity of this layer (or of all Ctrl-selected layers when this one is one of them): a slider inside the menu
+        ids = {lid} | (set(self.sel_group) if (lid in self.sel_group and len(self.sel_group) > 1) else set())
+        op_w = QWidget()
+        op_l = QHBoxLayout(op_w)
+        op_l.setContentsMargins(14, 4, 14, 4)
+        op_l.setSpacing(8)
+        op_name = QLabel("Opacity")
+        op_sl = QSlider(Qt.Orientation.Horizontal)
+        op_sl.setRange(0, 100)
+        op_sl.setFixedWidth(130)
+        op_sl.setValue(int(l.get("opacity", 100)))
+        op_val = QLabel("%d%%" % op_sl.value())
+        op_val.setMinimumWidth(36)
+        op_sl.setToolTip("How strongly this layer shows on the page: 100% = solid, 0% = invisible.")
+
+        def op_moved(v):
+            op_val.setText("%d%%" % v)
+            self._apply_layer_opacity(ids, v)
+        op_sl.valueChanged.connect(op_moved)
+        for w_ in (op_name, op_sl, op_val):
+            op_l.addWidget(w_)
+        op_act = QWidgetAction(m)
+        op_act.setDefaultWidget(op_w)
         items = [
             ("Move / resize / rotate", lambda: self.place_layer_tool(lid), True),
             ("Edit the text" if is_text else "Edit this picture alone\tdouble click", lambda: self.edit_layer(lid), True),
@@ -4035,9 +4121,14 @@ class Card(QWidget):
             ("Hide" if l.get("visible", True) else "Show", lambda: (self.toggle_layer(lid, not l.get("visible", True)), self._refresh_layers_ui()), True),
             ("Delete\tDel", lambda: self.delete_layer(lid), True),
         ]
+        items.insert(6, "opacity")                    # its own block, after Duplicate / Copy picture
         acts = {}
         for it in items:
             if it is None:
+                m.addSeparator()
+                continue
+            if it == "opacity":
+                m.addAction(op_act)
                 m.addSeparator()
                 continue
             a = m.addAction(it[0])
@@ -4174,8 +4265,9 @@ class Card(QWidget):
         self._clear_clone()
         self._checkpoint()
         self._stash = {"base": self.base, "adjs": self.adjs, "look": dict(self.look), "sel": self.sel,
-                       "shadow_src": self.shadow_src, "shadow": self._shadow_done}
+                       "shadow_src": self.shadow_src, "shadow": self._shadow_done, "palpha": self.palpha}
         self.ctx, self.alpha, self.sel_layer = lid, l["a"], lid
+        self.palpha = None                                  # the page's own transparency waits in the stash
         self.base, self.adjs, self.look, self.sel = l["rgb"], [], core.new_look(), None
         self.shadow_src, self._shadow_done = None, False
         self._view_gen += 1
@@ -4249,7 +4341,7 @@ class Card(QWidget):
                 else:
                     layers.append(l)
             v = self._build_view(st["base"], st["adjs"], core.new_look(**st["look"]), st["sel"],
-                                 self._deco_from(None, None, layers, None))
+                                 self._deco_from(None, None, layers, None), st.get("palpha"))
             return layers, v
 
         def done(r):
@@ -4258,6 +4350,7 @@ class Card(QWidget):
             self.base, self.adjs, self.look, self.sel = st["base"], copy.deepcopy(st["adjs"]), core.new_look(**st["look"]), st["sel"]
             self.shadow_src, self._shadow_done = st["shadow_src"], st["shadow"]
             self.ctx = self.alpha = self._stash = None
+            self.palpha = st.get("palpha")
             self.sel_group = set()
             self._go_move()
             self._clear_clone()
@@ -4495,7 +4588,10 @@ class Card(QWidget):
     def _layer_opacity_changed(self, v):
         if self._opacity_sync or not self._loaded:
             return
-        ids = set(self._border_targets())
+        self._apply_layer_opacity(set(self._border_targets()), v)
+
+    def _apply_layer_opacity(self, ids, v):
+        """Opacity of the given layers (the Layers tab slider and the right-click menu use this)."""
         if not ids:
             return
         self._begin_change()                               # a drag of the slider is one Undo step
@@ -4508,6 +4604,7 @@ class Card(QWidget):
         if self._tool == "transform" and pid in ids and self._layer(pid) is not None:
             self.canvas.set_tf_image(self._layer_qimage(self._layer(pid)))
         self._border_icon_timer.start()
+        self._sync_layer_opacity_ui()
 
     def _sync_layer_opacity_ui(self):
         if not hasattr(self, "layerOpacity"):
@@ -4796,7 +4893,7 @@ class Card(QWidget):
 
         def work(progress):
             new = core.remove_shadow(base, opts["strength"] / 100.0, progress, opts) if need_shadow else base
-            return new, self._build_view(new, adjs, look, sel)
+            return new, self._build_view(new, adjs, look, sel, None, self.palpha if self.ctx is None else None)
 
         def done(r):
             new, v = r
@@ -4965,6 +5062,27 @@ class Card(QWidget):
         self._timer.start()                          # every edit is limited to the selection
         self._touch()
 
+    def _reround_box(self, rad):
+        """Round corners on / off or Roundness changed while a Box selection is there: ONLY the box selected last changes
+        (the parts selected before it, with Shift / Add, stay as they are).  Works only while that selection is still the
+        current one; any other selection step ends it."""
+        lb = getattr(self, "_last_box", None)
+        if lb is None or not self._loaded or self.sel is None or self.sel is not lb["sel"]:
+            return
+        H, W = self.prev.shape[:2]
+        if lb["size"] != (W, H):
+            return
+        mask = core.shape_mask((W, H), "rect", lb["data"], radius=rad)
+        new = core.sel_combine(lb["base"], mask, lb["mode"])
+        if new is None:
+            return
+        if not self._gest:
+            self._cur_snap = self._snap()                     # the 'before' of this drag = the box with its old corners
+        self._begin_change()                                  # the whole slider drag is ONE undo step
+        self.sel = new
+        lb["sel"] = new
+        self._sel_changed()
+
     def _set_selection(self, mask, mode=None, after=None):
         """after(base_selection) is called once the selection is really in place (also when the settings had to be
         written into the picture first) - the Color range click uses it to remember itself for the live sliders."""
@@ -5119,7 +5237,12 @@ class Card(QWidget):
         H, W = self.prev.shape[:2]
         size_prev = self.sizeSlider.value() * self.scale
         if kind in ("rect", "ellipse", "lasso"):
-            self._set_selection(core.shape_mask((W, H), kind, data, radius=self._radius_of("rect") if kind == "rect" else 0.0), mode)
+            rad = self._radius_of("rect") if kind == "rect" else 0.0
+            after = None
+            if kind == "rect":
+                def after(base, data=data, mode=mode, size=(W, H)):          # remembered once the selection is really in place
+                    self._last_box = {"data": tuple(data), "base": base, "mode": mode, "size": size, "sel": self.sel}
+            self._set_selection(core.shape_mask((W, H), kind, data, radius=rad), mode, after=after)
             return
         if kind == "brush" and self._tool == "deselect":
             self._deselect_brush(data, size_prev)
@@ -5322,7 +5445,6 @@ class Card(QWidget):
         self.btnCancel.setVisible(pend)
         self.optsA.setVisible(sel_t or er or key in ("transform", "paint", "crop", "persp", "crop_round"))
         self.roundBox.setVisible(key in ROUND_KEYS)
-        self.cropOutW.setVisible(key in ("crop", "crop_round"))
         self.tfBox.setVisible(key == "transform")
         self.cropBox.setVisible(key in ("crop", "persp"))
         self.optsB.setVisible(sel_t or key in MOVE_KEYS)
@@ -5503,7 +5625,7 @@ class Card(QWidget):
                 self._rsync = False
             self.sldCropRound.setEnabled(bool(on))
             self.lblCropRound.setText("%d%%" % pct)
-            self.cmbCropOut.setEnabled(bool(on))
+            self.cornerPreview.set_corners(on, pct)
         r = self._radius_of(key)
         self.canvas.set_crop_radius(r if key in ("crop", "crop_round") else 0.0)
         self.canvas.set_box_radius(r if key in ("rect", "erase_rect") else 0.0)
@@ -5514,11 +5636,13 @@ class Card(QWidget):
         g = self._rgroup(self._tool)
         self._rstate[g] = [self.chkCropRound.isChecked(), int(self.sldCropRound.value())]
         self.sldCropRound.setEnabled(self.chkCropRound.isChecked())
-        self.cmbCropOut.setEnabled(self.chkCropRound.isChecked())
         self.lblCropRound.setText("%d%%" % self.sldCropRound.value())
+        self.cornerPreview.set_corners(self.chkCropRound.isChecked(), self.sldCropRound.value())
         r = self._radius_of(self._tool)
         self.canvas.set_crop_radius(r if self._tool in ("crop", "crop_round") else 0.0)    # the outline follows at once
         self.canvas.set_box_radius(r if self._tool in ("rect", "erase_rect") else 0.0)
+        if self._tool == "rect":
+            self._reround_box(r)                                                          # the box that is already selected follows too
         try:
             p = _prefs()
             key = "crop" if g == "round" else "box"
@@ -5527,44 +5651,46 @@ class Card(QWidget):
         except Exception:
             pass
 
-    def _crop_out_changed(self):
-        try:
-            _prefs().setValue("crop/outside", self.cmbCropOut.hex())
-        except Exception:
-            pass
-
     def _apply_crop(self):
+        """Crop / straighten / crop to a shape.  A shape (circle, oval, rounded box, round corners) leaves NOTHING behind it:
+        the outside is transparent (a picture layer and a page alike), saved as PNG / WEBP / TIF."""
         if not self._loaded:
             return
         c = self.canvas
         s = self.scale
         base = self.base
         alpha = self.alpha
+        palpha = self.palpha if self.ctx is None else None
         inlayer = self.ctx is not None
         back = self._auto_back
         alpha_make = None
+        palpha_make = None
+        grow = False                                          # True = the page gets transparent corners / outside
         if self._tool == "crop":
             l, t, r, b = c.crop_rect_img()
             box = (l / s, t / s, r / s, b / s)
             rad = self._radius_of("crop")
             if rad > 0:                                        # plain crop with round corners (Corners switched on)
                 cache = {}
-                out_rgb = self.cmbCropOut.rgb()
 
                 def shaped():
                     if "v" not in cache:
-                        cache["v"] = core.crop_to_shape(base, alpha if inlayer else None, box, "round", fill=out_rgb, radius=rad)
+                        cache["v"] = core.crop_to_shape(base, alpha if inlayer else palpha, box, "round", radius=rad)
                     return cache["v"]
 
                 def make(progress):
                     return shaped()[0]
                 if inlayer:
                     alpha_make = lambda progress: shaped()[1]
+                else:
+                    palpha_make = lambda progress, pa: shaped()[1]
+                    grow = True                               # the page now has transparent corners
             else:
                 def make(progress):
                     return core.crop_box(base, box)
                 if inlayer:
                     alpha_make = lambda progress: core.crop_box(alpha.convert("RGB"), box).convert("L")
+                palpha_make = lambda progress, pa: core.crop_box(pa.convert("RGB"), box).convert("L")
         elif self._tool == "persp":
             quad = [(x / s, y / s) for x, y in c.quad_img()]
 
@@ -5573,6 +5699,7 @@ class Card(QWidget):
                 return scanner.straighten(base, quad)
             if inlayer:                                       # the transparency is straightened the same way (same size)
                 alpha_make = lambda progress: scanner.straighten(alpha.convert("RGB"), quad).convert("L")
+            palpha_make = lambda progress, pa: scanner.straighten(pa.convert("RGB"), quad).convert("L")
         elif self._tool in CROP_SHAPE:                        # circle / oval / rounded box
             l, t, r, b = [v / s for v in c.crop_rect_img()]
             shape = "round" if self._tool == "crop_round" else "oval"
@@ -5583,19 +5710,22 @@ class Card(QWidget):
             box = (l, t, r, b)
             cache = {}
             rad = self._radius_of("crop_round")
-            out_rgb = self.cmbCropOut.rgb() if self._tool == "crop_round" else None      # circle / oval: the paper color as before
 
             def shaped():
                 if "v" not in cache:
-                    cache["v"] = core.crop_to_shape(base, alpha if inlayer else None, box, shape, fill=out_rgb, radius=rad)
+                    cache["v"] = core.crop_to_shape(base, alpha if inlayer else palpha, box, shape, radius=rad)
                 return cache["v"]
 
             def make(progress):
                 return shaped()[0]
             if inlayer:
                 alpha_make = lambda progress: shaped()[1]
+            else:
+                palpha_make = lambda progress, pa: shaped()[1]
+                grow = True
         else:
             return
+        palpha_start = grow and not inlayer                   # the page had no transparency yet: it starts as the shape
 
         def after():
             self._clear_clone()
@@ -5605,11 +5735,12 @@ class Card(QWidget):
                 self.leave_layer()
         self._fx_hint = {"title": "Straightened" if self._tool == "persp" else "Cropped",
                          "detail": lambda: "%d \u00d7 %d px" % self.base.size}
-        self._edit_base("Cropping", make, keep_sel=False, refit=True, after=after, alpha_make=alpha_make)
+        self._edit_base("Cropping", make, keep_sel=False, refit=True, after=after, alpha_make=alpha_make,
+                        palpha_make=palpha_make, palpha_start=palpha_start)
 
     def crop_to_selection(self):
         """Keeps only what is inside the current selection (any shape: box, ellipse, freehand, color range).
-        A picture (signature, stamp ...) becomes transparent outside the shape; on the page the outside gets the paper color."""
+        Everything outside the shape becomes transparent (a picture layer and the page alike): no background is left."""
         if not self._loaded:
             return
         if self.ctx is None and self._place_id is not None and self._layer(self._place_id) is not None:
@@ -5630,17 +5761,19 @@ class Card(QWidget):
         s = self.scale
         box = (x0 / s, y0 / s, x1 / s, y1 / s)
         base, alpha, inlayer = self.base, self.alpha, self.ctx is not None
+        palpha = self.palpha if not inlayer else None
         mask = self._mask_img(self.sel, base.size)
         cache = {}
 
         def shaped():
             if "v" not in cache:
-                cache["v"] = core.crop_to_shape(base, alpha if inlayer else None, box, None, mask=mask)
+                cache["v"] = core.crop_to_shape(base, alpha if inlayer else palpha, box, None, mask=mask)
             return cache["v"]
         self._fx_hint = {"detail": lambda: "%d \u00d7 %d px" % self.base.size}
         self._edit_base("Cropping to the shape", lambda progress: shaped()[0], keep_sel=False, refit=True,
                         alpha_make=(lambda progress: shaped()[1]) if inlayer else None,
-                        msg="Cropped to the selected shape.")
+                        palpha_make=None if inlayer else (lambda progress, pa: shaped()[1]), palpha_start=not inlayer,
+                        msg="Cropped to the selected shape. Nothing is left behind it (transparent: save as PNG).")
 
     def _on_tf_copy(self, on):
         if on:
@@ -5678,6 +5811,7 @@ class Card(QWidget):
             self._go_move()
         base, alpha = self.base, self.alpha
         am = (lambda progress: core.rotate_image(alpha.convert("RGB"), deg_ccw).convert("L")) if self.ctx is not None else None
+        pm = lambda progress, pa: core.rotate_mask(pa, deg_ccw)
         quarter = int(round(deg_ccw / 90.0)) % 4 if abs(deg_ccw / 90.0 - round(deg_ccw / 90.0)) < 1e-6 else None
         layers_in = self.layers if (self.ctx is None and quarter) else None
 
@@ -5696,7 +5830,7 @@ class Card(QWidget):
                 self._timer.start()
         self._fx_hint = {"detail": "%g\u00b0 %s" % (abs(deg_ccw), "to the left" if deg_ccw > 0 else "to the right")}
         self._edit_base("Rotating", lambda progress: core.rotate_image(base, deg_ccw), keep_sel=False, refit=True,
-                        alpha_make=am, after=after)
+                        alpha_make=am, after=after, palpha_make=pm)
 
     def _auto_shadow(self, live=False):
         """Shadow removal. It always starts from the picture BEFORE the first shadow removal, so the options
@@ -5802,6 +5936,7 @@ class Card(QWidget):
             self._sel_ver += 1
             self._touch()
         self._edit_base("Resetting " + self.name, make, keep_sel=False, refit=True, checkpoint=False, after=after,
+                        clear_palpha=True,
                         fail=lambda msg: self.message.emit("Cannot reload: " + msg.splitlines()[0]))
 
     # ------------------------------------------------------ copy / drag out
