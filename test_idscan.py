@@ -75,6 +75,32 @@ def run():
     prev.resize((620, 877)).save(sys.argv[1] if len(sys.argv) > 1 else "idscan_preview.png")
     page2, items2 = idscan.compose_page(f, b, 200, "Letter", "top")
     assert page2.size == (1700, 2200), page2.size
+    # corner roundness: 0 = square, bigger = rounder, the picture itself never changes
+    sq = idscan.rounded_card(f, pct=0)
+    r1_, r2_, r3_ = (idscan.corner_radius(f.size, v) for v in (50, 100, 200))
+    assert sq.getpixel((0, 0))[3] == 255 and idscan.corner_radius(f.size, 0) == 0.0, "pct 0 = square corners"
+    assert 0 < r1_ < r2_ < r3_, (r1_, r2_, r3_)
+    assert idscan.rounded_card(f, pct=100).getpixel((0, 0))[3] == 0, "real card: the very corner is transparent"
+    _, it0 = idscan.compose_page(f, b, DPI, "A4", rounded=True, round_pct=0)
+    assert it0[0][1].getpixel((0, 0))[3] == 255, "compose_page with round_pct=0 keeps square corners"
+    assert idscan.round_alpha(f.size, 150).size == f.size
+    # page colour: white (default), solid black, any colour
+    pw, _ = idscan.compose_page(f, b, DPI, "A4")
+    pb, _ = idscan.compose_page(f, b, DPI, "A4", page_color=(0, 0, 0))
+    pc, _ = idscan.compose_page(f, b, DPI, "A4", page_color=(10, 90, 160))
+    assert pw.getpixel((2, 2)) == (255, 255, 255) and pb.getpixel((2, 2)) == (0, 0, 0) and pc.getpixel((2, 2)) == (10, 90, 160)
+    # box corners (select / erase / crop) and fill opacity in core
+    import core
+    from PIL import Image as _I
+    m0 = core.make_mask((100, 80), "rect", (10, 10, 90, 70))
+    m1 = core.make_mask((100, 80), "rect", (10, 10, 90, 70), radius=0.3)
+    assert m0.getpixel((10, 10)) == 255 and m1.getpixel((10, 10)) == 0 and m1.getpixel((50, 40)) == 255, "rounded box mask"
+    im = _I.new("RGB", (100, 80), (200, 200, 200))
+    full = _I.new("L", (100, 80), 255)
+    assert core.fill_region(im, full, (0, 0, 0)).getpixel((5, 5)) == (0, 0, 0)
+    assert 90 < core.fill_region(im, full, (0, 0, 0), 0.5).getpixel((5, 5))[0] < 110, "fill opacity 50%"
+    rgb, a = core.crop_to_shape(im, None, (0, 0, 100, 80), "round", fill=(0, 0, 0), radius=0.3)
+    assert rgb.getpixel((0, 0)) == (0, 0, 0) and a is None, "outside the round corners = chosen colour"
     print("FAILED: %s" % fails if fails else "ALL OK")
     return 1 if fails else 0
 

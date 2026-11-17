@@ -1235,22 +1235,27 @@ def outline_mask(size, shape, radius=0.22):
     if shape == "oval":
         d.ellipse(box, fill=255)
     elif shape == "round":
-        d.rounded_rectangle(box, int(min(W, H) * ss * radius), fill=255)
+        r = int(min(W, H) * ss * max(0.0, min(0.5, float(radius))))
+        if r > 0:
+            d.rounded_rectangle(box, r, fill=255)
+        else:
+            d.rectangle(box, fill=255)
     else:
         d.rectangle(box, fill=255)
     return big.resize((W, H), Image.Resampling.LANCZOS) if ss > 1 else big
 
 
-def crop_to_shape(img, alpha, box, shape, mask=None, fill=None):
+def crop_to_shape(img, alpha, box, shape, mask=None, fill=None, radius=0.22):
     """Cut 'box' out of the picture in a shape.  Returns (rgb, alpha).
     alpha (PIL 'L' or None) = the picture's transparency: outside the shape it becomes transparent.
     With alpha None the outside is filled with 'fill' (the paper colour) instead.
-    mask = an own mask of the whole picture (selection shape) instead of a ready-made shape."""
+    mask = an own mask of the whole picture (selection shape) instead of a ready-made shape.
+    radius = for the 'round' shape: how round the corners are, as a fraction of the shorter side (0 = square, 0.5 = most)."""
     rgb = crop_box(img, box)
     if mask is not None:
         m = crop_box(mask.convert("L"), box).convert("L")
     else:
-        m = outline_mask(rgb.size, shape)
+        m = outline_mask(rgb.size, shape, radius)
     if alpha is not None:
         a = crop_box(alpha.convert("L"), box).convert("L")
         return rgb, ImageChops.multiply(a, m)
@@ -1269,7 +1274,7 @@ def crop_box(img, box):
 
 
 # ------------------------------------------------------------- eraser / clone
-def make_mask(size, shape, data, brush=20.0):
+def make_mask(size, shape, data, brush=20.0, radius=0.0):
     """Mask (PIL 'L', 255 = erase) from what the user drew, in real picture pixels.
     shape: 'brush' (list of points, brush = width), 'rect' / 'ellipse' ((x0,y0,x1,y1)), 'lasso' (list of points)."""
     m = Image.new("L", size, 0)
@@ -1284,7 +1289,12 @@ def make_mask(size, shape, data, brush=20.0):
             d.ellipse((x - r, y - r, x + r, y + r), fill=255)
     elif shape == "rect":
         x0, y0, x1, y1 = data
-        d.rectangle((min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)), fill=255)
+        bx = (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+        r = float(radius) * min(bx[2] - bx[0], bx[3] - bx[1])         # radius = fraction of the shorter side (0 = square)
+        if r >= 1.0:
+            d.rounded_rectangle(bx, min(r, (min(bx[2] - bx[0], bx[3] - bx[1])) / 2.0), fill=255)
+        else:
+            d.rectangle(bx, fill=255)
     elif shape == "ellipse":
         x0, y0, x1, y1 = data
         d.ellipse((min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)), fill=255)
@@ -1713,9 +1723,9 @@ def sel_coverage(m):
     return 0.0 if m is None else float((m > 0.5).mean())
 
 
-def shape_mask(size, shape, data, brush=20.0):
+def shape_mask(size, shape, data, brush=20.0, radius=0.0):
     """Float mask from a drawn rectangle / ellipse / lasso / brush (coordinates in the same pixels as size=(w,h))."""
-    return np.asarray(make_mask(size, shape, data, brush), dtype=np.float32) / 255.0
+    return np.asarray(make_mask(size, shape, data, brush, radius), dtype=np.float32) / 255.0
 
 
 def color_range_mask(lab, rgb, tol=30.0):
@@ -2056,8 +2066,10 @@ def paint_brush(img, pts, brush, rgb, opacity=1.0, softness=0.0, sel=None, alpha
     return out
 
 
-def fill_region(img, mask, rgb):
-    """Paints the masked area with one colour. mask = PIL 'L' at the picture's size."""
+def fill_region(img, mask, rgb, opacity=1.0):
+    """Paints the masked area with one colour. mask = PIL 'L' at the picture's size.  opacity 0..1 (1 = solid)."""
+    if opacity < 0.999:
+        mask = mask.point(lambda v, f=max(0.0, float(opacity)): int(v * f + 0.5))
     solid = Image.new("RGB", img.size, tuple(int(v) for v in rgb))
     return Image.composite(solid, img, mask)
 

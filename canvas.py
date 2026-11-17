@@ -110,6 +110,8 @@ class ImageCanvas(QWidget):
         self._tf = None                       # transform: dict(img, w, h, cx, cy, sx, sy, ang)
         self._tf_drag = None
         self.crop_shape = "rect"              # 'rect' | 'circle' | 'oval' | 'round': the shape the crop box will keep
+        self.crop_radius = 0.22               # crop: how round the corners are (fraction of the shorter side, 0 = square)
+        self.box_radius = 0.0                 # Box select / Box erase: the same for the box that is drawn (0 = square)
         self._scaled = None                   # (key, QImage): the picture shrunk with a proper filter (crisp text when zoomed out)
         self._scale_timer = QTimer(self)
         self._scale_timer.setSingleShot(True)
@@ -797,6 +799,14 @@ class ImageCanvas(QWidget):
         self.crop_shape = shape
         self.update()
 
+    def set_crop_radius(self, r):
+        self.crop_radius = max(0.0, min(0.5, float(r)))
+        self.update()
+
+    def set_box_radius(self, r):
+        self.box_radius = max(0.0, min(0.5, float(r)))
+        self.update()
+
     def _crop_shape_path(self, wr):
         """Outline (widget coordinates) of what the crop keeps: the box, or a circle / oval / rounded box inside it."""
         path = QPainterPath()
@@ -807,10 +817,17 @@ class ImageCanvas(QWidget):
         elif sh == "oval":
             path.addEllipse(wr)
         elif sh == "round":
-            r = 0.22 * min(wr.width(), wr.height())
-            path.addRoundedRect(wr, r, r)
+            r = self.crop_radius * min(wr.width(), wr.height())
+            if r > 0.5:
+                path.addRoundedRect(wr, r, r)
+            else:
+                path.addRect(wr)
         else:
-            path.addRect(wr)
+            r = self.crop_radius * min(wr.width(), wr.height())
+            if r > 0.5:                                        # a plain box with round corners (Crop, corners switched on)
+                path.addRoundedRect(wr, r, r)
+            else:
+                path.addRect(wr)
         return path
 
     def crop_rect_img(self):
@@ -1297,7 +1314,11 @@ class ImageCanvas(QWidget):
                 else:
                     rect = QRectF(pts[0], pts[-1]).normalized()
                     if kind == "rect":
-                        shape.addRect(rect)
+                        rr = self.box_radius * min(rect.width(), rect.height())
+                        if rr > 0.5:
+                            shape.addRoundedRect(rect, rr, rr)
+                        else:
+                            shape.addRect(rect)
                     else:
                         shape.addEllipse(rect)
                 if not shape.isEmpty():
@@ -1352,7 +1373,7 @@ class ImageCanvas(QWidget):
 
     def _paint_crop(self, p):
         wr = QRectF(self.to_wid(self._crop.topLeft()), self.to_wid(self._crop.bottomRight()))
-        shaped = self.crop_shape != "rect"
+        shaped = self.crop_shape != "rect" or self.crop_radius > 0.0
         keep = self._crop_shape_path(wr)
         path = QPainterPath()
         path.addRect(self._full_rect_w())

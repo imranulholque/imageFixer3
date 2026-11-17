@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (QCheckBox, QColorDialog, QComboBox, QDialog, QFor
                                QPushButton, QSlider, QVBoxLayout, QWidget)
 
 import idpreview
+from colorchoice import ColorChoice
 import idscan
 import jobs
 import scanfix
@@ -184,6 +185,11 @@ class ScanDialog(QDialog):
         self.lblPage = QLabel("ID card page")
         form.addRow(self.lblPage, r3)
         self._r3 = (self.cmbPage, self.cmbPlace)
+        # colour of the page itself: white, solid black or any colour
+        self.cmbPageColor = ColorChoice([("White", (255, 255, 255)), ("Black", (0, 0, 0))])
+        self.cmbPageColor.setToolTip("The colour of the ID card page behind the cards: white, solid black, or any colour you choose.")
+        self.lblPageColor = QLabel("Page color")
+        form.addRow(self.lblPageColor, self.cmbPageColor)
 
         # border of the card layers: colour + thickness (they can be changed later in the Border tab, too)
         self.chkBorder = QCheckBox("Border")
@@ -208,13 +214,35 @@ class ScanDialog(QDialog):
         self.lblBorder = QLabel("Card border")
         form.addRow(self.lblBorder, r4)
         self.chkBorder.toggled.connect(self._border_enable)
+
+        # corners of the card layers: round on / off + how round (can be changed later in the Border tab, too)
+        self.chkRound = QCheckBox("Round")
+        self.chkRound.setToolTip("Cut the four corners of each card round, like a real card.\n"
+                                 "Switch it off = square corners. How round can be changed any time later in the Border tab.")
+        self.sldRound = QSlider(Qt.Orientation.Horizontal)
+        self.sldRound.setRange(5, idscan.ROUND_MAX)
+        self.sldRound.setToolTip("How round the corners are:  100% = a real ID card,  less = sharper corners,  more = rounder corners")
+        self.lblRoundV = QLabel("")
+        self.lblRoundV.setMinimumWidth(40)
+        self.sldRound.valueChanged.connect(lambda v: self.lblRoundV.setText("%d%%" % v))
+        r5 = QHBoxLayout()
+        r5.addWidget(self.chkRound)
+        self.lblRoundT = QLabel("roundness")
+        r5.addWidget(self.lblRoundT)
+        r5.addWidget(self.sldRound, 1)
+        r5.addWidget(self.lblRoundV)
+        self.lblRound = QLabel("Card corners")
+        form.addRow(self.lblRound, r5)
+        self.chkRound.toggled.connect(self._round_enable)
         self.chkPreview = QCheckBox("Preview each side (front, back) before joining")
         self.chkPreview.setToolTip("After the FRONT and again after the BACK you see how the card will look (corners + border).\n"
                                    "OK = go on, Corner crop = drag the 4 corners yourself, Scan again = scan this side again.\n"
                                    "Switch it off to put the card on the page at once.")
         form.addRow("", self.chkPreview)
         self._idrows = (self.cmbPage, self.cmbPlace, self.lblPage, self.chkBorder, self.btnBorderColor, self.sldBorder,
-                        self.lblBorderW, self.lblBorder, self.chkPreview)
+                        self.lblBorderW, self.lblBorder, self.chkPreview,
+                        self.chkRound, self.sldRound, self.lblRoundV, self.lblRound, self.lblRoundT,
+                        self.cmbPageColor, self.lblPageColor)
         root.addLayout(form)
 
         self.lblStep = QLabel("")
@@ -382,9 +410,28 @@ class ScanDialog(QDialog):
             self.chkDuplex.setChecked(self.st.value("scan/duplex", False, type=bool))
             self.chkClose.setChecked(self.st.value("scan/autoclose", True, type=bool))
             self.chkPreview.setChecked(self.st.value("scan/preview", True, type=bool))
+            self.cmbPageColor.set_hex(self.st.value("scan/page_color", "#ffffff", type=str))
         except Exception:
             pass
         self._load_border()
+        self._load_round()
+
+    def _load_round(self):
+        """The corner settings are shared with the Border tab (when no layer is selected it changes these)."""
+        try:
+            self.chkRound.setChecked(self.st.value("scan/round_on", True, type=bool))
+            self.sldRound.setValue(max(5, min(idscan.ROUND_MAX, int(self.st.value("scan/round_pct", idscan.ROUND_PCT) or idscan.ROUND_PCT))))
+        except Exception:
+            pass
+        self.lblRoundV.setText("%d%%" % self.sldRound.value())
+        self._round_enable()
+
+    def _round_enable(self, *_):
+        self.sldRound.setEnabled(self.chkRound.isChecked())
+
+    def _round(self):
+        """How round the card corners are: 0 = square (switched off), else percent of a real card's corner."""
+        return int(self.sldRound.value()) if self.chkRound.isChecked() else 0
 
     def _load_border(self):
         """The border settings are shared with the Border tab (when no layer is selected it changes these)."""
@@ -427,6 +474,9 @@ class ScanDialog(QDialog):
         self.st.setValue("scan/border_on", self.chkBorder.isChecked())
         self.st.setValue("scan/border_color", self._bcolor)
         self.st.setValue("scan/border_w", int(self.sldBorder.value()))
+        self.st.setValue("scan/page_color", self.cmbPageColor.hex() or "#ffffff")
+        self.st.setValue("scan/round_on", self.chkRound.isChecked())
+        self.st.setValue("scan/round_pct", int(self.sldRound.value()))
         d = self.cmbDev.currentData()
         if d:
             self.st.setValue("scan/device", d["kind"] + "|" + d["id"])
@@ -583,11 +633,13 @@ class ScanDialog(QDialog):
         self._busy = busy
         for w in (self.cmbDev, self.btnRefresh, self.cmbMode, self.cmbSize, self.cmbDpi, self.cmbCol, self.chkUi,
                   self.chkFeed, self.chkDuplex, self.chkClose, self.cmbPage, self.cmbPlace, self.btnAgain,
-                  self.chkBorder, self.chkPreview, self.cmbFix):
+                  self.chkBorder, self.chkRound, self.cmbPageColor, self.chkPreview, self.cmbFix):
             w.setEnabled(not busy)
         if not busy:
             self._border_enable()
+            self._round_enable()
         else:
+            self.sldRound.setEnabled(False)
             self.btnBorderColor.setEnabled(False)
             self.sldBorder.setEnabled(False)
         if busy:
@@ -729,7 +781,7 @@ class ScanDialog(QDialog):
 
     def _show_preview(self, sides, stage):
         names = ["Front"] if stage == "front" else ["Front", "Back"]
-        image = idscan.preview_image([(s["card"], s["found"]) for s in sides], self._border())
+        image = idscan.preview_image([(s["card"], s["found"]) for s in sides], self._border(), round_pct=self._round())
         lost = [n for n, s in zip(names, sides) if not s["found"]]
         text = {"front": "FRONT: this is how it will look on the page. OK, then you scan the BACK.",
                 "back": "FRONT and BACK: this is how they will look. OK puts them together on one page.",
@@ -811,17 +863,20 @@ class ScanDialog(QDialog):
 
     def _finish_id(self, front, back, dpi, page, place, all_found):
         border = self._border()                                  # colour + thickness chosen now (changeable later: Border tab)
+        pcol = self.cmbPageColor.rgb() or (255, 255, 255)        # solid page colour (white, black, any colour)
+        rpct = self._round()                                     # corner roundness chosen now (0 = square; changeable later: Border tab)
 
         def work(progress):
             progress(0.9, "putting the page together")
-            pg, items = idscan.compose_page(front, back, dpi, page, place, rounded=all_found)
+            pg, items = idscan.compose_page(front, back, dpi, page, place, rounded=all_found and rpct > 0, round_pct=rpct,
+                                         page_color=pcol)
             path = os.path.join(self.work, "idcard_%s.png" % time.strftime("%H%M%S"))
             pg.save(path, compress_level=1)
             return path, items
 
         def done(r):
             path, items = r
-            self.win.scan_id_page(path, items, border)
+            self.win.scan_id_page(path, items, border, rpct)
             self._prog_hide(1200)
             self.lblMsg.setText("ID card page is ready (front and back are two layers)." +
                                 ("" if all_found else "  Note: a card was not found in a scan, the whole scan was used."))

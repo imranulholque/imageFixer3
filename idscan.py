@@ -13,6 +13,8 @@ from PIL import Image, ImageDraw
 
 CARD_ASPECT = 85.6 / 54.0                 # ID-1 (bank card, NID, driving licence)
 CORNER_MM = 3.18                          # corner radius of an ID-1 card (ISO 7810)
+ROUND_PCT = 100                           # default corner roundness: 100 = the real card (ISO 7810), 0 = square, 400 = very round
+ROUND_MAX = 400
 # page sizes in millimetres
 PAGES_MM = {"A4": (210.0, 297.0), "A5": (148.0, 210.0), "Letter": (215.9, 279.4), "Legal": (215.9, 355.6)}
 
@@ -164,19 +166,40 @@ def cut_card(img, dpi=300, keep_orientation=False):
     return card, True
 
 
-def rounded_card(card, extra=1.06):
-    """The card as RGBA with the real rounded corners: the four corners of a rectangular cut are scanner lid / shadow /
-    smeared edge, they become transparent (smooth, anti-aliased) so the card looks like the real card on the page."""
-    card = card.convert("RGB")
-    w, h = card.size
-    r = CORNER_MM / 85.6 * max(w, h) * extra             # a hair bigger than the real radius: no dark crumbs left
-    r = max(2.0, min(r, min(w, h) / 2.0))
+def corner_radius(size, pct=ROUND_PCT, extra=1.06):
+    """Corner radius in pixels of a card picture of this size.  pct = 100 is the real ID-1 radius (a hair bigger: no dark
+    crumbs left), 0 = no rounding (0.0), 200 = twice as round ..."""
+    try:
+        pct = max(0.0, min(float(ROUND_MAX), float(pct)))
+    except Exception:
+        pct = float(ROUND_PCT)
+    if pct <= 0:
+        return 0.0
+    w, h = size
+    r = CORNER_MM / 85.6 * max(w, h) * extra * pct / 100.0
+    return max(2.0, min(r, min(w, h) / 2.0))
+
+
+def round_alpha(size, pct=ROUND_PCT):
+    """The transparency (PIL 'L') of a card of this size with its corners cut round (smooth, anti-aliased).
+    pct = 0: nothing is cut (all 255)."""
+    w, h = int(size[0]), int(size[1])
+    r = corner_radius((w, h), pct)
+    if r <= 0:
+        return Image.new("L", (w, h), 255)
     S = 4                                                # drawn 4 times bigger, then reduced = smooth edge
     m = Image.new("L", (w * S, h * S), 0)
     ImageDraw.Draw(m).rounded_rectangle((0, 0, w * S - 1, h * S - 1), radius=r * S, fill=255)
-    m = m.resize((w, h), Image.Resampling.LANCZOS)
+    return m.resize((w, h), Image.Resampling.LANCZOS)
+
+
+def rounded_card(card, extra=1.06, pct=ROUND_PCT):
+    """The card as RGBA with the real rounded corners: the four corners of a rectangular cut are scanner lid / shadow /
+    smeared edge, they become transparent (smooth, anti-aliased) so the card looks like the real card on the page.
+    pct = how round (100 = real card, 0 = square corners, bigger = rounder)."""
+    card = card.convert("RGB")
     out = card.convert("RGBA")
-    out.putalpha(m)
+    out.putalpha(round_alpha(card.size, pct))
     return out
 
 
@@ -185,9 +208,10 @@ def page_pixels(page, dpi):
     return int(round(mm[0] / 25.4 * dpi)), int(round(mm[1] / 25.4 * dpi))
 
 
-def compose_page(front, back, dpi=300, page="A4", place="center", gap_mm=8.0, rounded=True):
-    """FRONT above BACK, real size, centred on a white page.  rounded = the corners are cut round like a real card
-    (transparent corners; every picture is then RGBA).
+def compose_page(front, back, dpi=300, page="A4", place="center", gap_mm=8.0, rounded=True, round_pct=ROUND_PCT,
+                 page_color=(255, 255, 255)):
+    """FRONT above BACK, real size, centred on a page of one solid colour (page_color: white, black, any colour).  rounded = the corners are cut round like a real card
+    (transparent corners; every picture is then RGBA).  round_pct = how round (100 = real card, 0 = square, 400 = very round).
     -> (page picture, [(name, picture, (x0, y0, x1, y1) as fractions of the page), ...])"""
     dpi = max(150, int(dpi))
     PW, PH = page_pixels(page, dpi)
@@ -204,7 +228,7 @@ def compose_page(front, back, dpi=300, page="A4", place="center", gap_mm=8.0, ro
     if f < 1.0:
         cards = [(n, c.resize((max(1, int(c.width * f)), max(1, int(c.height * f))), Image.Resampling.LANCZOS)) for n, c in cards]
     if rounded:
-        cards = [(n, rounded_card(c)) for n, c in cards]
+        cards = [(n, rounded_card(c, pct=round_pct)) for n, c in cards]
     gap = int(round(gap_mm / 25.4 * dpi))
     total = sum(c.height for _, c in cards) + gap * (len(cards) - 1)
     if place == "top":
@@ -216,7 +240,13 @@ def compose_page(front, back, dpi=300, page="A4", place="center", gap_mm=8.0, ro
         x = (PW - c.width) // 2
         items.append((name, c, (x / PW, y / PH, (x + c.width) / PW, (y + c.height) / PH)))
         y += c.height + gap
-    return Image.new("RGB", (PW, PH), (255, 255, 255)), items
+    try:
+        pc = tuple(max(0, min(255, int(v))) for v in page_color)[:3]
+        if len(pc) != 3:
+            raise ValueError
+    except Exception:
+        pc = (255, 255, 255)
+    return Image.new("RGB", (PW, PH), pc), items
 
 
 def paste_preview(page_img, items):
@@ -281,16 +311,16 @@ def make_border(on=True, color=BORDER_COLOR, width=BORDER_W):
     return rgb, w / 1000.0
 
 
-def preview_image(sides, border=None, width=360, bg=(226, 230, 238), pad=14):
+def preview_image(sides, border=None, width=360, bg=(226, 230, 238), pad=14, round_pct=ROUND_PCT):
     """How the cards will look on the page (round corners + border), side by side, small.
-    sides = [(card picture, found), ...] -> PIL RGB."""
+    sides = [(card picture, found), ...] -> PIL RGB.  round_pct as in rounded_card (0 = square corners)."""
     import core
     tiles = []
     for card, found in sides:
         c = card.convert("RGB")
         if c.width != width:
             c = c.resize((width, max(1, int(round(c.height * width / float(c.width))))), Image.Resampling.LANCZOS)
-        t = rounded_card(c) if found else c.convert("RGBA")
+        t = rounded_card(c, pct=round_pct) if found else c.convert("RGBA")
         if border:
             try:
                 t = core._apply_border(t, border)

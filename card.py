@@ -25,6 +25,7 @@ from canvas import ImageCanvas, np_to_qimage
 from compare import CompareOverlay
 from fullview import FullViewOverlay
 import scanner
+from colorchoice import ColorChoice
 from flow import ElidedLabel, FlowLayout
 from jobs import _log, run_background
 
@@ -130,7 +131,7 @@ HINTS = {
     "persp": "Drag the 4 corner points onto the 4 corners of the page, then Apply (Enter).",
     "crop_circle": "Drag the box: a circle fits in its shorter side.  Apply (Enter).  A picture (signature, stamp ...) becomes transparent outside the circle.",
     "crop_oval": "Drag the box: an oval (ellipse) fits in it.  Apply (Enter).  A picture becomes transparent outside the oval.",
-    "crop_round": "Drag the box: its corners will be rounded.  Apply (Enter).  A picture becomes transparent outside.",
+    "crop_round": "Drag the box: its corners will be rounded (switch the corners on / off and choose how round in the bar above).  Apply (Enter).  A picture becomes transparent outside.",
     "erase_brush": "Paint over what you want to remove: it is filled with what surrounds it.  Alt + click = copy from there.",
     "erase_rect": "Drag a box over what you want to remove.",
     "erase_ellipse": "Drag an ellipse over what you want to remove.",
@@ -144,6 +145,7 @@ LOOK_TITLES = {"bright": "Brightness", "contrast": "Contrast", "sat": "Saturatio
                "sharp": "Text sharpness", "objs": "Line & shape sharpness", "detail": "Faint strokes",
                "dark": "Text darkness", "clear": "Clean specks"}
 SHAPES = {"erase_brush": "brush", "erase_rect": "rect", "erase_ellipse": "ellipse", "erase_lasso": "lasso"}
+ROUND_KEYS = ("crop_round", "crop", "rect", "erase_rect")      # tools whose box can have round corners (on / off + roundness)
 
 # what the toast says for each kind of work (label given to _edit_base -> icon, text when finished)
 ACTIONS = {
@@ -1213,6 +1215,53 @@ class Card(QWidget):
         self.btnFindPage.clicked.connect(lambda: self.auto_crop())
         cbl.addWidget(self.btnFindPage)
         a.addWidget(self.cropBox)
+        # Corners of every box-like tool: Crop to rounded box, plain Crop, Box select, Box erase.  On / off + how round.
+        # "round" = Crop to rounded box (starts ON), "box" = the other box tools (start OFF: square, like before).
+        self.roundBox = QWidget()
+        rbl = QHBoxLayout(self.roundBox)
+        rbl.setContentsMargins(0, 0, 0, 0)
+        rbl.setSpacing(6)
+        self.chkCropRound = QCheckBox("Round corners")
+        self.chkCropRound.setToolTip("On = the corners of the box are round.  Off = square corners (no rounding at all).")
+        self.sldCropRound = NoWheelSlider(Qt.Orientation.Horizontal)
+        self.sldCropRound.setRange(1, 50)
+        self.sldCropRound.setFixedWidth(130)
+        self.sldCropRound.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.sldCropRound.setToolTip("How round the corners are (percent of the shorter side of the box): small = a little round, 50 = a pill / circle end")
+        self.lblCropRound = self._label("22%")
+        self.lblCropRound.setMinimumWidth(40)
+        self._rstate = {"round": [True, 22], "box": [False, 22]}
+        try:
+            p_ = _prefs()
+            for g_, dflt in (("round", True), ("box", False)):
+                key_ = "crop" if g_ == "round" else "box"
+                self._rstate[g_] = [p_.value(key_ + "/round_on", dflt, type=bool),
+                                    max(1, min(50, int(p_.value(key_ + "/round_pct", 22) or 22)))]
+        except Exception:
+            pass
+        self._rsync = False
+        self.cropOutW = QWidget()                       # the colour outside the round corners (a page only; a picture layer becomes transparent)
+        cow = QHBoxLayout(self.cropOutW)
+        cow.setContentsMargins(0, 0, 0, 0)
+        cow.setSpacing(6)
+        self.cmbCropOut = ColorChoice([("Paper color", None), ("Black", (0, 0, 0)), ("White", (255, 255, 255))])
+        self.cmbCropOut.setToolTip("What is outside the rounded corners on a page: the paper color (automatic), solid black, white or any color.\n"
+                                   "A picture layer (signature, stamp, ID card ...) becomes transparent there instead.")
+        try:
+            self.cmbCropOut.set_hex(_prefs().value("crop/outside", "", type=str))
+        except Exception:
+            pass
+        cow.addWidget(self._label("Outside"))
+        cow.addWidget(self.cmbCropOut)
+        self.chkCropRound.toggled.connect(lambda _=False: self._crop_round_changed())
+        self.sldCropRound.valueChanged.connect(lambda _=0: self._crop_round_changed())
+        self.cmbCropOut.changed.connect(self._crop_out_changed)
+        rbl.addWidget(self.chkCropRound)
+        rbl.addWidget(self._label("Roundness"))
+        rbl.addWidget(self.sldCropRound)
+        rbl.addWidget(self.lblCropRound)
+        rbl.addWidget(self.cropOutW)
+        a.addWidget(self.roundBox)
         self.sizeBox = QWidget()
         sb = QHBoxLayout(self.sizeBox)
         sb.setContentsMargins(0, 0, 0, 0)
@@ -1634,6 +1683,9 @@ class Card(QWidget):
         fw = QWidget()
         fw.setLayout(fr)
         gl2.addWidget(fw)
+        self.fillOpacity = SliderRow("Fill opacity", 1, 100, 100, ("faint", "", "solid"),
+                                     "How strongly the color covers: 100% = solid, less = see-through.", "%")
+        gl2.addWidget(self.fillOpacity)
         self.btnFill = QPushButton("Fill selection with this color")
         self.btnDelete = QPushButton("Delete selection  (Del)")
         self.btnDelete.setToolTip("Remove what is selected; the place is filled from its surroundings")
@@ -1910,6 +1962,13 @@ class Card(QWidget):
             b_.setMinimumWidth(0)
             lrow.addWidget(b_, 1)
         gl.addLayout(lrow)
+        self.layerOpacity = SliderRow("Opacity of the selected layer", 0, 100, 100, ("see-through", "", "solid"),
+                                      "How strongly the selected layer(s) show on the page (picture, ID card, text box).\n"
+                                      "Ctrl + click several layers to change them together.  The border keeps its full color.", "%")
+        self.layerOpacity.setEnabled(False)
+        self._opacity_sync = False
+        self.layerOpacity.changed.connect(self._layer_opacity_changed)
+        gl.addWidget(self.layerOpacity)
         self.btnLayerEdit.clicked.connect(lambda: self.sel_layer is not None and self.edit_layer(self.sel_layer))
         self.btnLayerMove.clicked.connect(lambda: self.sel_layer is not None and self.place_layer_tool(self.sel_layer))
         self.btnLayerCopy.clicked.connect(lambda: self.sel_layer is not None and self.duplicate_layer(self.sel_layer))
@@ -1963,8 +2022,27 @@ class Card(QWidget):
         hb.setWordWrap(True)
         gl.addWidget(hb)
         lay.addWidget(g)
+        # ---- corners of an ID card layer: round on / off + how round
+        g2, g2l = self._group_box("Card corners", collapsible=False)
+        self._round_sync = False
+        self.lblRoundFor = QLabel("")
+        self.lblRoundFor.setObjectName("hint")
+        self.lblRoundFor.setWordWrap(True)
+        g2l.addWidget(self.lblRoundFor)
+        self.chkRoundOn = QCheckBox("Round the corners  (switch off = square corners)")
+        g2l.addWidget(self.chkRoundOn)
+        self.roundRow = SliderRow("Roundness", 5, idscan.ROUND_MAX, idscan.ROUND_PCT, ("sharper", "real card", "rounder"),
+                                  "How round the corners are. 100% = the corner of a real ID card, less = sharper, more = rounder.", "%")
+        g2l.addWidget(self.roundRow)
+        hr = QLabel("Works on the ID card layers (Front / Back). With no layer selected these are the settings of the next ID card scan.")
+        hr.setObjectName("hint")
+        hr.setWordWrap(True)
+        g2l.addWidget(hr)
+        lay.addWidget(g2)
         lay.addStretch(1)
         self.stackPages.addWidget(pg)
+        self.chkRoundOn.toggled.connect(lambda _=False: self._round_changed("on"))
+        self.roundRow.changed.connect(lambda v: self._round_changed("pct"))
         self._border_icon_timer = QTimer(self)
         self._border_icon_timer.setSingleShot(True)
         self._border_icon_timer.setInterval(250)
@@ -3458,14 +3536,17 @@ class Card(QWidget):
             self.canvas.set_tf_image(self._layer_qimage(l))                # the finished picture of the text
             self.canvas.setFocus()
 
-    def add_fixed_layers(self, items, border=None):
+    def add_fixed_layers(self, items, border=None, round_pct=None):
         """Pictures that are put on the page exactly where they belong (the scanned ID card: front and back).
         items = [(name, PIL picture, (x0, y0, x1, y1) as fractions of the page)].  Nothing is cut away from them.
-        border = ((r, g, b), thickness) chosen in the Scan window, or None = no border (the Border tab changes it later)."""
+        border = ((r, g, b), thickness) chosen in the Scan window, or None = no border (the Border tab changes it later).
+        round_pct = corner roundness used in the Scan window (0 = square, 100 = real card, None = not known: 100); the
+        Border tab can change it later (the layer keeps its full rectangular picture, only the transparency is redrawn)."""
         self.ensure_loaded()
         if not self._loaded or self.ctx is not None:
             return
         bg = dict(self.BG_DEFAULT, remove=False, opacity=100)
+        rp = idscan.ROUND_PCT if round_pct is None else max(0, int(round_pct))
         self._checkpoint("ID card")
         new = []
         for name, im, (x0, y0, x1, y1) in items:
@@ -3475,7 +3556,8 @@ class Card(QWidget):
             new.append({"id": self._layer_seq, "name": name, "rgb": rgb, "a": alpha, "src": rgb,
                         "sa": None, "bg": bg, "grid": [(x0, y0), (x1, y0), (x0, y1), (x1, y1)], "n": 1,
                         "opacity": 100, "visible": True,
-                        "border": border})
+                        "border": border, "idcard": True,
+                        "round_on": rp > 0, "round_pct": rp if rp > 0 else self._round_pref()[1]})
         self.layers = self.layers + new
         self.ops += 1
         self.sel_layer = None
@@ -4328,6 +4410,117 @@ class Card(QWidget):
         self._set_border([l["id"] for l in self.layers], self._border_state())
         self._notify("border", "Border on every layer" if self.chkBorderOn.isChecked() else "Border removed from every layer", "")
 
+    # ---- corner roundness of ID card layers (Border tab)
+    @staticmethod
+    def _round_pref():
+        """(on, percent) the next ID card scan will use (shared with the Scan window)."""
+        try:
+            p = _prefs()
+            return (bool(p.value("scan/round_on", True, type=bool)),
+                    max(5, min(idscan.ROUND_MAX, int(p.value("scan/round_pct", idscan.ROUND_PCT) or idscan.ROUND_PCT))))
+        except Exception:
+            return True, idscan.ROUND_PCT
+
+    def _round_targets(self):
+        return [i for i in self._border_targets() if (self._layer(i) or {}).get("idcard")]
+
+    def _round_enable_ui(self):
+        self.roundRow.setEnabled(self.chkRoundOn.isChecked())
+
+    def _round_changed(self, what):
+        """what = "on" | "pct".  With ID card layer(s) selected their corners change (one Undo step; a drag of the
+        slider is one step); with none selected these are the settings of the NEXT ID card scan."""
+        if self._round_sync:
+            return
+        self._round_enable_ui()
+        on, pct = self.chkRoundOn.isChecked(), int(self.roundRow.value())
+        ids = self._round_targets()
+        if not ids or not self._loaded:
+            try:
+                p = _prefs()
+                p.setValue("scan/round_on", on)
+                p.setValue("scan/round_pct", pct)
+            except Exception:
+                pass
+            return
+        if what == "pct":
+            self._begin_change()
+        else:
+            self._checkpoint("Corners")
+        self._set_round(ids, on, pct)
+
+    def _set_round(self, ids, on, pct):
+        """The corners of these layers are cut again from their full rectangular picture (nothing is lost when going back)."""
+        ids = set(ids)
+        new = []
+        for l in self.layers:
+            if l["id"] in ids:
+                try:
+                    a = idscan.round_alpha(l["rgb"].size, pct if on else 0)
+                    l = dict(l, a=a, round_on=bool(on), round_pct=int(pct))
+                except Exception:
+                    pass
+            new.append(l)
+        self.layers = new
+        self.ops += 1
+        self._touch()
+        self._sync_live()
+        self._timer.start()
+        pid = self._place_id
+        if self._tool == "transform" and pid in ids and self._layer(pid) is not None:
+            self.canvas.set_tf_image(self._layer_qimage(self._layer(pid)))
+        self._border_icon_timer.start()
+
+    def _sync_round_ui(self):
+        if not hasattr(self, "roundRow"):
+            return
+        ids = self._round_targets()
+        self._round_sync = True
+        try:
+            if ids:
+                l = self._layer(ids[0])
+                self.chkRoundOn.setChecked(bool(l.get("round_on", True)))
+                self.roundRow.set_value(max(5, min(idscan.ROUND_MAX, int(l.get("round_pct", idscan.ROUND_PCT)))))
+                names = ", ".join(self._layer(i)["name"] for i in ids[:3]) + (" +%d more" % (len(ids) - 3) if len(ids) > 3 else "")
+                self.lblRoundFor.setText("Corners of:  %s%s" % (names, "  (shows the first one)" if len(ids) > 1 else ""))
+            else:
+                on, pct = self._round_pref()
+                self.chkRoundOn.setChecked(on)
+                self.roundRow.set_value(pct)
+                self.lblRoundFor.setText("No ID card layer is selected: these are the corners the next ID card scan will use.")
+        finally:
+            self._round_sync = False
+        self._round_enable_ui()
+
+    def _layer_opacity_changed(self, v):
+        if self._opacity_sync or not self._loaded:
+            return
+        ids = set(self._border_targets())
+        if not ids:
+            return
+        self._begin_change()                               # a drag of the slider is one Undo step
+        self.layers = [dict(l, opacity=int(v)) if l["id"] in ids else l for l in self.layers]
+        self.ops += 1
+        self._touch()
+        self._sync_live()
+        self._timer.start()
+        pid = self._place_id
+        if self._tool == "transform" and pid in ids and self._layer(pid) is not None:
+            self.canvas.set_tf_image(self._layer_qimage(self._layer(pid)))
+        self._border_icon_timer.start()
+
+    def _sync_layer_opacity_ui(self):
+        if not hasattr(self, "layerOpacity"):
+            return
+        ids = self._border_targets()
+        self._opacity_sync = True
+        try:
+            if ids:
+                self.layerOpacity.set_value(int(self._layer(ids[0]).get("opacity", 100)))
+            self.layerOpacity.setEnabled(bool(ids) and self.ctx is None)
+        finally:
+            self._opacity_sync = False
+
     def _sync_border_ui(self):
         """The Border tab shows the border of the selected layer(s) - or, with nothing selected, the settings that the
         next ID card scan will use."""
@@ -4361,6 +4554,8 @@ class Card(QWidget):
             self._border_sync = False
         self._border_enable_ui()
         self.btnBorderAll.setEnabled(bool(self.layers))
+        self._sync_round_ui()
+        self._sync_layer_opacity_ui()
 
     def _fill_layer_list(self):    _skip_click = False
     _icon_cache = None
@@ -4924,7 +5119,7 @@ class Card(QWidget):
         H, W = self.prev.shape[:2]
         size_prev = self.sizeSlider.value() * self.scale
         if kind in ("rect", "ellipse", "lasso"):
-            self._set_selection(core.shape_mask((W, H), kind, data), mode)
+            self._set_selection(core.shape_mask((W, H), kind, data, radius=self._radius_of("rect") if kind == "rect" else 0.0), mode)
             return
         if kind == "brush" and self._tool == "deselect":
             self._deselect_brush(data, size_prev)
@@ -5054,11 +5249,18 @@ class Card(QWidget):
         sel, base, rgb = self.sel, self.base, self.fill_rgb
         self._fx_hint = {"rect": self._sel_bbox(), "detail": "#%02X%02X%02X" % tuple(rgb)}
 
+        fop = self.fillOpacity.value() / 100.0
+
         def make(progress):
-            return core.fill_region(base, self._mask_img(sel, base.size), rgb)
+            return core.fill_region(base, self._mask_img(sel, base.size), rgb, fop)
         alpha = self.alpha
-        self._edit_base("Filling", make,
-                        alpha_make=lambda progress: ImageChops.lighter(alpha, self._mask_img(sel, alpha.size)) if alpha is not None else None)
+
+        def alpha_fill(progress):
+            m = self._mask_img(sel, alpha.size)
+            if fop < 0.999:
+                m = m.point(lambda v, f=fop: int(v * f + 0.5))
+            return ImageChops.lighter(alpha, m)
+        self._edit_base("Filling", make, alpha_make=alpha_fill if alpha is not None else None)
 
     # ---------------------------------------------------------------- tools
     def choose_tool(self, key):
@@ -5103,6 +5305,7 @@ class Card(QWidget):
         self.canvas.copy_mode = key == "copy"
         self.canvas.set_mode(mode, shape)
         self.canvas.set_crop_shape(CROP_SHAPE.get(key, "rect"))
+        self._load_round_widgets(key)
         if key in ERASE_KEYS:
             self.canvas.set_erase(SHAPES[key])
         self.btnHand.setChecked(key == "view")
@@ -5117,7 +5320,9 @@ class Card(QWidget):
         pend = key in CROP_KEYS or key == "transform"
         self.btnApply.setVisible(pend)
         self.btnCancel.setVisible(pend)
-        self.optsA.setVisible(sel_t or er or key in ("transform", "paint", "crop", "persp"))
+        self.optsA.setVisible(sel_t or er or key in ("transform", "paint", "crop", "persp", "crop_round"))
+        self.roundBox.setVisible(key in ROUND_KEYS)
+        self.cropOutW.setVisible(key in ("crop", "crop_round"))
         self.tfBox.setVisible(key == "transform")
         self.cropBox.setVisible(key in ("crop", "persp"))
         self.optsB.setVisible(sel_t or key in MOVE_KEYS)
@@ -5253,8 +5458,10 @@ class Card(QWidget):
         self._fx_hint = {"rect": er_rect, "effect": "sweep",
                          "detail": "%d \u00d7 %d px, filled from around" % (round(er_rect.width() / s), round(er_rect.height() / s))}
 
+        er_rad = self._radius_of("erase_rect")
+
         def get_mask():
-            mask = core.make_mask(base.size, kind, payload, brush=size)
+            mask = core.make_mask(base.size, kind, payload, brush=size, radius=er_rad if kind == "rect" else 0.0)
             if sel is not None:                      # with a selection, erasing only works inside it
                 m = np.asarray(mask, dtype=np.float32) * core.resize_mask(sel, base.size)
                 mask = Image.fromarray(np.clip(m, 0, 255).astype(np.uint8))
@@ -5270,6 +5477,62 @@ class Card(QWidget):
             return
         self._edit_base("Erasing", make)
 
+    @staticmethod
+    def _rgroup(key):
+        return "round" if key == "crop_round" else "box"
+
+    def _radius_of(self, key):
+        """Corner roundness of a tool as a fraction of the shorter side of its box (0 = switched off / no box tool)."""
+        if key not in ROUND_KEYS or not hasattr(self, "_rstate"):
+            return 0.0
+        on, pct = self._rstate[self._rgroup(key)]
+        return pct / 100.0 if on else 0.0
+
+    def _crop_radius(self):
+        return self._radius_of(self._tool)
+
+    def _load_round_widgets(self, key):
+        """A box tool was chosen: the controls show ITS setting, and the picture shows the box with these corners."""
+        if hasattr(self, "chkCropRound") and key in ROUND_KEYS:
+            on, pct = self._rstate[self._rgroup(key)]
+            self._rsync = True
+            try:
+                self.chkCropRound.setChecked(bool(on))
+                self.sldCropRound.setValue(int(pct))
+            finally:
+                self._rsync = False
+            self.sldCropRound.setEnabled(bool(on))
+            self.lblCropRound.setText("%d%%" % pct)
+            self.cmbCropOut.setEnabled(bool(on))
+        r = self._radius_of(key)
+        self.canvas.set_crop_radius(r if key in ("crop", "crop_round") else 0.0)
+        self.canvas.set_box_radius(r if key in ("rect", "erase_rect") else 0.0)
+
+    def _crop_round_changed(self):
+        if self._rsync or self._tool not in ROUND_KEYS:
+            return
+        g = self._rgroup(self._tool)
+        self._rstate[g] = [self.chkCropRound.isChecked(), int(self.sldCropRound.value())]
+        self.sldCropRound.setEnabled(self.chkCropRound.isChecked())
+        self.cmbCropOut.setEnabled(self.chkCropRound.isChecked())
+        self.lblCropRound.setText("%d%%" % self.sldCropRound.value())
+        r = self._radius_of(self._tool)
+        self.canvas.set_crop_radius(r if self._tool in ("crop", "crop_round") else 0.0)    # the outline follows at once
+        self.canvas.set_box_radius(r if self._tool in ("rect", "erase_rect") else 0.0)
+        try:
+            p = _prefs()
+            key = "crop" if g == "round" else "box"
+            p.setValue(key + "/round_on", self._rstate[g][0])
+            p.setValue(key + "/round_pct", self._rstate[g][1])
+        except Exception:
+            pass
+
+    def _crop_out_changed(self):
+        try:
+            _prefs().setValue("crop/outside", self.cmbCropOut.hex())
+        except Exception:
+            pass
+
     def _apply_crop(self):
         if not self._loaded:
             return
@@ -5283,11 +5546,25 @@ class Card(QWidget):
         if self._tool == "crop":
             l, t, r, b = c.crop_rect_img()
             box = (l / s, t / s, r / s, b / s)
+            rad = self._radius_of("crop")
+            if rad > 0:                                        # plain crop with round corners (Corners switched on)
+                cache = {}
+                out_rgb = self.cmbCropOut.rgb()
 
-            def make(progress):
-                return core.crop_box(base, box)
-            if inlayer:
-                alpha_make = lambda progress: core.crop_box(alpha.convert("RGB"), box).convert("L")
+                def shaped():
+                    if "v" not in cache:
+                        cache["v"] = core.crop_to_shape(base, alpha if inlayer else None, box, "round", fill=out_rgb, radius=rad)
+                    return cache["v"]
+
+                def make(progress):
+                    return shaped()[0]
+                if inlayer:
+                    alpha_make = lambda progress: shaped()[1]
+            else:
+                def make(progress):
+                    return core.crop_box(base, box)
+                if inlayer:
+                    alpha_make = lambda progress: core.crop_box(alpha.convert("RGB"), box).convert("L")
         elif self._tool == "persp":
             quad = [(x / s, y / s) for x, y in c.quad_img()]
 
@@ -5305,10 +5582,12 @@ class Card(QWidget):
                 l, t, r, b = cx - side / 2.0, cy - side / 2.0, cx + side / 2.0, cy + side / 2.0
             box = (l, t, r, b)
             cache = {}
+            rad = self._radius_of("crop_round")
+            out_rgb = self.cmbCropOut.rgb() if self._tool == "crop_round" else None      # circle / oval: the paper color as before
 
             def shaped():
                 if "v" not in cache:
-                    cache["v"] = core.crop_to_shape(base, alpha if inlayer else None, box, shape)
+                    cache["v"] = core.crop_to_shape(base, alpha if inlayer else None, box, shape, fill=out_rgb, radius=rad)
                 return cache["v"]
 
             def make(progress):

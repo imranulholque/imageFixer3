@@ -2263,7 +2263,7 @@ class MainWindow(QMainWindow):
         self.add_files(paths)
         self.say("Scanned %d page(s)." % len(paths))
 
-    def scan_id_page(self, page_path, items, border=None, tries=0):
+    def scan_id_page(self, page_path, items, border=None, round_pct=None, tries=0):
         """ID card: a white page is added as a new picture, front and back are put on it as two layers."""
         if tries == 0:
             self._origin[page_path] = "paste"
@@ -2271,13 +2271,13 @@ class MainWindow(QMainWindow):
         card = next((c for c in self.carousel.cards if c.path == page_path), None)
         if card is None or self._adding:
             if tries < 100:
-                QTimer.singleShot(100, lambda: self.scan_id_page(page_path, items, border, tries + 1))
+                QTimer.singleShot(100, lambda: self.scan_id_page(page_path, items, border, round_pct, tries + 1))
             return
         self.carousel.go_to(self.carousel.cards.index(card), animate=False)
         self._current_changed(self.carousel.index)
         card.ensure_loaded()
-        card.add_fixed_layers(items, border)
-        self.say("ID card page ready: Front and Back are layers (Layers tab). Border colour / thickness: Border tab.")
+        card.add_fixed_layers(items, border, round_pct)
+        self.say("ID card page ready: Front and Back are layers (Layers tab). Border colour / thickness / corner roundness: Border tab.")
 
     # --------------------------------------------------------------- phone
     def open_phone(self):
