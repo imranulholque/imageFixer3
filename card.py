@@ -12,7 +12,7 @@ from PIL import Image, ImageChops, ImageFilter, ImageOps
 from PySide6.QtCore import QEvent, QMimeData, QObject, QPointF, QRectF, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtCore import QRect
 from PySide6.QtWidgets import QGridLayout, QWidgetAction
-from PySide6.QtGui import QColor, QDrag, QIcon, QImage, QPainter, QPainterPath, QPen, QPixmap
+from PySide6.QtGui import QColor, QDrag, QFont, QIcon, QImage, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (QSplitter, QApplication, QButtonGroup, QCheckBox, QColorDialog, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu,
                                QAbstractItemView, QAbstractButton, QAbstractSlider, QAbstractSpinBox, QComboBox, QPushButton, QScrollArea, QSizePolicy, QSlider, QStackedWidget, QStyle, QStyledItemDelegate, QToolButton,
                                QVBoxLayout, QWidget)
@@ -706,7 +706,15 @@ def side_sync():
 
 
 EYE_ROLE = Qt.ItemDataRole.UserRole + 1
+GROUP_ROLE = Qt.ItemDataRole.UserRole + 2      # group number (1, 2, 3 ...), 0 = not in a group
+GROUP_POS_ROLE = Qt.ItemDataRole.UserRole + 3  # place inside a run of neighbouring rows of one group: 0 alone, 1 first, 2 middle, 3 last
 EYE_W = 40
+# one colour per group: the stripe, the tint and the "G1" badge of its rows share it
+GROUP_COLORS = ("#2dd4bf", "#f59e0b", "#f472b6", "#60a5fa", "#a3e635", "#c084fc", "#fb7185", "#38bdf8")
+
+
+def group_color(n):
+    return QColor(GROUP_COLORS[(int(n) - 1) % len(GROUP_COLORS)])
 
 
 def eye_rect(row_rect):
@@ -717,8 +725,52 @@ def eye_rect(row_rect):
 class _EyeDelegate(QStyledItemDelegate):
     """Draws the normal row, then an eye on the right: open eye = layer shown, eye with a slash = hidden (like Photoshop)."""
 
+    def _paint_group(self, p, opt, idx, gn):
+        """Rows of a group: a tinted background, a coloured stripe on the left (joined between neighbours)
+        and a "G1" badge, so a group can be told from loose layers at a glance."""
+        col = group_color(gn)
+        pos = int(idx.data(GROUP_POS_ROLE) or 0)
+        r = QRectF(opt.rect).adjusted(0.5, 0.5, -0.5, -0.5)
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        tint = QColor(col)
+        tint.setAlpha(34)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(tint)
+        p.drawRoundedRect(r, 8, 8)
+        # stripe: stretched over the gap to the neighbouring row of the same group, so the rows look tied together
+        y0 = r.top() + (4 if pos in (0, 1) else -3)
+        y1 = r.bottom() - (4 if pos in (0, 3) else -3)
+        p.setBrush(col)
+        p.drawRoundedRect(QRectF(r.left() + 2, y0, 4, y1 - y0), 2, 2)
+        p.restore()
+
+    def _paint_badge(self, p, opt, gn):
+        col = group_color(gn)
+        f = QFont(opt.font)
+        f.setBold(True)
+        f.setPixelSize(10)
+        txt = "G%d" % gn
+        w, h = 26, 16
+        er = eye_rect(opt.rect)
+        r = QRectF(er.left() - w - 2, opt.rect.center().y() - h / 2.0, w, h)
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(col)
+        p.drawRoundedRect(r, 8, 8)
+        p.setFont(f)
+        p.setPen(QColor("#0b0e14"))
+        p.drawText(r, int(Qt.AlignmentFlag.AlignCenter), txt)
+        p.restore()
+
     def paint(self, p, opt, idx):
+        gn = int(idx.data(GROUP_ROLE) or 0)
+        if gn:
+            self._paint_group(p, opt, idx, gn)
         super().paint(p, opt, idx)
+        if gn:
+            self._paint_badge(p, opt, gn)
         shown = bool(idx.data(EYE_ROLE))
         r = eye_rect(opt.rect)
         c = r.center()
@@ -4857,15 +4909,31 @@ class Card(QWidget):
         lw.clear()
         keep = {}
         flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsDragEnabled
-        for l in reversed(self.layers):                          # top layer first
+        order = list(reversed(self.layers))                      # top layer first
+        gnum = {}                                                # group id -> 1, 2, 3 ... in the order they appear from the top
+        for l in order:
+            g = l.get("group")
+            if g and g not in gnum:
+                gnum[g] = len(gnum) + 1
+        gsize = {}
+        for l in order:
+            if l.get("group"):
+                gsize[l["group"]] = gsize.get(l["group"], 0) + 1
+        for i, l in enumerate(order):
             icon = self._layer_icon(l)
             keep[(l["id"], id(l["rgb"]), id(l["a"]), l.get("opacity", 100), l.get("border"), l.get("rnd", 0))] = self._icon_cache[
                 (l["id"], id(l["rgb"]), id(l["a"]), l.get("opacity", 100), l.get("border"), l.get("rnd", 0))]
-            it = QListWidgetItem(icon, ("\u26d3 " if l.get("group") else "") + l["name"])
+            it = QListWidgetItem(icon, l["name"])
             it.setData(Qt.ItemDataRole.UserRole, l["id"])
+            g = l.get("group")
+            it.setData(GROUP_ROLE, gnum.get(g, 0) if g else 0)
+            prev_same = i > 0 and g and order[i - 1].get("group") == g
+            next_same = i + 1 < len(order) and g and order[i + 1].get("group") == g
+            it.setData(GROUP_POS_ROLE, 0 if not (prev_same or next_same) else (3 if prev_same and not next_same else (1 if next_same and not prev_same else 2)))
             it.setFlags(flags)
             it.setData(EYE_ROLE, bool(l.get("visible", True)))
-            it.setToolTip(l["name"] + "\nClick = select and work on this layer.  Eye = show / hide "
+            it.setToolTip(l["name"] + ("\nGroup G%d  (%d layers move together)" % (gnum[g], gsize[g]) if g else "")
+                          + "\nClick = select and work on this layer.  Eye = show / hide "
                           "(Alt + eye = only this one).  Drag = change the order.  Double click = edit.")
             lw.addItem(it)
             if l["id"] == self.sel_layer:
