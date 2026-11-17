@@ -2366,7 +2366,12 @@ def _apply_border(out, border, shape_alpha=None):
     arr = np.array(out)                                         # RGBA copy
     a_now = arr[:, :, 3].astype(np.float32)                     # alpha with the opacity applied
     a = np.asarray(shape_alpha, dtype=np.uint8) if shape_alpha is not None else arr[:, :, 3]
-    bw = max(2, int(round(max(out.size) * float(frac))))
+    # thickness is relative to the long side, but never to less than 300 px: on a small layer the slider must still
+    # change the frame (before, a ~60 px layer stayed at 2 px for every slider value); the frame can never eat more than
+    # half of the layer.
+    ref = max(max(out.size), 300)
+    bw = max(1, int(round(ref * float(frac))))
+    bw = max(1, min(bw, (min(out.size) - 1) // 2))
     pad = bw + 2
     ap = np.pad(a, pad)                                         # zeros around: the picture edge counts as an edge too
     try:
