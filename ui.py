@@ -722,6 +722,7 @@ class MainWindow(QMainWindow):
         _sb(self.btnSave, "save", "Save", "Ctrl+S", label="Save",
             extra_tip="Replaces the original file with the edited picture.\nA picture from the phone / clipboard goes to the save folder.")
         self.btnSave.setProperty("chip", True)
+        self.btnSave.setProperty("save", True)
         self.btnSave.setIconSize(QSize(18, 18))
         self.btnSave.clicked.connect(lambda: self._with_loaded(self.save_card))
         self.btnSaveMore = QPushButton("\u25be")

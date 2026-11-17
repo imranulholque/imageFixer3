@@ -27,7 +27,7 @@ from compare import CompareOverlay
 from fullview import FullViewOverlay
 import scanner
 from flow import ElidedLabel, FlowLayout
-from icons import icon as _ico, style_button as _style_btn
+from icons import icon as _ico, style_button as _style_btn, color_of as _ico_color
 from jobs import _log, run_background
 
 EXPORT_DIR = os.path.join(tempfile.gettempdir(), "imagefixer_export")
@@ -1666,6 +1666,8 @@ class Card(QWidget):
             _style_btn(b, ("adjust", "color", "shadow", "textfix", "picture", "aa", "layers", "border")[i], n,
                        "", extra_tip=b.toolTip())
             b.setProperty("tab", True)
+            _tc = _ico_color(("adjust", "color", "shadow", "textfix", "picture", "aa", "layers", "border")[i])
+            b.setStyleSheet("QPushButton:checked { border-bottom: 3px solid %s; background: #1a1f2e; }" % _tc)
             self.tabGroup.addButton(b, i)
             tabs.addWidget(b, 0, i)
         self.tabGroup.button(0).setChecked(True)

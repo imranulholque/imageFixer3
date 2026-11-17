@@ -197,6 +197,9 @@ QPushButton[tab="true"][ico="true"] { min-width: 0px; max-width: 16777215px; min
 QPushButton[tab="true"][ico="true"]:hover { background: #171c28; border-bottom: 2px solid transparent; }
 QPushButton[tab="true"][ico="true"]:checked { background: transparent; border-bottom: 2px solid #818cf8; }
 QPushButton[chip="true"] { padding: 4px 12px 4px 8px; border-radius: 15px; }
+QPushButton[accent="true"][save="true"] { background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #16a34a, stop:1 #22c55e); }
+QPushButton[accent="true"][save="true"]:hover { background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #22c55e, stop:1 #4ade80); }
+QPushButton[ico="true"]:hover, QToolButton[ico="true"]:hover { background: #2a3150; border-color: #4a5380; }
 QFrame#vsep { background: #2a3042; max-width: 1px; min-width: 1px; margin: 6px 3px; }
 QPushButton#nav { min-width: 30px; max-width: 30px; padding: 2px; font-size: 14px; }
 QToolTip { border-radius: 6px; }

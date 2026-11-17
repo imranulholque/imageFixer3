@@ -127,16 +127,41 @@ def _pixmap(name, color, size, caret, dpr=2.0):
     return pm
 
 
+# every feature family has its own colour, so the eye finds a tool without reading
+COLORS = {
+    "add": "#a5b4fc", "files": "#a5b4fc", "blank": "#60a5fa", "scan": "#22d3ee", "phone": "#34d399", "apply": "#a3e635",
+    "save": "#4ade80", "saveall": "#4ade80", "pdf": "#f87171", "folder": "#fbbf24", "open": "#fcd34d", "trash": "#fb7185",
+    "more": "#94a3b8", "help": "#38bdf8", "settings": "#94a3b8", "gear": "#94a3b8", "shortcuts": "#38bdf8",
+    "undo": "#a78bfa", "redo": "#a78bfa", "reset": "#fb923c", "compare": "#22d3ee", "eye": "#38bdf8", "upscale": "#c084fc",
+    "close": "#fb7185", "panel": "#94a3b8", "hand": "#fcd34d", "dropper": "#2dd4bf", "brush": "#f472b6",
+    "select": "#60a5fa", "move": "#a78bfa", "erase": "#fb923c", "crop": "#4ade80", "layer": "#c084fc", "text": "#fbbf24",
+    "prev": "#a5b4fc", "next": "#a5b4fc", "pageL": "#94a3b8", "pageR": "#94a3b8", "check": "#4ade80",
+    "adjust": "#818cf8", "color": "#f472b6", "shadow": "#fbbf24", "textfix": "#34d399", "picture": "#38bdf8",
+    "aa": "#fb923c", "layers": "#c084fc", "border": "#2dd4bf",
+}
+
+
+def color_of(name):
+    return COLORS.get(name, NORMAL)
+
+
+def _lighter(hexcolor, f=0.45):
+    c = QColor(hexcolor)
+    return QColor(int(c.red() + (255 - c.red()) * f), int(c.green() + (255 - c.green()) * f),
+                  int(c.blue() + (255 - c.blue()) * f)).name()
+
+
 _CACHE = {}
 
 
-def icon(name, size=20, caret=False, normal=NORMAL):
+def icon(name, size=20, caret=False, normal=None):
+    normal = normal or color_of(name)
     key = (name, size, caret, normal)
     ic = _CACHE.get(key)
     if ic is None:
         ic = QIcon()
         ic.addPixmap(_pixmap(name, normal, size, caret), QIcon.Mode.Normal, QIcon.State.Off)
-        ic.addPixmap(_pixmap(name, HOVER, size, caret), QIcon.Mode.Active, QIcon.State.Off)
+        ic.addPixmap(_pixmap(name, _lighter(normal) if normal != '#ffffff' else HOVER, size, caret), QIcon.Mode.Active, QIcon.State.Off)
         ic.addPixmap(_pixmap(name, ON, size, caret), QIcon.Mode.Normal, QIcon.State.On)
         ic.addPixmap(_pixmap(name, ON, size, caret), QIcon.Mode.Active, QIcon.State.On)
         ic.addPixmap(_pixmap(name, OFF, size, caret), QIcon.Mode.Disabled, QIcon.State.Off)
@@ -152,7 +177,7 @@ def tip(text, keys=""):
 def style_button(btn, name, text, keys="", size=20, label=None, caret=False, extra_tip=""):
     """Icon button.  `label` (optional) keeps a short text next to the icon; otherwise it is icon only.
     The full name + shortcut always sit in the tooltip."""
-    btn.setIcon(icon(name, size, caret, normal="#ffffff" if btn.property("accent") or btn.property("good") else NORMAL))
+    btn.setIcon(icon(name, size, caret, normal="#ffffff" if btn.property("accent") or btn.property("good") else None))
     btn.setIconSize(QSize(size, size))
     t = tip(text, keys)
     if extra_tip:
