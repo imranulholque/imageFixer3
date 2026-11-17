@@ -140,6 +140,7 @@ QToolButton:hover { background: #2b3246; }
 QToolButton:disabled { color: #5d6475; background: #181c26; border-color: #232838; }
 QToolButton[active="true"] { background: #4f46e5; border-color: #6366f1; color: white; }
 QToolButton::menu-indicator { image: none; width: 0px; }
+QPushButton::menu-indicator { image: none; width: 0px; }
 QPushButton[tab="true"] { background: transparent; border: none; border-bottom: 2px solid transparent; border-radius: 0;
   padding: 5px 2px; font-weight: 600; font-size: 12px; color: #9aa3b8; }
 QPushButton[tab="true"]:hover { color: white; background: #171c28; }
@@ -185,6 +186,20 @@ QCheckBox { spacing: 8px; background: transparent; }
 QCheckBox::indicator { width: 16px; height: 16px; border-radius: 5px; border: 1px solid #4a5268; background: #1a1f2b; }
 QCheckBox::indicator:hover { border-color: #818cf8; }
 QCheckBox::indicator:checked { background: #6366f1; border-color: #a5b4fc; }
+QPushButton[ico="true"], QToolButton[ico="true"] { padding: 0px; min-width: 32px; max-width: 32px; min-height: 30px; max-height: 30px; background: transparent; border: 1px solid transparent; border-radius: 8px; }
+QPushButton[ico="true"]:hover, QToolButton[ico="true"]:hover { background: #262d40; border-color: #343c54; }
+QPushButton[ico="true"]:pressed, QToolButton[ico="true"]:pressed { background: #1b2030; }
+QPushButton[ico="true"]:checked, QToolButton[ico="true"][active="true"] { background: #4f46e5; border-color: #6366f1; }
+QPushButton[ico="true"][accent="true"] { background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #6366f1, stop:1 #a855f7); border: none; }
+QPushButton[ico="true"][danger="true"]:hover { background: #4a222b; border-color: #5a2630; }
+QPushButton[ico="true"]:disabled, QToolButton[ico="true"]:disabled { background: transparent; border-color: transparent; }
+QPushButton[tab="true"][ico="true"] { min-width: 0px; max-width: 16777215px; min-height: 30px; max-height: 34px; border-radius: 0; border: none; border-bottom: 2px solid transparent; }
+QPushButton[tab="true"][ico="true"]:hover { background: #171c28; border-bottom: 2px solid transparent; }
+QPushButton[tab="true"][ico="true"]:checked { background: transparent; border-bottom: 2px solid #818cf8; }
+QPushButton[chip="true"] { padding: 4px 12px 4px 8px; border-radius: 15px; }
+QFrame#vsep { background: #2a3042; max-width: 1px; min-width: 1px; margin: 6px 3px; }
+QPushButton#nav { min-width: 30px; max-width: 30px; padding: 2px; font-size: 14px; }
+QToolTip { border-radius: 6px; }
 QToolTip { background: #222836; color: #e8eaed; border: 1px solid #3a4260; padding: 5px 7px; }
 """
 

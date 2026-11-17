@@ -10,7 +10,7 @@ from PySide6.QtCore import QMimeData
 from PySide6.QtGui import (QAction, QActionGroup, QColor, QCursor, QDesktopServices, QMouseEvent, QDrag, QFontMetrics, QIcon, QImage,
                            QKeySequence, QPainter, QPixmap, QShortcut, QTransform)
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QDialog, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel,
-                               QListView, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QProgressBar,
+                               QLineEdit, QAbstractSpinBox, QListView, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QProgressBar,
                                QPushButton, QSizePolicy, QStackedLayout, QSystemTrayIcon, QTextBrowser, QVBoxLayout, QWidget)
 
 import core
@@ -20,6 +20,7 @@ import winutil
 from card import CLIP_FILES, CROP_KEYS, EXPORT_DIR, TOOL_KEYS, Card, export_path
 from feedback import DropOverlay, install_ripples
 from flow import ElidedLabel
+from icons import icon as _ico, style_button as _sb
 from savedlg import SaveAllDialog
 from jobs import JobRunner
 from updatedlg import UpdateManager
@@ -409,6 +410,15 @@ def _k(tool):
 
 
 SHORTCUT_GROUPS = (
+    ("Go back / help", (
+        ("Esc", "Back one step: close a text field, Compare / Preview, cancel Crop / Erase / Transform, leave the tool, deselect, leave a single picture"),
+        ("F1  or  ?", "This list"),
+        ("Ctrl+,", "Settings menu"),
+        ("PgUp / PgDn / Home / End", "Previous / next / first / last picture"),
+        ("Ctrl+Shift+P", "Add from phone"),
+        ("Ctrl+Shift+A", "Apply the last setting to all pictures"),
+        ("Ctrl+Shift+E", "All pages as one PDF"),
+        ("Ctrl+Shift+Left / Right", "Move this page earlier / later"))),
     ("Files and saving", (
         ("Ctrl+O", "Choose files"),
         ("Ctrl+N", "New blank page of any color (like Picsart / Word); or put a color on this page as an overlay"),
@@ -583,77 +593,98 @@ class MainWindow(QMainWindow):
 
     # -------------------------------------------------------------- builders
     def _build_header(self):
+        """One slim icon bar.  Primary actions (Add, Save) keep a short label, everything else is an icon with a
+        tooltip (name + shortcut).  Groups: [add sources] | [apply] ...... [folder] | [save] [help] [settings]."""
         h = QWidget()
         h.setObjectName("header")
         l = QHBoxLayout(h)
-        l.setContentsMargins(16, 10, 16, 10)
-        l.setSpacing(10)
+        l.setContentsMargins(12, 6, 12, 6)
+        l.setSpacing(4)
         self.hdrLayout = l
+
+        def sep():
+            f = QFrame()
+            f.setObjectName("vsep")
+            f.setFixedSize(1, 22)
+            l.addSpacing(4)
+            l.addWidget(f)
+            l.addSpacing(4)
+            return f
         logo = QLabel()
-        logo.setPixmap(logo_pixmap(30))
+        logo.setPixmap(logo_pixmap(26))
+        logo.setToolTip("Image Fixer  by " + AUTHOR)
         self.lblLogo = logo
         brand = QLabel("Image Fixer")
         brand.setObjectName("brand")
-        by = QLabel("by " + AUTHOR)
-        by.setObjectName("muted")
-        box = QWidget()
-        bv = QVBoxLayout(box)
-        bv.setContentsMargins(0, 0, 0, 0)
-        bv.setSpacing(0)
-        bv.addWidget(brand)
-        bv.addWidget(by)
-        self.lblBrand = box
+        brand.setStyleSheet("font-size: 15px;")
+        self.lblBrand = brand
         l.addWidget(logo)
-        l.addWidget(box)
-        l.addSpacing(14)
-        self.btnChoose = QPushButton("+  Choose files")
+        l.addWidget(brand)
+        l.addSpacing(10)
+        self.btnChoose = QPushButton()
         self.btnChoose.setProperty("accent", True)
+        _sb(self.btnChoose, "add", "Add pictures", "Ctrl+O", label="Add")
+        self.btnChoose.setProperty("chip", True)
+        self.btnChoose.setIconSize(QSize(18, 18))
         self.btnChoose.clicked.connect(self.choose_files)
-        self.btnSaveAll = QPushButton("Save all edited")
-        self.btnSaveAll.clicked.connect(self.save_all)
-        self.btnPhone = QPushButton("Add from phone")
-        self.btnPhone.setToolTip("Use your phone as a wireless scanner / picture sender (QR code)")
-        self.btnPhone.clicked.connect(self.open_phone)
-        self.btnBlank = QPushButton("Blank page")
-        self.btnBlank.setToolTip("A new blank page of any color and size, or a color put on this page as an overlay  (Ctrl+N)")
+        self.btnBlank = QPushButton()
+        _sb(self.btnBlank, "blank", "Blank page", "Ctrl+N", extra_tip="A new page of any color and size, or a color put on this page as an overlay")
         self.btnBlank.clicked.connect(self.open_blank)
-        self.btnScan = QPushButton("Scan")
-        self.btnScan.setToolTip("Scan from a TWAIN / WIA scanner, also ID card front + back on one page  (Ctrl+Shift+N)")
+        self.btnScan = QPushButton()
+        _sb(self.btnScan, "scan", "Scan", "Ctrl+Shift+N", extra_tip="TWAIN / WIA scanner, also ID card front + back on one page")
         self.btnScan.clicked.connect(self.open_scan)
-        self.btnPdfAll = QPushButton("Save all as PDF")
-        self.btnPdfAll.setToolTip("One PDF with every open picture, one page each")
-        self.btnPdfAll.clicked.connect(self.save_all_pdf)
-        self.btnApplyAll = QPushButton("Apply last setting to all")
+        self.btnPhone = QPushButton()
+        _sb(self.btnPhone, "phone", "Add from phone", "Ctrl+Shift+P", extra_tip="Use your phone as a wireless scanner / picture sender (QR code)")
+        self.btnPhone.clicked.connect(self.open_phone)
+        self.btnApplyAll = QPushButton()
         self.btnApplyAll.setProperty("good", True)
-        self.btnApplyAll.setToolTip("Copies ONLY the setting you changed last (one slider, the shadow removal, or the picked colors) "
-                                    "to all the other pictures. Crop, erase, move ... are never copied.")
+        _sb(self.btnApplyAll, "apply", "Apply last setting to all", "Ctrl+Shift+A",
+            extra_tip="Copies ONLY the setting you changed last (one slider, the shadow removal, or the picked colors) "
+                      "to all the other pictures. Crop, erase, move ... are never copied.")
+        self.btnApplyAll.setProperty("ico", True)
+        self.btnApplyAll.setProperty("good", False)
         self.btnApplyAll.clicked.connect(lambda: self._with_loaded(self.apply_to_all))
         l.addWidget(self.btnChoose)
         l.addWidget(self.btnBlank)
         l.addWidget(self.btnScan)
         l.addWidget(self.btnPhone)
+        self._sepA = sep()
         l.addWidget(self.btnApplyAll)
+        l.addSpacing(6)
         l.addStretch(1)
-        self.btnFolder = QPushButton("Save folder: not set")
+        self.btnFolder = QPushButton("Folder: not set")
+        self.btnFolder.setIcon(_ico("folder", 18))
+        self.btnFolder.setIconSize(QSize(18, 18))
+        self.btnFolder.setProperty("flat", True)
         self.btnFolder.setMinimumWidth(60)
         self.btnFolder.setToolTip("Edited pictures are saved here. Click to change.")
         self.btnFolder.clicked.connect(self.choose_dir)
-        self.btnOpenDir = QPushButton("Open")
-        self.btnOpenDir.setToolTip("Open the save folder")
+        self.btnOpenDir = QPushButton()
+        _sb(self.btnOpenDir, "open", "Open the save folder")
         self.btnOpenDir.clicked.connect(self.open_dir)
-        self.btnClear = QPushButton("Clear all")
+        self.btnClear = QPushButton()
+        self.btnClear.setProperty("danger", True)
+        _sb(self.btnClear, "trash", "Clear all pictures", "", extra_tip="The files on the disk are not touched")
         self.btnClear.clicked.connect(self.clear_all)
-        self.btnSettings = QPushButton("Settings")
+        self.btnSettings = QPushButton()
+        _sb(self.btnSettings, "settings", "Settings", "Ctrl+,")
         self.btnSettings.setMenu(self._build_menu())
-        l.insertWidget(l.indexOf(self.btnApplyAll) + 1, self.updater.badge)      # green 'New update available' in the empty space
-        for b in (self.btnFolder, self.btnOpenDir, self.btnClear):
-            l.addWidget(b)
-        self.btnMore = QPushButton("\u22ef")          # small window: the less used buttons live in this menu
-        self.btnMore.setToolTip("More: save folder, apply to all, clear all ...")
+        self.btnHelp = QPushButton()
+        _sb(self.btnHelp, "help", "Keyboard shortcuts", "F1  or  ?")
+        self.btnHelp.clicked.connect(self.show_shortcuts)
+        l.insertWidget(l.indexOf(self.btnApplyAll) + 1, self.updater.badge)      # green 'New update available'
+        l.addWidget(self.btnFolder)
+        l.addWidget(self.btnOpenDir)
+        l.addWidget(self.btnClear)
+        self.btnMore = QPushButton()
+        _sb(self.btnMore, "more", "More")
         self.btnMore.setMenu(self._build_more_menu())
         self.btnMore.hide()
         l.addWidget(self.btnMore)
+        self._sepB = sep()
         l.addWidget(self._build_save_group())
+        l.addSpacing(4)
+        l.addWidget(self.btnHelp)
         l.addWidget(self.btnSettings)
         return h
 
@@ -667,6 +698,8 @@ class MainWindow(QMainWindow):
             m.addAction(a)
             return a
         act("New blank page...", self.open_blank)
+        act("Scan...", self.open_scan)
+        act("Add from phone...", self.open_phone)
         act("Apply last setting to all", lambda: self._with_loaded(self.apply_to_all))
         act("Choose save folder...", self.choose_dir)
         self.actMoreOpen = act("Open save folder", self.open_dir)
@@ -684,14 +717,16 @@ class MainWindow(QMainWindow):
         bl = QHBoxLayout(box)
         bl.setContentsMargins(0, 0, 0, 0)
         bl.setSpacing(2)
-        self.btnSave = QPushButton("Save")
+        self.btnSave = QPushButton()
         self.btnSave.setProperty("accent", True)
-        self.btnSave.setToolTip("Replaces the original file with the edited picture (Ctrl+S).\n"
-                                "A picture from the phone / clipboard goes to the save folder.")
+        _sb(self.btnSave, "save", "Save", "Ctrl+S", label="Save",
+            extra_tip="Replaces the original file with the edited picture.\nA picture from the phone / clipboard goes to the save folder.")
+        self.btnSave.setProperty("chip", True)
+        self.btnSave.setIconSize(QSize(18, 18))
         self.btnSave.clicked.connect(lambda: self._with_loaded(self.save_card))
         self.btnSaveMore = QPushButton("\u25be")
-        self.btnSaveMore.setFixedWidth(30)
-        self.btnSaveMore.setToolTip("Save as..., save all, PDF, print, copy")
+        self.btnSaveMore.setFixedWidth(28)
+        self.btnSaveMore.setToolTip("Save as...  Save all  PDF  Print  Copy")
         m = QMenu(self)
 
         def act(text, fn, key=None):
@@ -872,10 +907,12 @@ class MainWindow(QMainWindow):
         b.setContentsMargins(12, 8, 12, 8)
         b.setSpacing(8)
         self.barLayout = b
-        self.btnPrev = QPushButton("\u2039")
+        self.btnPrev = QPushButton()
         self.btnPrev.setObjectName("nav")
-        self.btnNext = QPushButton("\u203a")
+        _sb(self.btnPrev, "prev", "Previous picture", "\u2190  /  PgUp")
+        self.btnNext = QPushButton()
         self.btnNext.setObjectName("nav")
+        _sb(self.btnNext, "next", "Next picture", "\u2192  /  PgDn")
         self.btnPrev.clicked.connect(lambda: self.carousel.prev())
         self.btnNext.clicked.connect(lambda: self.carousel.next())
         self.strip = Strip()
@@ -902,12 +939,11 @@ class MainWindow(QMainWindow):
         self.strip.itemSelectionChanged.connect(self._strip_selection)
         self._thumb_px = 64
         self._apply_thumb_size()
-        self.btnPageL = QPushButton("\u21e0")
-        self.btnPageR = QPushButton("\u21e2")
-        for pb, d, tip in ((self.btnPageL, -1, "Move this page earlier (page order in the PDF)"),
-                           (self.btnPageR, 1, "Move this page later (page order in the PDF)")):
-            pb.setToolTip(tip)
-            pb.setProperty("flat", True)
+        self.btnPageL = QPushButton()
+        self.btnPageR = QPushButton()
+        for pb, d, tip, ic in ((self.btnPageL, -1, "Move this page earlier (page order in the PDF)", "pageL"),
+                               (self.btnPageR, 1, "Move this page later (page order in the PDF)", "pageR")):
+            _sb(pb, ic, tip, "Ctrl+Shift+\u2190" if d < 0 else "Ctrl+Shift+\u2192")
             pb.clicked.connect(lambda _=False, d=d: self.move_page(d))
         self.progress = QProgressBar()
         self.progress.setFixedWidth(130)
@@ -1040,7 +1076,20 @@ class MainWindow(QMainWindow):
         sc("Backspace", cur(lambda c: c.delete_selection()), del_label)
         sc("Return", cur(lambda c: c.apply_pending()), lambda: "Apply" if self._pending_active() else None)
         sc("Enter", cur(lambda c: c.apply_pending()), lambda: "Apply" if self._pending_active() else None)
-        sc("Escape", cur(lambda c: c.cancel_pending()), lambda: "Cancel" if self._pending_active() else None)
+        sc("Escape", self._escape)
+        # navigation / help / quick actions
+        sc("F1", self.show_shortcuts)
+        sc("?", self.show_shortcuts)
+        sc("Ctrl+,", lambda: self.btnSettings.showMenu())
+        sc("PgUp", lambda: self.carousel.prev())
+        sc("PgDown", lambda: self.carousel.next())
+        sc("Home", lambda: self.carousel.go_to(0))
+        sc("End", lambda: self.carousel.go_to(max(0, len(self.carousel.cards) - 1)) if hasattr(self.carousel, "cards") else None)
+        sc("Ctrl+Shift+P", self.open_phone)
+        sc("Ctrl+Shift+A", lambda: self._with_loaded(self.apply_to_all), "Apply the last setting to all")
+        sc("Ctrl+Shift+Left", lambda: self.move_page(-1), "Page earlier")
+        sc("Ctrl+Shift+Right", lambda: self.move_page(1), "Page later")
+        sc("Ctrl+Shift+E", self.save_all_pdf, "All pages as one PDF")
         # tools (single letters, like in a picture editor): the toast of the tool says the letter
         for tool, key in TOOL_KEYS.items():                      # every tool has a key (Ctrl+T = Transform is registered above)
             if tool != "transform":
@@ -1066,6 +1115,38 @@ class MainWindow(QMainWindow):
         sc("Ctrl+=", cur(lambda c: c.canvas.zoom_by(1.25)), "Zoom in")
         sc("Ctrl++", cur(lambda c: c.canvas.zoom_by(1.25)), "Zoom in")
         sc("Ctrl+-", cur(lambda c: c.canvas.zoom_by(0.8)), "Zoom out")
+
+    def _escape(self):
+        """Esc = back one step, always the same order: a text field -> compare / preview -> a pending tool (crop, erase,
+        transform) -> any other tool -> the selection -> the single-picture view -> the thumbnail selection."""
+        fw = QApplication.focusWidget()
+        if isinstance(fw, (QLineEdit, QAbstractSpinBox)):
+            fw.clearFocus()
+            return
+        if self.runner.busy:
+            return
+        c = self.carousel.current()
+        if c is None:
+            return
+        if getattr(c, "_cmp", None) is not None:
+            c.compare()
+            return self._key_chip("Escape", "Compare closed")
+        if getattr(c, "_fq", None) is not None:
+            c.preview_full()
+            return self._key_chip("Escape", "Preview closed")
+        if c._tool != "view":
+            c.cancel_pending()
+            if c._tool != "view":
+                c._go_move()
+            return self._key_chip("Escape", "Back to Hand")
+        if c.sel is not None:
+            c.deselect()
+            return self._key_chip("Escape", "Deselected")
+        if getattr(c, "ctx", None) is not None:
+            c.leave_layer()
+            return self._key_chip("Escape", "Back to the page")
+        if self.strip.selectedItems():
+            self.strip.clearSelection()
 
     def _with_current(self, fn):
         c = self.carousel.current()
@@ -1133,21 +1214,21 @@ class MainWindow(QMainWindow):
         """Top bar: the first of these steps that fits the width is used (measured, not guessed)."""
         lay = self.hdrLayout
         small = w < 700
-        lay.setContentsMargins(*((8, 6, 8, 6) if small else (16, 10, 16, 10)))
-        lay.setSpacing(6 if small else 10)
+        lay.setContentsMargins(*((6, 4, 6, 4) if small else (12, 6, 12, 6)))
+        lay.setSpacing(2 if small else 4)
 
         def step(k):
             self.lblBrand.setVisible(k < 1)
-            self.btnPhone.setText("Add from phone" if k < 2 else "Phone")
-            self.btnChoose.setText("+  Choose files" if k < 2 else "+  Files")
-            self.btnBlank.setText("Blank page" if k < 2 else "Blank")
-            self.btnApplyAll.setText("Apply last setting to all" if k < 2 else "Apply to all")
-            more = k >= 3                                  # folder, open, clear, apply-to-all go into the ... menu
-            for b in (self.btnFolder, self.btnOpenDir, self.btnClear, self.btnApplyAll):
+            self.btnFolder.setVisible(k < 2)                # folder name goes first, its icon-buttons stay in the ... menu
+            self.btnHelp.setVisible(k < 5)
+            more = k >= 3                                   # open-folder, clear, apply-to-all, phone ... go into the ... menu
+            for b in (self.btnOpenDir, self.btnClear, self.btnApplyAll):
                 b.setVisible(not more)
-            self.btnMore.setVisible(more)
+            self.btnPhone.setVisible(k < 4)
+            self._sepA.setVisible(not more)
+            self.btnMore.setVisible(k >= 2)
             self.lblLogo.setVisible(k < 4)
-            self.btnSettings.setText("Settings" if k < 5 else "\u2699")
+            self.btnChoose.setText("Add" if k < 3 else "")
         for k in range(6):
             step(k)
             lay.invalidate()
@@ -2010,14 +2091,14 @@ class MainWindow(QMainWindow):
 
     def _refresh_dir(self):
         d = self._dir()
-        room = int(max(80, min(340, self.width() * 0.2)))
-        narrow = self.width() < 1100
+        room = int(max(60, min(260, self.width() * 0.16)))
         fm = QFontMetrics(self.font())
         if d:
-            self.btnFolder.setText(("Folder: " if narrow else "Save folder: ") + fm.elidedText(d, Qt.TextElideMode.ElideMiddle, room))
+            name = os.path.basename(d.rstrip("/\\")) or d
+            self.btnFolder.setText(fm.elidedText(name, Qt.TextElideMode.ElideMiddle, room))
             self.btnFolder.setToolTip("Edited pictures are saved in:\n" + d + "\nClick to change.")
         else:
-            self.btnFolder.setText("Save folder: not set" if not narrow else "Folder: not set")
+            self.btnFolder.setText("Choose save folder")
             self.btnFolder.setToolTip("Edited pictures are saved here. Click to choose the folder.")
         self.btnOpenDir.setEnabled(bool(d))
 

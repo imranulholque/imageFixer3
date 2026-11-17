@@ -27,6 +27,7 @@ from compare import CompareOverlay
 from fullview import FullViewOverlay
 import scanner
 from flow import ElidedLabel, FlowLayout
+from icons import icon as _ico, style_button as _style_btn
 from jobs import _log, run_background
 
 EXPORT_DIR = os.path.join(tempfile.gettempdir(), "imagefixer_export")
@@ -935,11 +936,11 @@ class Card(QWidget):
     @staticmethod
     def _sep():
         f = QFrame()
-        f.setFrameShape(QFrame.Shape.VLine)
-        f.setStyleSheet("color: #2a3042;")
+        f.setObjectName("vsep")
+        f.setFixedSize(1, 22)
         return f
 
-    def _menu_button(self, text, entries, tip=""):
+    def _menu_button(self, text, entries, tip="", ico=None, keys=""):
         b = QToolButton()
         b.setText(text + "  ▾")
         b.setToolTip(tip)
@@ -955,7 +956,42 @@ class Card(QWidget):
             act.triggered.connect(lambda _=False, cb=cb: cb())
         b.setMenu(m)
         b.base_text = text
+        b.base_tip = tip
+        if ico:                                   # icon only (a tiny arrow shows it opens a menu); name + keys in the tooltip
+            b.setIcon(_ico(ico, 20, caret=True))
+            b.setIconSize(QSize(22, 22))
+            b.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+            b.setText("")
+            b.setProperty("ico", True)
+            b.setToolTip(text + ("   " + keys if keys else "") + ("\n" + tip if tip else ""))
+            b.base_tip = b.toolTip()
         return b
+
+    def _icon_pass(self):
+        """Icon-driven top rows: every button gets an icon; names, keys and the old long help live in the tooltip."""
+        def S(btn, name, text, keys="", label=None):
+            old = btn.toolTip()
+            _style_btn(btn, name, text, keys, label=label, extra_tip=old if len(old) > 60 else "")
+        S(self.btnUndo, "undo", "Undo", "Ctrl+Z")
+        S(self.btnRedo, "redo", "Redo", "Ctrl+Y")
+        S(self.btnReset, "reset", "Reset to the original")
+        S(self.btnCompare, "compare", "Compare with the original", "Q")
+        S(self.btnPreview, "eye", "Real-quality preview", "F")
+        S(self.btnUpscale, "upscale", "Upscale", "U")
+        S(self.btnRemove, "trash", "Remove from the list", "Del")
+        S(self.btnPanel, "panel", "Show / hide the side panel", "Ctrl+B")
+        S(self.btnHand, "hand", "Hand: drag the picture", "H")
+        S(self.btnPick, "dropper", "Eyedropper", "I")
+        S(self.btnPaint, "brush", "Color brush", "P")
+        S(self.btnLayerTop, "layer", "New layer from the selection", "Ctrl+J")
+        S(self.btnText, "text", "Text box", "T")
+        S(self.btnLayerDone, "prev", "Back to the page", "Esc", label="Back")
+        S(self.btnApply, "check", "Apply", "Enter", label="Apply")
+        S(self.btnCancel, "close", "Cancel", "Esc", label="Cancel")
+        for b in (self.btnLayerDone, self.btnApply, self.btnCancel):
+            b.setProperty("ico", False)
+            b.style().unpolish(b)
+            b.style().polish(b)
 
     def _mark(self, w, on):
         w.setProperty("active", bool(on))
@@ -1142,15 +1178,15 @@ class Card(QWidget):
             None, ("Select all\tCtrl+A", self.select_all), ("Deselect\tCtrl+D", self.deselect),
             ("Inverse\tCtrl+Shift+I", self.invert_selection), None,
             ("New layer from selection\tCtrl+J", lambda: self.layer_from_selection(False)),
-            ("Cut selection to a layer\tCtrl+Shift+J", lambda: self.layer_from_selection(True))], "Ways to select a part of the picture")
+            ("Cut selection to a layer\tCtrl+Shift+J", lambda: self.layer_from_selection(True))], "Ways to select a part of the picture", "select", "B / M / L / W")
         self.menuMove = self._menu_button("Move", [
             ("Move\tV", lambda: T("move")), ("Copy\tShift+V", lambda: T("copy")),
-            ("Transform\tCtrl+T", self.start_transform)], "Move, copy or resize the selection")
+            ("Transform\tCtrl+T", self.start_transform)], "Move, copy or resize the selection", "move", "V")
         self.menuErase = self._menu_button("Erase", [
             ("Brush\tE", lambda: T("erase_brush")), ("Box\tShift+E", lambda: T("erase_rect")),
             ("Ellipse\tCtrl+E", lambda: T("erase_ellipse")), ("Freehand\tAlt+E", lambda: T("erase_lasso")), None,
             ("Delete selection\tDel", self.delete_selection),
-            ("Fill with color", self.fill_selection)], "Remove things; the place is filled from around it")
+            ("Fill with color", self.fill_selection)], "Remove things; the place is filled from around it", "erase", "E")
         self.menuCrop = self._menu_button("Crop", [
             ("Auto crop (find the page, then fix the corners)\tA", lambda: self.auto_crop()), None,
             ("Crop\tC", lambda: T("crop")), ("Straighten (4 corners)\tS", lambda: T("persp")), None,
@@ -1158,7 +1194,7 @@ class Card(QWidget):
             ("To rounded box\tAlt+C", lambda: T("crop_round")), ("To selection shape\tAlt+X", self.crop_to_selection), None,
             ("Rotate left\tShift+R", lambda: self.rotate(90.0)), ("Rotate right\tR", lambda: self.rotate(-90.0))],
             "Crop (also a picture you placed: signature, stamp ...) to a box, circle, oval, rounded box or any selected shape; "
-            "straighten a photographed page; rotate")
+            "straighten a photographed page; rotate", "crop", "A auto / C crop")
         self.menus = {"select": self.menuSelect, "move": self.menuMove, "erase": self.menuErase, "crop": self.menuCrop}
         self.btnLayerDone = QPushButton("◀  Back to the page")
         self.btnLayerDone.setProperty("accent", True)
@@ -1192,6 +1228,7 @@ class Card(QWidget):
         r2.addStretch(1)
         r2.addWidget(self.lblZoom)
         root.addLayout(r2)
+        self._icon_pass()
 
         # --- row 3: options of the chosen tool
         self.optsA = QWidget()
@@ -1517,11 +1554,6 @@ class Card(QWidget):
         # --- text of the top row
         self.lblInfo.setVisible(not narrow)
         self.lblState.setVisible(w >= 520)
-        self.btnUndo.setText("\u21b6" if compact else "\u21b6 Undo")
-        self.btnRedo.setText("\u21b7" if compact else "Redo \u21b7")
-        self.btnRemove.setText("\u2715" if compact else "Remove")
-        self.btnPreview.setText("\u25c9" if compact else "Preview")
-        self.btnUpscale.setText("\u2922" if compact else "Upscale")
         self._r1.setSpacing(4 if compact else 8)
         self._root.setContentsMargins(*((6, 4, 4, 2) if compact or short else (10, 6, 8, 4)))
         self._root.setSpacing(3 if short else 4)
@@ -1631,8 +1663,11 @@ class Card(QWidget):
             elif n == "Border":
                 b.setToolTip("Add / remove a border on the selected layer(s) and choose its colour and thickness.\n"
                              "Only this tab changes a border: brightness, sharpness, shadow removal ... never touch it.")
+            _style_btn(b, ("adjust", "color", "shadow", "textfix", "picture", "aa", "layers", "border")[i], n,
+                       "", extra_tip=b.toolTip())
+            b.setProperty("tab", True)
             self.tabGroup.addButton(b, i)
-            tabs.addWidget(b, i // 4, i % 4)
+            tabs.addWidget(b, 0, i)
         self.tabGroup.button(0).setChecked(True)
         v.addLayout(tabs)
 
@@ -5475,7 +5510,10 @@ class Card(QWidget):
         for fam, keys in (("select", SELECT_KEYS), ("move", MOVE_KEYS), ("erase", ERASE_KEYS), ("crop", CROP_KEYS)):
             b = self.menus[fam]
             on = key in keys
-            b.setText((b.base_text + ": " + NAMES[key] if on else b.base_text) + "  ▾")
+            if b.toolButtonStyle() == Qt.ToolButtonStyle.ToolButtonIconOnly:
+                b.setToolTip(b.base_tip + (("\n\u25cf Active: " + NAMES[key]) if on else ""))
+            else:
+                b.setText((b.base_text + ": " + NAMES[key] if on else b.base_text) + "  ▾")
             self._mark(b, on)
         sel_t, er = key in SELECT_KEYS, key in ERASE_KEYS
         pend = key in CROP_KEYS or key == "transform"
