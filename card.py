@@ -4905,6 +4905,9 @@ class Card(QWidget):
 
     def _fill_layer_list(self):
         lw = self.layerList
+        vbar = lw.verticalScrollBar()
+        scroll = vbar.value()
+        lw.setUpdatesEnabled(False)                              # one repaint at the end: no flicker, no jumping
         lw.blockSignals(True)
         lw.clear()
         keep = {}
@@ -4945,6 +4948,8 @@ class Card(QWidget):
             lw.clearSelection()
         lw.setEnabled(True)
         lw.blockSignals(False)
+        lw.setUpdatesEnabled(True)
+        vbar.setValue(min(scroll, vbar.maximum()))               # the list stays where it was (a long list used to jump to the top)
         l = None if self.sel_layer is None else self._layer(self.sel_layer)
         on = l is not None
         is_text = l is not None and l.get("text") is not None
@@ -5503,7 +5508,6 @@ class Card(QWidget):
         prev = self.prev
         fuzz = self._fuzz
         local = self.localSlider.value() / 100.0 if self.chkLocal.isChecked() else 0.0
-        base_sel = self.sel
 
         def work(progress):
             lab = self._lab if self._lab is not None else core.rgb_to_lab(prev)

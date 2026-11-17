@@ -206,22 +206,6 @@ def _neutral_factor(lab):
 
 
 def color_match(lab, t, tol):
-    """Pixels that have the SAME COLOUR as target t (Lab), whatever their lightness: same hue, enough colour strength.
-    A black pixel with a hint of red, or a grey one, is NOT matched (it has too little colour)."""
-    Ct = math.hypot(t[1], t[2])
-    a, b = lab[..., 1], lab[..., 2]
-    C = np.hypot(a, b)
-    dh = np.abs((np.arctan2(b, a) - math.atan2(t[2], t[1]) + math.pi) % (2 * math.pi) - math.pi)
-    dh = np.degrees(dh)
-    hw = 12.0 + tol * 0.5
-    hue_g = 1.0 - _smooth((dh - hw * 0.75) / (hw * 0.5))
-    chroma_g = _smooth((C - 0.32 * Ct) / (0.25 * Ct))
-    dL = np.abs(lab[..., 0] - t[0])
-    light_g = 1.0 - _smooth((dL - tol * 1.6) / (tol * 0.8))
-    return (hue_g * chroma_g * light_g).astype(np.float32)
-
-
-def color_match(lab, t, tol):
     """0..1: how much each pixel IS colour t=(L,a,b).  Hue and chroma decide first, lightness counts less, and
     grey / black pixels (even with a faint colour cast) never match a strong colour, so selecting red does not
     take the black writing with it."""

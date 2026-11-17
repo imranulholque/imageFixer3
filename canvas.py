@@ -287,7 +287,7 @@ class ImageCanvas(QWidget):
         if name == "sel" and self._selmove is not None:                  # the outline follows the mouse while it is dragged
             x0 += int(round(self._selmove["d"][0] * self.zoom))
             y0 += int(round(self._selmove["d"][1] * self.zoom))
-        p.drawImage(x0, y0, img.copy())
+        p.drawImage(x0, y0, img)                          # buf lives until this returns: no copy per frame
 
     def has_image(self):
         return self._img is not None
