@@ -1592,8 +1592,6 @@ class MainWindow(QMainWindow):
         self.btnNext.setEnabled(n > 1 and i < n - 1)
         unsaved = sum(1 for c in self.carousel.cards if c.is_unsaved()) if n else 0
         label = "Save all edited (%d)" % unsaved if unsaved else "Save all edited"
-        self.btnSaveAll.setText(label)
-        self.btnSaveAll.setEnabled(unsaved > 0)
         if hasattr(self, "actSaveAll"):                       # the Save v menu in the top bar
             self.actSaveAll.setText("Save all edited (%d)..." % unsaved if unsaved else "Save all edited...")
             self.actSaveAll.setEnabled(unsaved > 0)
@@ -1605,7 +1603,6 @@ class MainWindow(QMainWindow):
             c.btnSaveAll.setText(label)
             c.btnSaveAll.setEnabled(unsaved > 0)
         self.btnClear.setEnabled(n > 0)
-        self.btnPdfAll.setEnabled(n > 0)
         self.btnPageL.setEnabled(n > 1 and i > 0)
         self.btnPageR.setEnabled(n > 1 and i < n - 1)
         if n == 0:
