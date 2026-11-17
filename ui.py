@@ -418,7 +418,9 @@ SHORTCUT_GROUPS = (
         ("Ctrl+Shift+P", "Add from phone"),
         ("Ctrl+Shift+A", "Apply the last setting to all pictures"),
         ("Ctrl+Shift+E", "All pages as one PDF"),
-        ("Ctrl+Shift+Left / Right", "Move this page earlier / later"))),
+        ("Ctrl+Shift+Left / Right", "Move this page earlier / later"),
+        ("Ctrl+G", "Group the selected layers (Ctrl + click several first): they move, resize and rotate as one"),
+        ("Ctrl+Shift+G", "Ungroup"))),
     ("Files and saving", (
         ("Ctrl+O", "Choose files"),
         ("Ctrl+N", "New blank page of any color (like Picsart / Word); or put a color on this page as an overlay"),
@@ -1072,6 +1074,8 @@ class MainWindow(QMainWindow):
         sc("Ctrl+J", cur(lambda c: c.layer_from_selection(False)), "New layer from selection")
         sc("Ctrl+Shift+J", cur(lambda c: c.layer_from_selection(True)), "Cut selection to a layer")
         sc("Ctrl+T", cur(lambda c: c.start_transform()), "Transform")
+        sc("Ctrl+G", cur(lambda c: c.group_layers()), "Group layers")
+        sc("Ctrl+Shift+G", cur(lambda c: c.ungroup_layers()), "Ungroup layers")
         del_label = lambda: "Delete selection" if (self.carousel.current() is not None and self.carousel.current().sel is not None) else None
         sc("Delete", cur(lambda c: c.delete_selection()), del_label)
         sc("Backspace", cur(lambda c: c.delete_selection()), del_label)

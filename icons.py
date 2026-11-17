@@ -93,6 +93,8 @@ def g_image(p): _rrect(p, 3, 4, 18, 16); _dot(p, 8.5, 9.5, 1.8, False); _line(p,
 def g_aa(p): _line(p, 2.5, 19, 7.5, 5, 12.5, 19); _line(p, 4.4, 14.5, 10.6, 14.5); p.drawEllipse(QPointF(17.5, 15.2), 3.3, 3.3); _line(p, 20.8, 11.5, 20.8, 19)
 def g_layers(p): _line(p, 12, 3, 21, 8, 12, 13, 3, 8, 12, 3); _line(p, 3, 12.5, 12, 17.5, 21, 12.5); _line(p, 3, 16.5, 12, 21.5, 21, 16.5)
 def g_border(p): _rrect(p, 4, 4, 16, 16, 3); _rrect(p, 8, 8, 8, 8, 1)
+def g_group(p): _rrect(p, 3, 3, 9, 9, 2); _rrect(p, 12, 12, 9, 9, 2); pen = QPen(p.pen()); pen.setStyle(Qt.PenStyle.DashLine); pen.setDashPattern([1.8, 1.8]); p.setPen(pen); _rrect(p, 1.5, 1.5, 21, 21, 3)
+def g_ungroup(p): _rrect(p, 2.5, 2.5, 9, 9, 2); _rrect(p, 12.5, 12.5, 9, 9, 2); _line(p, 15, 4, 20, 9); _line(p, 20, 4, 15, 9)
 def g_check(p): _line(p, 5, 12.5, 10, 17.5, 19, 7)
 def g_keys(p): _rrect(p, 2.5, 6, 19, 12, 2.5); [_dot(p, x, 10, 0.8) for x in (7, 11, 15, 19)]; _line(p, 7, 14.5, 17, 14.5)
 
@@ -134,7 +136,7 @@ COLORS = {
     "more": "#94a3b8", "help": "#38bdf8", "settings": "#94a3b8", "gear": "#94a3b8", "shortcuts": "#38bdf8",
     "undo": "#a78bfa", "redo": "#a78bfa", "reset": "#fb923c", "compare": "#22d3ee", "eye": "#38bdf8", "upscale": "#c084fc",
     "close": "#fb7185", "panel": "#94a3b8", "hand": "#fcd34d", "dropper": "#2dd4bf", "brush": "#f472b6",
-    "select": "#60a5fa", "move": "#a78bfa", "erase": "#fb923c", "crop": "#4ade80", "layer": "#c084fc", "text": "#fbbf24",
+    "select": "#60a5fa", "move": "#a78bfa", "erase": "#fb923c", "crop": "#4ade80", "layer": "#c084fc", "group": "#2dd4bf", "ungroup": "#fb923c", "text": "#fbbf24",
     "prev": "#a5b4fc", "next": "#a5b4fc", "pageL": "#94a3b8", "pageR": "#94a3b8", "check": "#4ade80",
     "adjust": "#818cf8", "color": "#f472b6", "shadow": "#fbbf24", "textfix": "#34d399", "picture": "#38bdf8",
     "aa": "#fb923c", "layers": "#c084fc", "border": "#2dd4bf",

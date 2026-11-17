@@ -2022,6 +2022,21 @@ class Card(QWidget):
             b_.setMinimumWidth(0)
             lrow.addWidget(b_, 1)
         gl.addLayout(lrow)
+        grow = QHBoxLayout()
+        grow.setSpacing(4)
+        self.btnGroup = QPushButton()
+        self.btnUngroup = QPushButton()
+        _style_btn(self.btnGroup, "group", "Group the selected layers", "Ctrl+G", label="Group",
+                   extra_tip="Ctrl + click two or more layers first.  A group is selected, moved, resized and rotated as one.")
+        _style_btn(self.btnUngroup, "ungroup", "Ungroup", "Ctrl+Shift+G", label="Ungroup",
+                   extra_tip="Frees the layers of the group again.")
+        self.btnGroup.clicked.connect(self.group_layers)
+        self.btnUngroup.clicked.connect(self.ungroup_layers)
+        self.btnGroup.setEnabled(False)
+        self.btnUngroup.setEnabled(False)
+        grow.addWidget(self.btnGroup, 1)
+        grow.addWidget(self.btnUngroup, 1)
+        gl.addLayout(grow)
         self.layerOpacity = SliderRow("Opacity of the selected layer", 0, 100, 100, ("see-through", "", "solid"),
                                       "How strongly the selected layer(s) show on the page (picture, ID card, text box).\n"
                                       "Ctrl + click several layers to change them together.  The border keeps its full color.", "%")
@@ -3316,6 +3331,74 @@ class Card(QWidget):
     def _replace_layer(self, lid, **kw):
         self.layers = [dict(l, **kw) if l["id"] == lid else l for l in self.layers]
 
+    # ------------------------------------------------ groups: layers that stay together (click one = all are selected)
+    def _group_ids(self, lid):
+        """Ids of every layer that is in the same group as this one (just [lid] if it is not grouped)."""
+        l = self._layer(lid)
+        g = None if l is None else l.get("group")
+        if not g:
+            return [lid]
+        return [x["id"] for x in self.layers if x.get("group") == g] or [lid]
+
+    def _pick_group(self, lid):
+        """The layer was clicked: when it belongs to a group, the whole group becomes the selection."""
+        m = self._group_ids(lid)
+        if len(m) > 1:
+            self.sel_group = set(m)
+            self.sel_main = False
+        return len(m) > 1
+
+    def group_layers(self):
+        """Group (Ctrl+G): the selected layers (Ctrl + click several) are tied together: they select, move, resize,
+        rotate and fade as ONE.  The pixels are not changed; Ungroup (Ctrl+Shift+G) frees them again."""
+        if not self._loaded or self.ctx is not None:
+            return
+        ids = set(self.sel_group)
+        cur = self._place_id if self._place_id is not None else self.sel_layer
+        if cur is not None:
+            ids.add(cur)
+        ids = {i for i in ids if self._layer(i) is not None}
+        if len(ids) < 2:
+            self.message.emit("Select two or more layers first (Ctrl + click them), then Group.")
+            return
+        if self._tool == "transform" and self._place_id is not None:
+            self._commit_layer_pts()
+        self._layer_seq += 1
+        gid = "g%d_%s" % (self._layer_seq, uuid.uuid4().hex[:6])
+        self._checkpoint("Group")
+        self.layers = [dict(l, group=gid) if l["id"] in ids else l for l in self.layers]
+        self.sel_group = set(ids)
+        self.ops += 1
+        self._touch()
+        self._refresh_layers_ui()
+        self._notify("ok", "Grouped", "%d layers move together" % len(ids))
+
+    def ungroup_layers(self):
+        """Ungroup (Ctrl+Shift+G): the group of the selected layer is dissolved; every layer is free again."""
+        if not self._loaded or self.ctx is not None:
+            return
+        ids = set(self.sel_group)
+        cur = self._place_id if self._place_id is not None else self.sel_layer
+        if cur is not None:
+            ids.add(cur)
+        gids = {l.get("group") for l in self.layers if l["id"] in ids and l.get("group")}
+        if not gids:
+            self.message.emit("The selected layer is not in a group.")
+            return
+        self._checkpoint("Ungroup")
+        self.layers = [{k: v for k, v in l.items() if k != "group"} if l.get("group") in gids else l for l in self.layers]
+        self.ops += 1
+        self._touch()
+        self._refresh_layers_ui()
+        self._notify("ok", "Ungrouped", "the layers are free again")
+
+    def _selection_has_group(self):
+        ids = set(self.sel_group)
+        cur = self._place_id if self._place_id is not None else self.sel_layer
+        if cur is not None:
+            ids.add(cur)
+        return any(l.get("group") for l in self.layers if l["id"] in ids)
+
     # ------------------------------------------------ text boxes (Bangla / English)
     def _text_layer(self):
         """The selected text box layer, or None."""
@@ -3421,6 +3504,7 @@ class Card(QWidget):
             return
         self._layer_seq += 1
         nl = textbox.duplicate(l, self._layer_seq, offset)
+        nl.pop("group", None)
         self._checkpoint("Copy")
         i = next(k for k, x in enumerate(self.layers) if x["id"] == lid)
         self.layers = self.layers[:i + 1] + [nl] + self.layers[i + 1:]
@@ -3442,6 +3526,7 @@ class Card(QWidget):
             src = self._layer(gid)
             self._layer_seq += 1
             nl = textbox.duplicate(src, self._layer_seq, 0.0)
+            nl.pop("group", None)
             i = next(k for k, x in enumerate(self.layers) if x["id"] == gid)
             self.layers = self.layers[:i] + [nl] + self.layers[i:]
         self.ops += 1
@@ -4027,6 +4112,8 @@ class Card(QWidget):
             return
         lid = self._layer_at(x, y)
         if lid is not None:
+            if lid not in self.sel_group:
+                self._pick_group(lid)
             self.place_layer_tool(lid)
             self._show_text_tab_if_text(lid)
 
@@ -4073,6 +4160,7 @@ class Card(QWidget):
         if not (lid in self.sel_group and len(self.sel_group) > 1):
             self.sel_group = set()
             self.sel_main = False
+            self._pick_group(lid)
         self.place_layer_tool(lid)
         self._show_text_tab_if_text(lid)
         self.canvas.begin_layer_drag(x, y, alt)                 # drag starts right away: click = select, drag = move, Alt + drag = copy
@@ -4153,6 +4241,9 @@ class Card(QWidget):
             ("Duplicate", lambda: self.duplicate_layer(lid), True),
             ("Copy picture", lambda: self.copy_layer_image(lid), not is_text),
             None,
+            ("Group layers\tCtrl+G", self.group_layers, len(self.sel_group) > 1),
+            ("Ungroup\tCtrl+Shift+G", self.ungroup_layers, bool(l.get("group"))),
+            None,
             ("Bring to front\tCtrl+Alt+Shift+Up", lambda: self.move_layer_to(lid, True), not top),
             ("Bring forward", lambda: self.move_layer_order(lid, 1), not top),
             ("Send backward", lambda: self.move_layer_order(lid, -1), not bottom),
@@ -4166,7 +4257,7 @@ class Card(QWidget):
             ("Hide" if l.get("visible", True) else "Show", lambda: (self.toggle_layer(lid, not l.get("visible", True)), self._refresh_layers_ui()), True),
             ("Delete\tDel", lambda: self.delete_layer(lid), True),
         ]
-        items.insert(6, "opacity")                    # its own block, after Duplicate / Copy picture
+        items.insert(9, "opacity")                    # its own block, after Duplicate / Copy picture
         acts = {}
         for it in items:
             if it is None:
@@ -4255,6 +4346,8 @@ class Card(QWidget):
             self.message.emit("The page is edited together with the selected layers." if self.sel_main
                               else "Only the selected layers are edited.")
             return
+        if lid is not None and lid not in self.sel_group:
+            self._pick_group(lid)
         if lid is not None and lid in self.sel_group and len(self.sel_group) > 1:
             self.place_layer_tool(lid)                 # one of the selected pictures: they all stay selected, drag moves all
             self.canvas.begin_layer_drag(x, y, False)
@@ -4760,7 +4853,7 @@ class Card(QWidget):
             icon = self._layer_icon(l)
             keep[(l["id"], id(l["rgb"]), id(l["a"]), l.get("opacity", 100), l.get("border"), l.get("rnd", 0))] = self._icon_cache[
                 (l["id"], id(l["rgb"]), id(l["a"]), l.get("opacity", 100), l.get("border"), l.get("rnd", 0))]
-            it = QListWidgetItem(icon, l["name"])
+            it = QListWidgetItem(icon, ("\u26d3 " if l.get("group") else "") + l["name"])
             it.setData(Qt.ItemDataRole.UserRole, l["id"])
             it.setFlags(flags)
             it.setData(EYE_ROLE, bool(l.get("visible", True)))
@@ -4782,6 +4875,8 @@ class Card(QWidget):
         self.btnLayerEdit.setText("Aa  Edit text" if is_text else "Edit picture")
         for b_ in (self.btnLayerEdit, self.btnLayerMove, self.btnLayerCopy, self.btnLayerDel):
             b_.setEnabled(on)
+        self.btnGroup.setEnabled(on and len(self.sel_group) > 1)
+        self.btnUngroup.setEnabled(on and self._selection_has_group())
         main_on = self.ctx is None and not on
         self.btnMainPic.setProperty("accent", bool(main_on))
         self.btnMainPic.style().unpolish(self.btnMainPic)
@@ -4812,6 +4907,7 @@ class Card(QWidget):
             return
         self.sel_group = set()
         self.sel_main = False
+        self._pick_group(lid)
 
         def go():
             l = self._layer(lid)
