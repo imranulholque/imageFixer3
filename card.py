@@ -4692,7 +4692,7 @@ class Card(QWidget):
         self._sync_round_ui()
         self._sync_layer_opacity_ui()
 
-    def _fill_layer_list(self):    _skip_click = False
+    _skip_click = False
     _icon_cache = None
 
     def _layer_icon(self, l):

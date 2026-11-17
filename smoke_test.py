@@ -30,7 +30,6 @@ c.message.connect(lambda t: msgs.append(t))
 c.ensure_loaded()
 assert c._loaded, "not loaded"
 H, W = c.prev.shape[:2]
-def pix(): return core_out()[0]
 import core
 def out():
     return core.render(c.prev, c.adjs, c.look, sel=c.sel)
