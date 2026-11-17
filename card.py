@@ -3332,7 +3332,7 @@ class Card(QWidget):
         self.layers = [dict(l, **kw) if l["id"] == lid else l for l in self.layers]
 
     # ------------------------------------------------ groups: layers that stay together (click one = all are selected)
-    def _group_ids(self, lid):
+    def _linked_ids(self, lid):
         """Ids of every layer that is in the same group as this one (just [lid] if it is not grouped)."""
         l = self._layer(lid)
         g = None if l is None else l.get("group")
@@ -3342,7 +3342,7 @@ class Card(QWidget):
 
     def _pick_group(self, lid):
         """The layer was clicked: when it belongs to a group, the whole group becomes the selection."""
-        m = self._group_ids(lid)
+        m = self._linked_ids(lid)
         if len(m) > 1:
             self.sel_group = set(m)
             self.sel_main = False
