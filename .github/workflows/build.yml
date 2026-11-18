@@ -26,19 +26,24 @@ jobs:
           open("buildinfo.py", "w").write('BUILD = ${{ github.run_number }}\nREPO = "${{ github.repository }}"\nREPO_ID = ${{ github.repository_id }}\nCOMMIT = "${{ github.sha }}"\n')
       - name: Updater test
         continue-on-error: true
+        timeout-minutes: 5
         run: python test_updater.py
       - name: Undo-on-disk test
         continue-on-error: true
+        timeout-minutes: 5
         run: python test_spill.py
       - name: ID card cut test
         continue-on-error: true
+        timeout-minutes: 5
         run: python test_idscan.py
       # Opens the real window invisibly and clicks through the main features.
       # If something is wrong the log shows exactly where; the exe is still built.
       - name: Self test
         continue-on-error: true
+        timeout-minutes: 6
         env:
           QT_QPA_PLATFORM: offscreen
+          PYTHONUNBUFFERED: "1"      # show every PASS / FAIL line live, so a hang shows which test it is
         run: python smoke_test.py
       # The program icon: made here when icon.ico is not in the repository.
       - name: Make icon if missing
