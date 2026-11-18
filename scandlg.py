@@ -11,8 +11,8 @@ import time
 
 from PySide6.QtCore import QProcess, QSize, QTimer, Qt
 from PySide6.QtGui import QColor
-from PySide6.QtWidgets import (QCheckBox, QColorDialog, QComboBox, QDialog, QFormLayout, QFrame, QHBoxLayout, QLabel, QProgressBar,
-                               QPushButton, QSlider, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QCheckBox, QColorDialog, QComboBox, QDialog, QFormLayout, QFrame, QHBoxLayout, QLabel, QProgressBar,
+                               QPushButton, QScrollArea, QSlider, QVBoxLayout, QWidget)
 
 from icons import icon as _ico
 import idpreview
@@ -109,8 +109,8 @@ def _card(caption, icon_name, vertical=False):
     fr.setObjectName("scanCard")
     fr.setStyleSheet(CARD_CSS)
     v = QVBoxLayout(fr)
-    v.setContentsMargins(14, 10, 14, 12)
-    v.setSpacing(8)
+    v.setContentsMargins(12, 8, 12, 10)
+    v.setSpacing(6)
     head = QHBoxLayout()
     head.setSpacing(6)
     ic = QLabel()
@@ -122,7 +122,7 @@ def _card(caption, icon_name, vertical=False):
     head.addStretch(1)
     v.addLayout(head)
     rows = _Rows() if vertical else QFormLayout()
-    rows.setSpacing(8)
+    rows.setSpacing(6)
     if not vertical:
         rows.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
     v.addLayout(rows)
@@ -136,7 +136,7 @@ class ScanDialog(QDialog):
         self.st = win.settings
         self.setWindowTitle("Scan")
         self.setModal(False)
-        self.setMinimumWidth(500)
+        self.setMinimumWidth(820)
         self.work = tempfile.mkdtemp(prefix="scan_", dir=win.tmp)
         self._procs = []                  # running list jobs
         self._proc = None                 # the running scan
@@ -149,8 +149,8 @@ class ScanDialog(QDialog):
         self._errors = []
 
         root = QVBoxLayout(self)
-        root.setSpacing(10)
-        root.setContentsMargins(16, 14, 16, 14)
+        root.setSpacing(8)
+        root.setContentsMargins(14, 12, 14, 12)
         th = QHBoxLayout()
         th.setSpacing(8)
         tic = QLabel()
@@ -168,7 +168,7 @@ class ScanDialog(QDialog):
         self._idcard, form4 = _card("ID card", "border")
         row = QHBoxLayout()
         self.cmbDev = QComboBox()
-        self.cmbDev.setMinimumWidth(300)
+        self.cmbDev.setMinimumWidth(180)
         self.btnRefresh = QPushButton("Find scanners")
         self.btnRefresh.setToolTip("Look for TWAIN and WIA scanners again")
         self.btnRefresh.setIcon(_ico("reset", 18))
@@ -294,10 +294,31 @@ class ScanDialog(QDialog):
                         self.lblBorderW, self.lblBorder, self.chkPreview,
                         self.chkRound, self.sldRound, self.lblRoundV, self.lblRound, self.lblRoundT, self.sampleRound,
                         self._idcard)
-        root.addWidget(fr1)
-        root.addWidget(fr2)
-        root.addWidget(fr3)
-        root.addWidget(self._idcard)
+        # the cards scroll when the screen is small; the title, the step text and the Scan / Close buttons never scroll away
+        self._body = QWidget()
+        bl = QHBoxLayout(self._body)                     # two columns: short enough for any laptop screen, no scrolling
+        bl.setContentsMargins(0, 0, 0, 0)
+        bl.setSpacing(10)
+        c1, c2 = QVBoxLayout(), QVBoxLayout()
+        c1.setSpacing(8)
+        c2.setSpacing(8)
+        c1.addWidget(fr1)
+        c1.addWidget(fr2)
+        c1.addStretch(1)
+        c2.addWidget(fr3)
+        c2.addWidget(self._idcard)
+        c2.addStretch(1)
+        bl.addLayout(c1, 1)
+        bl.addLayout(c2, 1)
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }"
+                                   "QScrollArea > QWidget > QWidget { background: transparent; }")
+        self._scroll.setWidget(self._body)
+        self._scroll.setMinimumHeight(140)
+        root.addWidget(self._scroll, 1)
 
         self.lblStep = QLabel("")
         self.lblStep.setWordWrap(True)
@@ -548,6 +569,7 @@ class ScanDialog(QDialog):
         if first:
             self._load_border()               # the Border tab may have changed the shared settings meanwhile
         self.show()
+        self._fit_screen()
         self.raise_()
         self.activateWindow()
         if first and self.cmbDev.count() == 0 and not self._procs:
@@ -655,7 +677,23 @@ class ScanDialog(QDialog):
         self.chkDuplex.setVisible(self.chkFeed.isChecked())
         self.btnAgain.setVisible(idm and self._front is not None)
         self._update_step()
-        self.adjustSize()
+        self._fit_screen()
+
+    def _fit_screen(self):
+        """Open at the height the content needs, but never taller / wider than the screen this window is on."""
+        scr = (self.screen() if self.isVisible() else None) or self.win.screen() or QApplication.primaryScreen()
+        ag = scr.availableGeometry()
+        maxh, maxw = int(ag.height() * 0.92), int(ag.width() * 0.92)
+        self.setMinimumWidth(min(820, maxw))
+        self.setMaximumSize(maxw, maxh)
+        fixed = self.sizeHint().height() - self._scroll.sizeHint().height()
+        want = fixed + self._body.sizeHint().height() + 6
+        w = min(max(self.minimumWidth(), self.width() if self.isVisible() else 860), maxw)
+        self.resize(w, min(want, maxh))
+        fg = self.frameGeometry()                       # keep the whole window inside the screen
+        x = min(max(fg.x(), ag.x()), max(ag.x(), ag.right() - fg.width()))
+        y = min(max(fg.y(), ag.y()), max(ag.y(), ag.bottom() - fg.height()))
+        self.move(x, y)
 
     def _both_in_one(self):
         return self._id_mode() and self.chkFeed.isChecked() and self.chkDuplex.isChecked()

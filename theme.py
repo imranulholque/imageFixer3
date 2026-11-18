@@ -213,6 +213,10 @@ QSlider::handle:horizontal:pressed { background: #a5b4fc; }
 QPushButton[gh="true"] { background: transparent; border: none; text-align: left; font-weight: 700; font-size: 13px; color: #e4e7f2; padding: 4px 2px; }
 QPushButton[gh="true"]:hover { color: #ffffff; background: #1b2132; border-radius: 6px; }
 QLabel#hint { color: #7f879b; }
+QLabel#info { color: #9aa3b8; font-size: 11px; background: #111623; border: 1px solid #1f2639; border-radius: 8px; padding: 7px 9px; }
+QFrame#group QPushButton { min-height: 28px; }
+QFrame#group QPushButton[accent="true"] { min-height: 36px; font-size: 13px; }
+QFrame#group QCheckBox { padding: 2px 0px; }
 QFrame#vsep { background: #2a3042; max-width: 1px; min-width: 1px; margin: 6px 3px; }
 QPushButton#nav { min-width: 30px; max-width: 30px; padding: 2px; font-size: 14px; }
 QToolTip { border-radius: 6px; }

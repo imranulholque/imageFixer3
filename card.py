@@ -264,8 +264,8 @@ class SliderRow(QWidget):
         self._default = value
         self._unit = unit
         v = QVBoxLayout(self)
-        v.setContentsMargins(0, 0, 0, 0)
-        v.setSpacing(4)
+        v.setContentsMargins(0, 2, 0, 6)
+        v.setSpacing(3)
         top = QHBoxLayout()
         top.setSpacing(8)
         self.title = QLabel(title)
@@ -589,7 +589,7 @@ class ColorList(QWidget):
         head.addWidget(btn)
         gl.addLayout(head)
         note = QLabel("Click another shade in the picture to add its slider.")
-        note.setObjectName("hint")
+        note.setObjectName("info")
         note.setWordWrap(True)
         gl.addWidget(note)
         self._group = g
@@ -1067,7 +1067,7 @@ class Card(QWidget):
         bl.setContentsMargins(0, 0, 0, 0)
         bl.setSpacing(4)
         lab = QLabel("")
-        lab.setObjectName("hint")
+        lab.setObjectName("info")
         lab.setWordWrap(True)
         self._scope_labels.append(lab)
         btn = QPushButton("Apply to the selection")
@@ -1728,7 +1728,7 @@ class Card(QWidget):
         gs, gls = self._group_box("Remove a stamp or mark")
         hs = QLabel("Select the stamp (Select menu > Color range is the quickest), then press the button. "
                     "The place is filled from what is around it.")
-        hs.setObjectName("hint")
+        hs.setObjectName("info")
         hs.setWordWrap(True)
         gls.addWidget(hs)
         self.chkInk = QCheckBox("Keep the dark writing under the stamp")
@@ -1745,7 +1745,7 @@ class Card(QWidget):
         g2, gl2 = self._group_box("Color range & fill")
         hc = QLabel("Choose the Color range tool and click a color: it is selected. "
                     "Fuzziness (how wide) is in the bar above the picture.")
-        hc.setObjectName("hint")
+        hc.setObjectName("info")
         hc.setWordWrap(True)
         gl2.addWidget(hc)
         fr = FlowLayout(hspacing=6, vspacing=6)
@@ -1802,7 +1802,7 @@ class Card(QWidget):
         gn, gln = self._group_box("Newspaper / book photo  \u2192  white page", collapsible=False)
         hn = QLabel("For a photo of a newspaper or a book page: the text and the shapes stay as they are, the page turns white. "
                     "One click - then slide the strength down or up. The slider works before and after the click.")
-        hn.setObjectName("hint")
+        hn.setObjectName("info")
         hn.setWordWrap(True)
         gln.addWidget(hn)
         self.btnNews = QPushButton("Make the page white  (one click)")
@@ -1863,7 +1863,7 @@ class Card(QWidget):
         g2, gl2 = self._group_box("Manual shadow removal", collapsible=False)
         info = QLabel("Works at once - no click needed.  Select a part of the picture first (Select menu) to fix only "
                       "that part, for example a shadow in one corner.  After the one-click button it fine-tunes the result.")
-        info.setObjectName("hint")
+        info.setObjectName("info")
         info.setWordWrap(True)
         gl2.addWidget(info)
         gl2.addWidget(self._look_row("flat", "Even out the light", 0, 100, ("off", "", "full"),
@@ -2008,7 +2008,7 @@ class Card(QWidget):
         g, gl = self._group_box("Layers", collapsible=False)
         hint = QLabel("Select an area, then press Ctrl+J (copy) or Ctrl+Shift+J (cut) = it becomes a layer.  "
                       "Click a layer = work on it alone.  Drag a row up / down = change the order.  The tick shows / hides it.")
-        hint.setObjectName("hint")
+        hint.setObjectName("info")
         hint.setWordWrap(True)
         gl.addWidget(hint)
         nrow = QHBoxLayout()
@@ -2117,7 +2117,7 @@ class Card(QWidget):
         hb = QLabel("Select one layer (or Ctrl + click several) in the Layers tab or on the page, then change its border here. "
                     "The border is drawn on the finished layer, so brightness, sharpness, shadow removal, colours and "
                     "opacity never change its colour: only this tab does.")
-        hb.setObjectName("hint")
+        hb.setObjectName("info")
         hb.setWordWrap(True)
         gl.addWidget(hb)
         lay.addWidget(g)
@@ -2141,7 +2141,7 @@ class Card(QWidget):
         g2l.addLayout(srow)
         hr = QLabel("Works on the selected layer(s): pictures, QR codes, text boxes, ID cards. With no layer selected it changes the "
                     "ID card of this page and is also used for the next ID card scan. The border follows the round corners.")
-        hr.setObjectName("hint")
+        hr.setObjectName("info")
         hr.setWordWrap(True)
         g2l.addWidget(hr)
         lay.addWidget(g2)
@@ -2196,6 +2196,11 @@ class Card(QWidget):
         self.btnText.clicked.connect(self.add_text_layer)
         self.btnLayerDone.clicked.connect(lambda: self.leave_layer())
         self.btnCopy.clicked.connect(self.copy_image)
+        for name, ic in (("btnNews", "picture"), ("btnShadow", "shadow")):
+            b_ = getattr(self, name, None)
+            if b_ is not None:
+                b_.setIcon(_ico(ic, 18, normal="#ffffff"))
+                b_.setIconSize(QSize(18, 18))
         for name, ic in (("btnRemoveStamp", "erase"), ("btnFill", "brush"), ("btnDelete", "trash"), ("btnPickFill", "dropper")):
             b_ = getattr(self, name, None)
             if b_ is not None:
