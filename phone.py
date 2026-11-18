@@ -1,0 +1,1509 @@
+"""Phone as a wireless scanner: a tiny web server on the local network.
+The phone only needs a browser. Only the pages of this program are served - no file of the computer is reachable."""
+import hmac
+import io
+import ipaddress
+import json
+import os
+import re
+import secrets
+import socket
+import ssl
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
+
+from PIL import Image, ImageOps
+from PySide6.QtCore import QObject, Signal
+
+import scanner
+
+MAX_BODY = 60 * 1024 * 1024
+EXT = {"JPEG": ".jpg", "PNG": ".png", "WEBP": ".webp", "BMP": ".bmp", "GIF": ".gif", "TIFF": ".tif",
+       "MPO": ".jpg", "HEIF": ".heic"}
+
+
+def local_ip():
+    """The address of this computer on the Wi-Fi / LAN (None if there is no network)."""
+    cands = []
+    for target in ("8.8.8.8", "10.255.255.255", "192.168.255.255"):       # the address the computer really uses to reach the network
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect((target, 1))
+            cands.append(s.getsockname()[0])
+            s.close()
+        except Exception:
+            pass
+    try:
+        cands += socket.gethostbyname_ex(socket.gethostname())[2]
+    except Exception:
+        pass
+    for ip in cands:
+        try:
+            a = ipaddress.ip_address(ip)
+            if a.is_private and not a.is_loopback and not a.is_link_local:
+                return ip
+        except ValueError:
+            pass
+    return None
+
+
+def _cert_files(ips):
+    """Self-signed certificate for the local addresses (made once, kept in %APPDATA%\\ImageFixer). Needs the 'cryptography' package.
+    The phone shows a one-time warning for it; after 'Proceed' the browser treats the page as secure, so the live camera works."""
+    import datetime
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+    d = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "ImageFixer")
+    os.makedirs(d, exist_ok=True)
+    crt, key, meta = (os.path.join(d, n) for n in ("phone_cert.pem", "phone_key.pem", "phone_cert.ips"))
+    want = ",".join(sorted(set(ips)))
+    try:
+        if os.path.exists(crt) and os.path.exists(key) and open(meta).read() == want:
+            c = x509.load_pem_x509_certificate(open(crt, "rb").read())
+            if c.not_valid_after > datetime.datetime.utcnow() + datetime.timedelta(days=30):
+                return crt, key
+    except Exception:
+        pass
+    k = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Image Fixer")])
+    san = [x509.DNSName("localhost")] + [x509.IPAddress(ipaddress.ip_address(i)) for i in ips]
+    now = datetime.datetime.utcnow()
+    c = (x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(k.public_key()).serial_number(x509.random_serial_number())
+         .not_valid_before(now - datetime.timedelta(days=1)).not_valid_after(now + datetime.timedelta(days=800))
+         .add_extension(x509.SubjectAlternativeName(san), critical=False).sign(k, hashes.SHA256()))
+    open(key, "wb").write(k.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL, serialization.NoEncryption()))
+    open(crt, "wb").write(c.public_bytes(serialization.Encoding.PEM))
+    open(meta, "w").write(want)
+    return crt, key
+
+
+class _Handler(BaseHTTPRequestHandler):
+    server_version = "ImageFixer"
+    protocol_version = "HTTP/1.1"
+    timeout = 120                                       # a dead / idle connection is closed, not kept forever
+    disable_nagle_algorithm = True                      # small replies leave at once (no 40 ms wait)
+    wbufsize = 64 * 1024                                # headers + body go out in one piece
+
+    def log_message(self, *a):
+        pass
+
+    # ---- helpers
+    def _send(self, code, body=b"", ctype="text/plain; charset=utf-8", extra=None):
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+        self.wfile.flush()
+
+    def _json(self, obj, code=200):
+        self._send(code, json.dumps(obj), "application/json")
+
+    def _allowed(self):
+        """(route, query) if the client is on the local network and the token is right, else None."""
+        try:
+            a = ipaddress.ip_address(self.client_address[0].split("%")[0])
+            if not (a.is_private or a.is_loopback):
+                self._send(403, "Only the local network can use this.")
+                return None
+        except ValueError:
+            self._send(403, "")
+            return None
+        u = urlparse(self.path)
+        m = re.match(r"^/s/([A-Za-z0-9_\-]+)(/.*)?$", u.path)
+        if m:                                           # internet link (secret path)
+            if not hmac.compare_digest(m.group(1), self.server.token):
+                self._send(404, "This link is not valid any more.")
+                return None
+            route = m.group(2) or "/"
+        elif a.is_loopback:                             # the tunnel arrives from this computer: secret path required
+            self._send(404, "This link is not valid.")
+            return None
+        else:                                           # a device on the same Wi-Fi: plain address, no secret
+            route = u.path or "/"
+        self.server.owner.touch()
+        return route, parse_qs(u.query)
+
+    def _body(self, may_be_empty=False):
+        n = int(self.headers.get("Content-Length") or 0)
+        if n > MAX_BODY or (n <= 0 and not may_be_empty):
+            self._json({"ok": False, "error": "File too big or empty"}, 413)
+            return None
+        return self.rfile.read(n)
+
+    # ---- routes
+    def do_GET(self):
+        r = self._allowed()
+        if r is None:
+            return
+        route, _ = r
+        if route == "/":
+            self._send(200, PAGE, "text/html; charset=utf-8")
+        elif route == "/api/ping":
+            self._json({"ok": True})
+        elif route == "/sw.js":                         # keeps the scanner page on the phone: it opens again even without a connection
+            self._send(200, SW_JS, "application/javascript; charset=utf-8")
+        elif route == "/engine.js":                     # the scanner engine (runs in a background worker on the phone)
+            self._send(200, ENGINE_JS, "application/javascript; charset=utf-8")
+        elif route == "/manifest.webmanifest":
+            self._send(200, MANIFEST, "application/manifest+json; charset=utf-8")
+        elif route == "/icon.svg":
+            self._send(200, ICON_SVG, "image/svg+xml")
+        else:
+            self._send(404, "")
+
+    def do_POST(self):
+        r = self._allowed()
+        if r is None:
+            return
+        route, q = r
+        data = self._body(may_be_empty=route in ("/api/detect", "/api/warp"))    # these may refer to a photo already sent (?id=)
+        if data is None:
+            return
+        try:
+            if route == "/api/detect":
+                self._detect(data, q)
+            elif route == "/api/warp":
+                self._warp(data, q)
+            elif route == "/api/upload":
+                self._upload(data, q)
+            else:
+                self._send(404, "")
+        except Exception as ex:
+            self._json({"ok": False, "error": str(ex)[:200]}, 400)
+
+    # ---- fast scan path: the photo is sent ONCE, then every detect / warp / look change only sends a few numbers
+    def _source(self, q, data):
+        """(id, entry) of the photo: from the cache (?id=) or decoded from the body (and cached)."""
+        cache = self.server.owner.cache
+        sid = q.get("id", [""])[0]
+        ent = cache.get(sid) if sid else None
+        if ent is None and data:
+            im = Image.open(io.BytesIO(data))
+            im.load()
+            im = ImageOps.exif_transpose(im).convert("RGB")
+            sid, ent = cache.put(im)
+        return sid, ent
+
+    def _detect(self, data, q):
+        sid, ent = self._source(q, data)
+        if ent is None:
+            self._json({"ok": False, "gone": True, "error": "send the photo again"}, 410)
+            return
+        im = ent.view(int(q.get("sr", ["0"])[0]))
+        quad, found = scanner.detect_document(im)           # the very same finder the PC's Auto crop uses
+        cx = sum(p[0] for p in quad) / 4.0                  # + the same hair-inset as the PC (no sliver of table at the edge)
+        cy = sum(p[1] for p in quad) / 4.0
+        quad = [(cx + (x - cx) * 0.995, cy + (y - cy) * 0.995) for x, y in quad]
+        self._json({"ok": True, "id": sid, "w": im.width, "h": im.height, "found": found,
+                    "quad": [[x, y] for x, y in quad]})
+
+    def _warp(self, data, q):
+        sid, ent = self._source(q, data)
+        if ent is None:
+            self._json({"ok": False, "gone": True, "error": "send the photo again"}, 410)
+            return
+        vals = [float(v) for v in q.get("q", [""])[0].split(",")]
+        if len(vals) != 8:
+            raise ValueError("4 corners needed")
+        look = q.get("look", ["orig"])[0]
+        sr = int(q.get("sr", ["0"])[0]) % 4
+        key = (sr, tuple(round(v, 1) for v in vals))
+        jpg = ent.look_jpeg(key, look, lambda: scanner.straighten(
+            ent.view(sr), [(vals[i], vals[i + 1]) for i in range(0, 8, 2)]), scanner.enhance)
+        self._send(200, jpg, "image/jpeg")
+
+    def _upload(self, data, q):
+        try:
+            im = Image.open(io.BytesIO(data))
+            fmt = im.format
+            im.verify()
+        except Exception:
+            self._json({"ok": False, "error": "Not a picture this program can open"}, 400)
+            return
+        batch = re.sub(r"[^A-Za-z0-9]", "", q.get("batch", ["x"])[0])[:24] or "x"
+        i = max(0, int(q.get("i", ["0"])[0]))
+        n = max(1, min(500, int(q.get("n", ["1"])[0])))
+        kind = q.get("kind", ["file"])[0]
+        name = os.path.basename(q.get("name", ["picture"])[0]) or "picture"
+        stem = re.sub(r"[^\w\-. ]", "_", os.path.splitext(name)[0])[:60] or "picture"
+        ext = EXT.get(fmt, ".jpg")
+        self._json({"ok": True, **self.server.owner.store(batch, i, n, kind, stem, ext, data)})
+
+
+class _Entry:
+    """One photo from the phone, decoded once. The straightened page and every 'look' of it are kept, so turning
+    between Original / Clean / Gray / B&W (or coming back to one) costs nothing the second time."""
+
+    def __init__(self, im):
+        self.im = im
+        self.t = time.time()
+        self.lock = threading.RLock()
+        self._views = {0: im}
+        self._warp_key = None
+        self._warp = None
+        self._looks = {}
+
+    def view(self, turns):
+        turns %= 4
+        with self.lock:
+            v = self._views.get(turns)
+            if v is None:
+                v = self.im.transpose({1: Image.Transpose.ROTATE_270, 2: Image.Transpose.ROTATE_180,
+                                       3: Image.Transpose.ROTATE_90}[turns])        # clockwise quarter turns
+                self._views[turns] = v
+            return v
+
+    def look_jpeg(self, key, look, make_warp, enhance):
+        with self.lock:                                   # one page at a time per photo (the same work is never done twice)
+            self.t = time.time()
+            if self._warp_key != key:
+                self._warp_key, self._warp, self._looks = key, make_warp(), {}
+            jpg = self._looks.get(look)
+            if jpg is None:
+                out = enhance(self._warp, look)
+                buf = io.BytesIO()
+                out.save(buf, "JPEG", quality=92, subsampling=0)
+                jpg = self._looks[look] = buf.getvalue()
+            return jpg
+
+
+class _Cache:
+    MAX = 6                                               # photos kept in memory
+
+    def __init__(self):
+        self._d = {}
+        self._lock = threading.Lock()
+
+    def get(self, sid):
+        with self._lock:
+            e = self._d.get(sid)
+            if e is not None:
+                e.t = time.time()
+            return e
+
+    def put(self, im):
+        sid = secrets.token_hex(6)
+        e = _Entry(im)
+        with self._lock:
+            self._d[sid] = e
+            while len(self._d) > self.MAX:
+                del self._d[min(self._d, key=lambda k: self._d[k].t)]
+        return sid, e
+
+
+class Tunnel:
+    """Optional 'Internet' link: a free Cloudflare quick tunnel (no account). The small helper program 'cloudflared'
+    is downloaded once (about 30 MB, from github.com) next to the program's settings, then started; Cloudflare gives
+    this computer a public https address. Only this program's phone page is reachable, and only with the secret code in the link.
+    Attributes used by the window: url, error, status_text, timed_out(), alive(), stop()."""
+    URL = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
+    BASE = "https://github.com/cloudflare/cloudflared/releases/latest/download/"
+
+    def __init__(self, port):
+        self.port = port
+        self.url = None
+        self.error = None
+        self.status_text = "Starting ..."
+        self.proc = None
+        self.started = time.time()
+        self._stopped = False
+        threading.Thread(target=self._run, daemon=True).start()
+
+    # ---- the helper program
+    @staticmethod
+    def _bin_path():
+        import sys
+        name = "cloudflared.exe" if sys.platform == "win32" else "cloudflared"
+        root = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), ".config")
+        d = os.path.join(root, "ImageFixer")
+        os.makedirs(d, exist_ok=True)
+        return os.path.join(d, name)
+
+    def _source(self):
+        import platform
+        import sys
+        mach = platform.machine().lower()
+        arm = mach in ("arm64", "aarch64")
+        if sys.platform == "win32":
+            return self.BASE + "cloudflared-windows-amd64.exe", False
+        if sys.platform == "darwin":
+            return self.BASE + ("cloudflared-darwin-arm64.tgz" if arm else "cloudflared-darwin-amd64.tgz"), True
+        return self.BASE + ("cloudflared-linux-arm64" if arm else "cloudflared-linux-amd64"), False
+
+    def _ensure(self):
+        path = self._bin_path()
+        if os.path.isfile(path) and os.path.getsize(path) > (1 << 20):
+            return path
+        import urllib.request
+        src, tgz = self._source()
+        self.status_text = "Downloading the connection helper (only the first time) ... 0%"
+        tmp = path + ".part"
+        with urllib.request.urlopen(src, timeout=60) as resp, open(tmp, "wb") as out:
+            total = int(resp.headers.get("Content-Length") or 0)
+            got = 0
+            buf = io.BytesIO() if tgz else None
+            while True:
+                if self._stopped:
+                    raise RuntimeError("stopped")
+                chunk = resp.read(256 * 1024)
+                if not chunk:
+                    break
+                (buf or out).write(chunk)
+                got += len(chunk)
+                if total:
+                    self.status_text = "Downloading the connection helper (only the first time) ... %d%%" % (got * 100 // total)
+            if tgz:
+                import tarfile
+                buf.seek(0)
+                with tarfile.open(fileobj=buf, mode="r:gz") as tf:
+                    for m in tf.getmembers():
+                        if os.path.basename(m.name) == "cloudflared":
+                            out.write(tf.extractfile(m).read())
+                            break
+                    else:
+                        raise RuntimeError("helper not found in the download")
+        os.replace(tmp, path)
+        try:
+            os.chmod(path, 0o755)
+        except Exception:
+            pass
+        return path
+
+    # ---- the tunnel
+    def _run(self):
+        import subprocess
+        import sys
+        try:
+            path = self._ensure()
+        except Exception as ex:
+            if not self._stopped:
+                self.error = "Could not download the connection helper: %s" % str(ex)[:120]
+            return
+        if self._stopped:
+            return
+        self.started = time.time()                        # the 30 s clock starts when the helper starts
+        self.status_text = "Connecting ... (can take up to 30 seconds)"
+        cmd = [path, "tunnel", "--url", "http://127.0.0.1:%d" % self.port, "--no-autoupdate", "--protocol", "http2"]
+        flags = 0x08000000 if sys.platform == "win32" else 0
+        try:
+            self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                         stdin=subprocess.DEVNULL, creationflags=flags)
+        except Exception as ex:
+            self.error = str(ex)[:150]
+            return
+        self._read()
+
+    def _read(self):
+        found = None
+        try:
+            for raw in self.proc.stdout:
+                line = raw.decode("utf-8", "replace")
+                if found is None:
+                    for m in self.URL.findall(line):
+                        if m != "https://api.trycloudflare.com":
+                            found = m
+                            break
+                if found is not None and self.url is None and "Registered tunnel connection" in line:
+                    time.sleep(1.5)                       # let the new address reach the DNS
+                    self.url = found
+        except Exception:
+            pass
+        if self._stopped:
+            return
+        if self.url is None and self.error is None:
+            self.error = "The connection helper stopped. Check the internet connection of this computer."
+        elif self.url is not None:
+            self.url = None
+            self.error = "The internet link was closed."
+
+    def alive(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def timed_out(self):
+        return self.url is None and self.error is None and self.proc is not None and time.time() - self.started > 60
+
+    def stop(self):
+        self._stopped = True
+        try:
+            if self.proc is not None and self.proc.poll() is None:
+                self.proc.kill()
+        except Exception:
+            pass
+        self.proc = None
+
+
+class _Server(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+    request_queue_size = 128                            # many quick connections from the phone browser are not refused
+
+
+class PhoneServer(QObject):
+    received = Signal(list)          # file paths, in the order the phone sent them
+    activity = Signal()
+
+    def __init__(self, inbox, parent=None):
+        super().__init__(parent)
+        self.inbox = inbox
+        os.makedirs(inbox, exist_ok=True)
+        self.token = secrets.token_urlsafe(16)
+        self.port = 0
+        self.httpd = None
+        self.last_seen = 0.0
+        self.total = 0
+        self._batches = {}
+        self._lock = threading.Lock()
+        self.cache = _Cache()
+
+    # ---- control
+    def start(self, preferred_port=0):
+        if self.httpd is not None:
+            return True
+        for port in ([preferred_port] if preferred_port else []) + [0]:
+            try:
+                self.httpd = _Server(("0.0.0.0", port), _Handler)
+                break
+            except OSError:
+                self.httpd = None
+        if self.httpd is None:
+            return False
+        self.httpd.token = self.token
+        self.httpd.owner = self
+        self.port = self.httpd.server_address[1]
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self._start_https()
+        return True
+
+    def _start_https(self):
+        """A second, https door on the next port for the QR code: the phone's browser only opens the camera on a secure page.
+        The plain http door stays (the internet tunnel uses it)."""
+        self.sport, self.https = 0, None
+        ip = local_ip()
+        if ip is None:
+            return
+        try:
+            crt, key = _cert_files([ip, "127.0.0.1"])
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(crt, key)
+            for port in (self.port + 1, 0):
+                try:
+                    h = _Server(("0.0.0.0", port), _Handler)
+                    break
+                except OSError:
+                    h = None
+            if h is None:
+                return
+            h.socket = ctx.wrap_socket(h.socket, server_side=True)
+            h.token, h.owner = self.token, self
+            self.https, self.sport = h, h.server_address[1]
+            threading.Thread(target=h.serve_forever, daemon=True).start()
+        except Exception:
+            self.https, self.sport = None, 0                 # no 'cryptography' / no certificate: the plain http link is used
+
+    def stop(self):
+        if getattr(self, "https", None) is not None:
+            try:
+                self.https.shutdown()
+                self.https.server_close()
+            except Exception:
+                pass
+            self.https = None
+        if self.httpd is not None:
+            try:
+                self.httpd.shutdown()
+                self.httpd.server_close()
+            except Exception:
+                pass
+        self.httpd = None
+
+    def running(self):
+        return self.httpd is not None
+
+    def url(self):
+        ip = local_ip()
+        if ip is None or not self.running():
+            return None
+        if getattr(self, "sport", 0):
+            return "https://%s:%d" % (ip, self.sport)       # secure page: the live camera works
+        return "http://%s:%d" % (ip, self.port)
+
+    def link_for(self, base):
+        """Same secret link behind another address (the internet tunnel)."""
+        return base.rstrip("/") + "/s/%s/" % self.token
+
+    def phone_online(self):
+        return time.time() - self.last_seen < 12.0
+
+    # ---- called from the server threads
+    def touch(self):
+        self.last_seen = time.time()
+        self.activity.emit()
+
+    def store(self, batch, i, n, kind, stem, ext, data):
+        with self._lock:
+            b = self._batches.setdefault(batch, {"n": n, "files": {}, "t": time.time()})
+            b["n"] = n
+            fname = ("Scan_%s_%02d" % (time.strftime("%Y%m%d_%H%M%S"), i + 1)) if kind == "scan" else stem
+            os.makedirs(self.inbox, exist_ok=True)
+            path = b["files"].get(i)                          # the phone sent this one again (bad connection): same file, no copy
+            if path is None:
+                path = os.path.join(self.inbox, fname + ext)
+                n = 2
+                while os.path.exists(path):
+                    path = os.path.join(self.inbox, "%s (%d)%s" % (fname, n, ext))
+                    n += 1
+            with open(path, "wb") as f:
+                f.write(data)
+            b["files"][i] = path
+            done = len(b["files"]) >= b["n"]
+            if done:
+                paths = [b["files"][k] for k in sorted(b["files"])]
+                del self._batches[batch]
+            for k in [k for k, v in self._batches.items() if time.time() - v["t"] > 3600]:
+                del self._batches[k]
+        if done:
+            self.total += len(paths)
+            self.received.emit(paths)
+        return {"stored": len(b["files"]), "done": done}
+
+
+SW_JS = r"""const C='if-shell-v3';
+self.addEventListener('install',e=>{self.skipWaiting();e.waitUntil(caches.open(C).then(c=>c.addAll([self.registration.scope,'manifest.webmanifest','icon.svg','engine.js'])).catch(()=>{}));});
+self.addEventListener('activate',e=>e.waitUntil(caches.keys().then(k=>Promise.all(k.filter(x=>x!==C).map(x=>caches.delete(x)))).then(()=>self.clients.claim())));
+self.addEventListener('fetch',e=>{const r=e.request,u=new URL(r.url);
+ if(r.method!=='GET'||u.origin!==location.origin||u.pathname.indexOf('/api/')>=0)return;
+ const net=Promise.race([fetch(r),new Promise((_,no)=>setTimeout(no,3500))]);          // computer reachable: always the newest page
+ e.respondWith(net.then(x=>{if(x.ok){const y=x.clone();caches.open(C).then(c=>c.put(r,y));}return x;})
+  .catch(()=>caches.match(r,{ignoreSearch:true}).then(m=>m||caches.match(self.registration.scope))));});   // not reachable: the copy kept on the phone
+"""
+
+MANIFEST = json.dumps({"name": "Image Fixer Scanner", "short_name": "Scanner", "start_url": "./", "scope": "./",
+                       "display": "standalone", "background_color": "#0b0e14", "theme_color": "#0b0e14",
+                       "icons": [{"src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any"}]})
+
+ICON_SVG = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">'
+            '<stop offset="0" stop-color="#6366f1"/><stop offset="1" stop-color="#a855f7"/></linearGradient></defs>'
+            '<rect width="512" height="512" rx="112" fill="url(#g)"/><path d="M150 190v-30a20 20 0 0 1 20-20h30M312 140h30a20 20 0 0 1 20 20v30'
+            'M362 322v30a20 20 0 0 1-20 20h-30M200 372h-30a20 20 0 0 1-20-20v-30" fill="none" stroke="#fff" stroke-width="28" stroke-linecap="round"/>'
+            '<rect x="196" y="204" width="120" height="104" rx="10" fill="#fff"/></svg>')
+
+
+ENGINE_JS = r"""// Image Fixer scanner engine: finds the paper, cuts it out, cleans it.
+// Runs in a background Web Worker (the phone screen never freezes); if the browser cannot, the same code runs on the page.
+(function(G){
+const IS_W=typeof document==='undefined';
+const mkC=()=>IS_W?new OffscreenCanvas(1,1):document.createElement('canvas');
+const bw=b=>b.width||b.naturalWidth, bh=b=>b.height||b.naturalHeight;
+// ======================= finding the paper (pure functions on pixel data: used by the live camera AND by the photo)
+function blurF(a,w,h,r){ // box blur, Float32Array
+ const t=new Float32Array(a.length),o=new Float32Array(a.length),k=2*r+1;
+ for(let y=0;y<h;y++){let s=0;const row=y*w;for(let i=-r;i<=r;i++)s+=a[row+Math.min(w-1,Math.max(0,i))];
+  for(let x=0;x<w;x++){t[row+x]=s/k;s+=a[row+Math.min(w-1,x+r+1)]-a[row+Math.max(0,x-r)];}}
+ for(let x=0;x<w;x++){let s=0;for(let i=-r;i<=r;i++)s+=t[Math.min(h-1,Math.max(0,i))*w+x];
+  for(let y=0;y<h;y++){o[y*w+x]=s/k;s+=t[Math.min(h-1,y+r+1)*w+x]-t[Math.max(0,y-r)*w+x];}}
+ return o;}
+function otsu(v){const n=v.length,hist=new Float64Array(256);for(let i=0;i<n;i++)hist[v[i]]++;let sum=0;for(let i=0;i<256;i++)sum+=i*hist[i];
+ let wB=0,sB=0,best=-1,th=127;for(let t=0;t<256;t++){wB+=hist[t];if(!wB)continue;const wF=n-wB;if(!wF)break;sB+=t*hist[t];
+  const mB=sB/wB,mF=(sum-sB)/wF,q=wB*wF*(mB-mF)*(mB-mF);if(q>best){best=q;th=t;}}return th;}
+function bigBlob(mask,w,h){ // biggest 4-connected blob -> {lab:Uint8Array, n}
+ const seen=new Uint8Array(w*h),st=new Int32Array(w*h);let bestStart=-1,bestN=0;
+ for(let s=0;s<w*h;s++){if(!mask[s]||seen[s])continue;let sp=0,n=0;st[sp++]=s;seen[s]=1;
+  while(sp){const p=st[--sp];n++;const x=p%w,y=(p-x)/w;
+   if(x>0&&mask[p-1]&&!seen[p-1]){seen[p-1]=1;st[sp++]=p-1;}if(x<w-1&&mask[p+1]&&!seen[p+1]){seen[p+1]=1;st[sp++]=p+1;}
+   if(y>0&&mask[p-w]&&!seen[p-w]){seen[p-w]=1;st[sp++]=p-w;}if(y<h-1&&mask[p+w]&&!seen[p+w]){seen[p+w]=1;st[sp++]=p+w;}}
+  if(n>bestN){bestN=n;bestStart=s;}}
+ if(bestStart<0)return null;const lab=new Uint8Array(w*h),st2=[bestStart];lab[bestStart]=1;
+ while(st2.length){const p=st2.pop(),x=p%w,y=(p-x)/w;
+  if(x>0&&mask[p-1]&&!lab[p-1]){lab[p-1]=1;st2.push(p-1);}if(x<w-1&&mask[p+1]&&!lab[p+1]){lab[p+1]=1;st2.push(p+1);}
+  if(y>0&&mask[p-w]&&!lab[p-w]){lab[p-w]=1;st2.push(p-w);}if(y<h-1&&mask[p+w]&&!lab[p+w]){lab[p+w]=1;st2.push(p+w);}}
+ return {lab,n:bestN};}
+function polyArea(q){let a=0;for(let i=0;i<q.length;i++){const p=q[i],r=q[(i+1)%q.length];a+=p.x*r.y-r.x*p.y;}return Math.abs(a)/2;}
+function hullOf(pts){ // convex hull (monotone chain)
+ pts=pts.slice().sort((a,b)=>a.x-b.x||a.y-b.y);const cr=(o,a,b)=>(a.x-o.x)*(b.y-o.y)-(a.y-o.y)*(b.x-o.x);
+ const lo=[];for(const p of pts){while(lo.length>=2&&cr(lo[lo.length-2],lo[lo.length-1],p)<=0)lo.pop();lo.push(p);}
+ const up=[];for(let i=pts.length-1;i>=0;i--){const p=pts[i];while(up.length>=2&&cr(up[up.length-2],up[up.length-1],p)<=0)up.pop();up.push(p);}
+ lo.pop();up.pop();return lo.concat(up);}
+function fillHoles(lab,w,h){ // holes inside a blob (a dark face / printed picture inside a paper) are not "outside" the paper -> {lab,n}
+ const N=w*h,out=new Uint8Array(N),st=new Int32Array(N);let sp=0;
+ const seed=p=>{if(!lab[p]&&!out[p]){out[p]=1;st[sp++]=p;}};
+ for(let x=0;x<w;x++){seed(x);seed((h-1)*w+x);}for(let y=0;y<h;y++){seed(y*w);seed(y*w+w-1);}
+ while(sp){const p=st[--sp],x=p%w,y=(p-x)/w;if(x>0)seed(p-1);if(x<w-1)seed(p+1);if(y>0)seed(p-w);if(y<h-1)seed(p+w);}
+ const f=new Uint8Array(N);let n=0;for(let i=0;i<N;i++)if(!out[i]){f[i]=1;n++;}return {lab:f,n};}
+function noiseMask(d,w,h){ // mask for SMALL things (a passport photo, a card): the table colour = median of the border strip, the threshold comes from the table's own texture noise
+ const N=w*h,m=Math.max(2,Math.round(Math.min(w,h)*0.04));if(m*2>=Math.min(w,h))return null;
+ const cnt=N-(w-2*m)*(h-2*m);if(cnt<16)return null;
+ const rr=new Float32Array(cnt),gg=new Float32Array(cnt),bb=new Float32Array(cnt);let k=0;
+ for(let y=0;y<h;y++)for(let x=0;x<w;x++){if(x<m||y<m||x>=w-m||y>=h-m){const i=4*(y*w+x);rr[k]=d[i];gg[k]=d[i+1];bb[k]=d[i+2];k++;}}
+ rr.sort();gg.sort();bb.sort();const cr=rr[cnt>>1],cg=gg[cnt>>1],cb=bb[cnt>>1],d0=new Float32Array(N);
+ for(let i=0;i<N;i++){const a=d[4*i]-cr,b=d[4*i+1]-cg,c=d[4*i+2]-cb;d0[i]=Math.sqrt(a*a+b*b+c*c);}
+ const dd=blurF(blurF(d0,w,h,1),w,h,1),bv=new Float32Array(cnt);k=0;
+ for(let y=0;y<h;y++)for(let x=0;x<w;x++){if(x<m||y<m||x>=w-m||y>=h-m)bv[k++]=dd[y*w+x];}
+ bv.sort();const p98=bv[Math.min(cnt-1,Math.floor(cnt*0.98))],thr=Math.max(14,1.6*p98),o=new Uint8Array(N);
+ for(let i=0;i<N;i++)o[i]=dd[i]>thr?1:0;return o;}
+function lineX(p0,p1,p2,p3){ // intersection of line p0p1 with line p2p3 -> {x,y,t,s} (t along p0p1, s along p2p3) or null
+ const d1x=p1.x-p0.x,d1y=p1.y-p0.y,d2x=p3.x-p2.x,d2y=p3.y-p2.y,den=d1x*d2y-d1y*d2x;if(Math.abs(den)<1e-9)return null;
+ const t=((p2.x-p0.x)*d2y-(p2.y-p0.y)*d2x)/den,s=((p2.x-p0.x)*d1y-(p2.y-p0.y)*d1x)/den;return {x:p0.x+t*d1x,y:p0.y+t*d1y,t,s};}
+function quadFromHull(h){ // smallest enclosing 4-gon: drop the hull edge whose removal adds the least area (neighbours are extended)
+ let P=h.slice();
+ while(P.length>4){const n=P.length;let bi=-1,ba=1e30,bx=null;
+  for(let i=0;i<n;i++){const p0=P[(i-1+n)%n],p1=P[i],p2=P[(i+1)%n],p3=P[(i+2)%n],X=lineX(p0,p1,p3,p2);
+   if(!X||X.t<=1||X.s<=1)continue;const a=Math.abs((p1.x-X.x)*(p2.y-X.y)-(p1.y-X.y)*(p2.x-X.x))/2;if(a<ba){ba=a;bi=i;bx={x:X.x,y:X.y};}}
+  if(bi<0){let m=1e30,mi=0;for(let i=0;i<n;i++){const a=polyArea([P[(i-1+n)%n],P[i],P[(i+1)%n]]);if(a<m){m=a;mi=i;}}P.splice(mi,1);continue;}
+  const j=(bi+1)%n;P[bi]=bx;P.splice(j,1);}
+ return P;}
+function orderQuad(q){ // -> TL,TR,BR,BL
+ const s=q.map(p=>p.x+p.y),d=q.map(p=>p.x-p.y);let tl=0,br=0,tr=0,bl=0;
+ for(let i=1;i<4;i++){if(s[i]<s[tl])tl=i;if(s[i]>s[br])br=i;if(d[i]>d[tr])tr=i;if(d[i]<d[bl])bl=i;}
+ const set=new Set([tl,br,tr,bl]);if(set.size<4){const c={x:q.reduce((a,p)=>a+p.x,0)/4,y:q.reduce((a,p)=>a+p.y,0)/4};
+  const o=q.slice().sort((a,b)=>Math.atan2(a.y-c.y,a.x-c.x)-Math.atan2(b.y-c.y,b.x-c.x));let k=0;for(let i=1;i<4;i++)if(o[i].x+o[i].y<o[k].x+o[k].y)k=i;return [o[k],o[(k+1)%4],o[(k+2)%4],o[(k+3)%4]];}
+ return [q[tl],q[tr],q[br],q[bl]];}
+
+// coarse finder: several colour / brightness masks on a small picture -> paper-like blobs -> enclosing 4-gons; the best one is the one
+// whose 4 sides all have a real colour step across them (this is what keeps it away from a printed frame, a red box, a hand ...)
+function sideContrast(chb,w,h,q){
+ const smp=(x,y,c)=>{x=x<0?0:x>w-1.001?w-1.001:x;y=y<0?0:y>h-1.001?h-1.001:y;const x0=x|0,y0=y|0,fx=x-x0,fy=y-y0,i=y0*w+x0,a=chb[c];
+  return (a[i]*(1-fx)+a[i+1]*fx)*(1-fy)+(a[i+w]*(1-fx)+a[i+w+1]*fx)*fy;};
+ const cen={x:q.reduce((a,p)=>a+p.x,0)/4,y:q.reduce((a,p)=>a+p.y,0)/4},sides=[],off=Math.max(2.5,0.009*Math.max(w,h));
+ for(let i=0;i<4;i++){const a=q[i],b=q[(i+1)%4],L=Math.hypot(b.x-a.x,b.y-a.y)||1,ux=(b.x-a.x)/L,uy=(b.y-a.y)/L;let nx=uy,ny=-ux;
+  if(nx*((a.x+b.x)/2-cen.x)+ny*((a.y+b.y)/2-cen.y)<0){nx=-nx;ny=-ny;}
+  const K=24,E=[];for(let k=0;k<K;k++){const s=0.1+0.8*(k+0.5)/K,px=a.x+ux*s*L,py=a.y+uy*s*L;let best=0;
+   for(const sh of [-1.5,0,1.5]){let e=0;for(let c=0;c<3;c++){const df=smp(px+nx*(off+sh),py+ny*(off+sh),c)-smp(px-nx*(off-sh),py-ny*(off-sh),c);e+=df*df;}best=Math.max(best,Math.sqrt(e));}E.push(best);}
+  E.sort((x,y)=>x-y);sides.push(E[E.length>>1]);}
+ return 0.5*(sides.reduce((a,v)=>a+v,0)/4)+0.5*Math.min(...sides);}
+function coarseCands(d,w,h){
+ const N=w*h,L=new Float32Array(N);for(let i=0;i<N;i++)L[i]=0.299*d[4*i]+0.587*d[4*i+1]+0.114*d[4*i+2];
+ const Lb=blurF(blurF(L,w,h,2),w,h,2),u1=new Uint8Array(N);for(let i=0;i<N;i++)u1[i]=Lb[i];
+ const chb=[0,1,2].map(c=>{const a=new Float32Array(N);for(let i=0;i<N;i++)a[i]=d[4*i+c];return blurF(a,w,h,1);});
+ const dist=(cr,cg,cb)=>{const D=new Float32Array(N);for(let i=0;i<N;i++)D[i]=Math.hypot(d[4*i]-cr,d[4*i+1]-cg,d[4*i+2]-cb);
+  const Db=blurF(blurF(D,w,h,2),w,h,2),u=new Uint8Array(N);for(let i=0;i<N;i++)u[i]=Math.min(255,Db[i]*1.3);return u;};
+ let br=0,bg=0,bb=0,bn=0;const m=Math.max(2,Math.round(Math.min(w,h)*0.03));
+ for(let y=0;y<h;y++)for(let x=0;x<w;x++){if(x<m||y<m||x>=w-m||y>=h-m){const i=4*(y*w+x);br+=d[i];bg+=d[i+1];bb+=d[i+2];bn++;}}
+ const u2=dist(br/bn,bg/bn,bb/bn);
+ // the paper's own colour = the middle of the picture (median of a small patch, so a few letters do not matter)
+ const px0=Math.round(w*0.42),px1=Math.round(w*0.58),py0=Math.round(h*0.42),py1=Math.round(h*0.58),R=[],G=[],B=[];
+ for(let y=py0;y<py1;y++)for(let x=px0;x<px1;x++){const i=4*(y*w+x);R.push(d[i]);G.push(d[i+1]);B.push(d[i+2]);}
+ const med=a=>{a.sort((x,y)=>x-y);return a[a.length>>1];};
+ const u4=dist(med(R),med(G),med(B));                       // small = like the paper
+ const t1=otsu(u1),t2=otsu(u2),t4=otsu(u4),masks=[],pm=new Uint8Array(N);
+ const mk=f=>{const a=new Uint8Array(N);for(let i=0;i<N;i++)a[i]=f(i)?1:0;return a;};
+ masks.push([mk(i=>u2[i]>t2),3],[mk(i=>u1[i]>t1&&u2[i]>t2*0.7),3],[mk(i=>u1[i]>t1),3],[mk(i=>u4[i]<t4),3],[mk(i=>u4[i]<t4*0.6),3]);
+ const nm=noiseMask(d,w,h);if(nm)masks.push([nm,1]);
+ const cands=[];
+ for(const [mkm,rad] of masks){
+  let a=new Float32Array(N);for(let i=0;i<N;i++)a[i]=mkm[i];
+  a=blurF(a,w,h,rad);const c1=new Uint8Array(N);for(let i=0;i<N;i++)c1[i]=a[i]>0.4?1:0;
+  a=new Float32Array(N);for(let i=0;i<N;i++)a[i]=c1[i];a=blurF(a,w,h,rad);const c2=new Uint8Array(N);for(let i=0;i<N;i++)c2[i]=a[i]>0.6?1:0;
+  const bl0=bigBlob(c2,w,h);if(!bl0)continue;const bl=fillHoles(bl0.lab,w,h),frac=bl.n/N;if(bl.n<30||frac<0.0015||frac>0.985)continue;
+  const pts=[];let cx=0,cy=0;
+  for(let y=0;y<h;y++)for(let x=0;x<w;x++){const p=y*w+x;if(!bl.lab[p])continue;cx+=x;cy+=y;
+   const edge=x===0||y===0||x===w-1||y===h-1||!bl.lab[p-1]||!bl.lab[p+1]||!bl.lab[p-w]||!bl.lab[p+w];if(edge)pts.push({x:x+0.5,y:y+0.5});}
+  if(pts.length<8)continue;const hull=hullOf(pts);if(hull.length<4)continue;const qh=quadFromHull(hull);if(qh.length!==4)continue;const q=orderQuad(qh);
+  const area=Math.max(1,polyArea(q)),fill=bl.n/area;cx/=bl.n;cy/=bl.n;if(fill<0.7||fill>1.25)continue;
+  const centre=1-0.5*Math.hypot(cx-w/2,cy-h/2)/Math.hypot(w/2,h/2),con=sideContrast(chb,w,h,q);
+  cands.push({q,fill,frac,score:con*Math.sqrt(frac)*Math.sqrt(centre)*Math.min(1,fill),con});}
+ return cands;}
+// learned re-ranking of the candidate outlines (trained on the user's own accepted crops, see croplearn.py): a candidate that
+// holds the other good ones (= the whole sheet, not a header / photo / barcode inside it) and does not hug the border with every
+// corner wins over one that only has a slightly stronger edge. Works on a 96 px copy, ~5 ms.
+function quadMask(q,w,h){const m=new Uint8Array(w*h);let x0=w,y0=h,x1=0,y1=0;for(const p of q){x0=Math.min(x0,p.x);x1=Math.max(x1,p.x);y0=Math.min(y0,p.y);y1=Math.max(y1,p.y);}
+ x0=Math.max(0,Math.floor(x0));y0=Math.max(0,Math.floor(y0));x1=Math.min(w-1,Math.ceil(x1));y1=Math.min(h-1,Math.ceil(y1));
+ let sg=0;for(let i=0;i<4;i++){const a=q[i],b=q[(i+1)%4];sg+=a.x*b.y-b.x*a.y;}sg=sg>=0?1:-1;
+ for(let y=y0;y<=y1;y++)for(let x=x0;x<=x1;x++){let ok=true;for(let i=0;i<4&&ok;i++){const a=q[i],b=q[(i+1)%4];if(sg*((b.x-a.x)*(y+0.5-a.y)-(b.y-a.y)*(x+0.5-a.x))<0)ok=false;}if(ok)m[y*w+x]=1;}
+ return m;}
+function rankCands(cands,W,H){ // -> cands sorted best first
+ if(cands.length<2)return cands;
+ const k=96/Math.max(W,H),w=Math.max(8,Math.round(W*k)),h=Math.max(8,Math.round(H*k)),N=w*h,mg=0.02*Math.max(w,h);
+ const qs=cands.map(c=>c.q.map(p=>({x:p.x*k,y:p.y*k}))),ms=qs.map(q=>quadMask(q,w,h)),cnt=ms.map(m=>{let s=0;for(let i=0;i<N;i++)s+=m[i];return Math.max(s,1);});
+ const smax=Math.max(...cands.map(c=>c.score))+1e-9,Wt=[0.3312,0.535,-0.6354],Mu=[0.7589,0.8816,0.5609],Sd=[0.2712,0.232,0.3681];
+ cands.forEach((c,i)=>{let tot=0,n=0;
+  for(let j=0;j<cands.length;j++){if(j===i)continue;const rj=cands[j].score/smax;let ov=0;for(let p=0;p<N;p++)if(ms[i][p]&&ms[j][p])ov++;tot+=rj*ov/cnt[j];n+=rj;}
+  const touch=qs[i].reduce((a,p)=>a+((p.x<mg||p.y<mg||p.x>w-mg||p.y>h-mg)?1:0),0)/4,f=[c.score/smax,tot/Math.max(n,1e-6),touch];
+  c.rank=f.reduce((a,v,t)=>a+Wt[t]*(v-Mu[t])/Sd[t],0);});
+ return cands.slice().sort((a,b)=>b.rank-a.rank);}
+let PRIOR=null;   // live camera: the outline that is locked right now (4 points, 0..1). Set only for one live look.
+function coarseQuad(d,w,h){const c=coarseCands(d,w,h);if(!c.length)return null;
+ if(PRIOR&&PRIOR.length===4){   // tracking: the candidate nearest to the locked page wins, so a header / photo inside the page can not steal the lock
+  let bi=-1,bd=1e9;for(let i=0;i<c.length;i++){let t=0;for(let k=0;k<4;k++)t+=Math.hypot(c[i].q[k].x/w-PRIOR[k].x,c[i].q[k].y/h-PRIOR[k].y);t/=4;if(t<bd){bd=t;bi=i;}}
+  if(bi>=0&&bd<0.09)return c[bi];}
+ try{return rankCands(c,w,h)[0];}catch(e){}c.sort((a,b)=>b.score-a.score);return c[0];}
+
+// straight-edge refinement: every side of the outline is moved onto the real edge in the picture (many samples + a robust line fit),
+// the corners are the meeting points of the 4 fitted lines -> straight sides, exact corners, no wobble.
+function refineQuad(d,w,h,q0,rounds){
+ const N=w*h,ch=[new Float32Array(N),new Float32Array(N),new Float32Array(N)];
+ for(let c=0;c<3;c++){const a=new Float32Array(N);for(let i=0;i<N;i++)a[i]=d[4*i+c];ch[c]=blurF(a,w,h,1);}
+ const smp=(x,y,c)=>{x=x<0?0:x>w-1.001?w-1.001:x;y=y<0?0:y>h-1.001?h-1.001:y;const x0=x|0,y0=y|0,fx=x-x0,fy=y-y0,i=y0*w+x0,a=ch[c];
+  return (a[i]*(1-fx)+a[i+1]*fx)*(1-fy)+(a[i+w]*(1-fx)+a[i+w+1]*fx)*fy;};
+ let q=q0.map(p=>({x:p.x,y:p.y})),band=Math.max(6,0.03*Math.max(w,h)),moved=0;
+ let minSide=1e30;for(let i=0;i<4;i++)minSide=Math.min(minSide,Math.hypot(q0[(i+1)%4].x-q0[i].x,q0[(i+1)%4].y-q0[i].y));
+ band=Math.max(2.5,Math.min(band,0.2*minSide));   // a small object must not search for its edge far away, into the table
+ for(let r=0;r<(rounds||2);r++){
+  const cen={x:q.reduce((a,p)=>a+p.x,0)/4,y:q.reduce((a,p)=>a+p.y,0)/4},lines=[];
+  for(let i=0;i<4;i++){
+   const a=q[i],b=q[(i+1)%4],L=Math.hypot(b.x-a.x,b.y-a.y)||1,ux=(b.x-a.x)/L,uy=(b.y-a.y)/L;let nx=uy,ny=-ux;
+   const mx=(a.x+b.x)/2-cen.x,my=(a.y+b.y)/2-cen.y;if(nx*mx+ny*my<0){nx=-nx;ny=-ny;}
+   const K=Math.max(12,Math.min(90,Math.round(L/5))),P=[],E=[];
+   for(let k=0;k<K;k++){const s=0.06+0.88*(k+0.5)/K,px=a.x+ux*s*L,py=a.y+uy*s*L;
+    const prof=[],ts=[];let mxv=0;
+    for(let t=-band;t<=band;t+=0.5){
+     const xa=px+nx*(t+1.5),ya=py+ny*(t+1.5),xb=px+nx*(t-1.5),yb=py+ny*(t-1.5);
+     let e=0;for(let c=0;c<3;c++){const df=smp(xa,ya,c)-smp(xb,yb,c);e+=df*df;}e=Math.sqrt(e);prof.push(e);ts.push(t);if(e>mxv)mxv=e;}
+    // the OUTERMOST strong edge wins (a printed frame / header line inside the page is not the page edge)
+    let bt=0,bi=-1;for(let j=prof.length-2;j>=1;j--){if(prof[j]>=0.55*mxv&&prof[j]>=prof[j-1]&&prof[j]>=prof[j+1]){bi=j;break;}}
+    if(bi<0){let m0=-1;for(let j=0;j<prof.length;j++)if(prof[j]>m0){m0=prof[j];bi=j;}}bt=ts[bi];
+    P.push({x:px+nx*bt,y:py+ny*bt});E.push(mxv);}
+   const sorted=E.slice().sort((x,y)=>x-y),med=sorted[sorted.length>>1];
+   let use=P.filter((p,k)=>E[k]>=Math.max(5,0.5*med));
+   let ln=null;
+   if(use.length>=Math.max(6,K*0.35)){
+    for(let it=0;it<4;it++){
+     let mx2=0,my2=0;for(const p of use){mx2+=p.x;my2+=p.y;}mx2/=use.length;my2/=use.length;
+     let sxx=0,sxy=0,syy=0;for(const p of use){const dx=p.x-mx2,dy=p.y-my2;sxx+=dx*dx;sxy+=dx*dy;syy+=dy*dy;}
+     const th=0.5*Math.atan2(2*sxy,sxx-syy),dx=Math.cos(th),dy=Math.sin(th);
+     const res=use.map(p=>Math.abs((p.x-mx2)*(-dy)+(p.y-my2)*dx)),rs=res.slice().sort((x,y)=>x-y),mr=rs[rs.length>>1];
+     ln={x:mx2,y:my2,dx,dy,n:use.length,res:mr};
+     const lim=Math.max(1.0,2.5*mr),keep=use.filter((p,k)=>res[k]<=lim);if(keep.length<Math.max(6,K*0.3)||keep.length===use.length)break;use=keep;}
+    if(ln.n<Math.max(6,K*0.3))ln=null;}
+   lines.push(ln||{x:a.x,y:a.y,dx:ux,dy:uy,n:0,res:0,weak:true});}
+  const nq=[];let ok=true;
+  for(let i=0;i<4;i++){const l1=lines[(i+3)%4],l2=lines[i],X=lineX({x:l1.x,y:l1.y},{x:l1.x+l1.dx,y:l1.y+l1.dy},{x:l2.x,y:l2.y},{x:l2.x+l2.dx,y:l2.y+l2.dy});
+   if(!X||Math.hypot(X.x-q[i].x,X.y-q[i].y)>band*2.2+0.02*Math.max(w,h)){ok=false;break;}nq.push({x:X.x,y:X.y});}
+  if(!ok||polyArea(nq)<0.6*polyArea(q))break;q=nq;moved++;band=Math.max(2.5,band*0.4);}
+ return {quad:q,moved};}
+
+// d = RGBA of the picture (any size). Returns {quad:[TL,TR,BR,BL] in this picture's pixels, found}
+function findPaper(d,W,H,small,smW,smH,opt){ // small = the same picture scaled down for the coarse step (RGBA, smW x smH)
+ const best=coarseQuad(small,smW,smH),k=W/smW;
+ if(!best){const mm=0.04;return {quad:[[mm,mm],[1-mm,mm],[1-mm,1-mm],[mm,1-mm]].map(p=>({x:p[0]*W,y:p[1]*H})),found:false};}
+ let q=best.q.map(p=>({x:p.x*k,y:p.y*k}));
+ let found=best.fill>0.82&&(best.frac>0.15||best.con>25);
+ if(!(opt&&opt.noRefine)){try{const r=refineQuad(d,W,H,q,(opt&&opt.rounds)||3);if(r.moved)q=r.quad;}catch(e){}}
+ q=orderQuad(q).map(p=>({x:Math.max(0,Math.min(W,p.x)),y:Math.max(0,Math.min(H,p.y))}));
+ return {quad:q,found};}
+
+function detectLocal(src,live){ // -> {quad:[TL,TR,BR,BL] in src pixels, found}. live = quick version for the camera view
+ const W=bw(src),H=bh(src),mk=(side)=>{const s=Math.min(1,side/Math.max(W,H)),w=Math.max(8,Math.round(W*s)),h=Math.max(8,Math.round(H*s)),c=mkC();
+  c.width=w;c.height=h;const g=c.getContext('2d',{willReadFrequently:true});g.imageSmoothingQuality='high';g.drawImage(src,0,0,w,h);return {w,h,d:g.getImageData(0,0,w,h).data,s};};
+ const sm=mk(live?320:560);
+ if(live){const r=findPaper(sm.d,sm.w,sm.h,sm.d,sm.w,sm.h,{rounds:2});const k=1/sm.s;return {quad:r.quad.map(p=>({x:p.x*k,y:p.y*k})),found:r.found};}
+ const fn=mk(1000),r=findPaper(fn.d,fn.w,fn.h,sm.d,sm.w,sm.h,{rounds:3}),k=1/fn.s;
+ let pts=r.quad.map(p=>({x:Math.max(0,Math.min(W,p.x*k)),y:Math.max(0,Math.min(H,p.y*k))}));
+ const cx=pts.reduce((a,p)=>a+p.x,0)/4,cy=pts.reduce((a,p)=>a+p.y,0)/4;
+ pts=pts.map(p=>({x:cx+(p.x-cx)*0.995,y:cy+(p.y-cy)*0.995}));      // a hair inside the page edge: no sliver of table in the crop
+ return {quad:pts,found:r.found&&polyArea(pts)>=0.0015*W*H};}
+
+// the real proportions of the sheet from its 4 photographed corners (same maths as the computer's straighten): a tilted A4 stays A4
+function sheetRatio(q,W,H){const u0=W/2,v0=H/2,[tl,tr,br,bl]=q,dist=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y);
+ const simple=(dist(tl,tr)+dist(bl,br))/Math.max(1e-6,dist(tl,bl)+dist(tr,br));
+ try{const m1=[tl.x,tl.y,1],m2=[tr.x,tr.y,1],m3=[bl.x,bl.y,1],m4=[br.x,br.y,1];
+  const cr=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]],dt=(a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+  const k2=dt(cr(m1,m4),m3)/dt(cr(m2,m4),m3),k3=dt(cr(m1,m4),m2)/dt(cr(m3,m4),m2);
+  const n2=m2.map((v,i)=>k2*v-m1[i]),n3=m3.map((v,i)=>k3*v-m1[i]),den=n2[2]*n3[2];if(Math.abs(den)<1e-9)return simple;
+  const f2=-((n2[0]*n3[0]-(n2[0]*n3[2]+n2[2]*n3[0])*u0+n2[2]*n3[2]*u0*u0)+(n2[1]*n3[1]-(n2[1]*n3[2]+n2[2]*n3[1])*v0+n2[2]*n3[2]*v0*v0))/den;
+  if(!isFinite(f2)||f2<=0)return simple;const f=Math.sqrt(f2);
+  // M = Ai^T Ai with A=[[f,0,u0],[0,f,v0],[0,0,1]]  ->  Ai=[[1/f,0,-u0/f],[0,1/f,-v0/f],[0,0,1]]
+  const Ai=[[1/f,0,-u0/f],[0,1/f,-v0/f],[0,0,1]],ap=v=>[Ai[0][0]*v[0]+Ai[0][1]*v[1]+Ai[0][2]*v[2],Ai[1][0]*v[0]+Ai[1][1]*v[1]+Ai[1][2]*v[2],v[2]];
+  const a2=ap(n2),a3=ap(n3),r=Math.sqrt(Math.max(1e-12,dt(a2,a2))/Math.max(1e-12,dt(a3,a3)));
+  if(!isFinite(r)||r<0.2||r>5||Math.abs(Math.log(r/simple))>0.45)return simple;return r;}catch(e){return simple;}}
+
+function warpLocal(src,quad,maxSide){ // cut the quad out of src and remove the camera angle -> canvas
+ const [p0,p1,p2,p3]=quad,dist=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y);
+ const w0=Math.max(dist(p0,p1),dist(p3,p2)),h0=Math.max(dist(p0,p3),dist(p1,p2)),ratio=sheetRatio(quad,bw(src),bh(src));let w,h;
+ if(w0/Math.max(h0,1e-6)>ratio){h=h0;w=h0*ratio;if(w<w0){w=w0;h=w0/ratio;}}else{w=w0;h=w0/ratio;if(h<h0){h=h0;w=h0*ratio;}}
+ const k=Math.min(1,maxSide/Math.max(w,h));
+ w=Math.max(8,Math.round(w*k));h=Math.max(8,Math.round(h*k));
+ const sw=bw(src),sh=bh(src),sc=mkC();sc.width=sw;sc.height=sh;const sg=sc.getContext('2d',{willReadFrequently:true});sg.drawImage(src,0,0);
+ const S=sg.getImageData(0,0,sw,sh).data,out=mkC();out.width=w;out.height=h;const og=out.getContext('2d'),O=og.createImageData(w,h),D=O.data;
+ const sx=p0.x-p1.x+p2.x-p3.x,sy=p0.y-p1.y+p2.y-p3.y;let a,b,c,d,e,f,gg=0,hh=0;
+ if(Math.abs(sx)<1e-9&&Math.abs(sy)<1e-9){a=p1.x-p0.x;b=p3.x-p0.x;c=p0.x;d=p1.y-p0.y;e=p3.y-p0.y;f=p0.y;}
+ else{const dx1=p1.x-p2.x,dx2=p3.x-p2.x,dy1=p1.y-p2.y,dy2=p3.y-p2.y,det=dx1*dy2-dx2*dy1;
+  gg=(sx*dy2-dx2*sy)/det;hh=(dx1*sy-sx*dy1)/det;a=p1.x-p0.x+gg*p1.x;b=p3.x-p0.x+hh*p3.x;c=p0.x;d=p1.y-p0.y+gg*p1.y;e=p3.y-p0.y+hh*p3.y;f=p0.y;}
+ const mx=sw-1.001,my=sh-1.001;let o=0;
+ for(let y=0;y<h;y++){const v=(y+0.5)/h;for(let x=0;x<w;x++){const u=(x+0.5)/w,z=gg*u+hh*v+1;
+  let X=(a*u+b*v+c)/z,Y=(d*u+e*v+f)/z;X=X<0?0:X>mx?mx:X;Y=Y<0?0:Y>my?my:Y;
+  const x0=X|0,y0=Y|0,fx=X-x0,fy=Y-y0,i=4*(y0*sw+x0),j=i+4*sw,w00=(1-fx)*(1-fy),w10=fx*(1-fy),w01=(1-fx)*fy,w11=fx*fy;
+  D[o]=S[i]*w00+S[i+4]*w10+S[j]*w01+S[j+4]*w11;D[o+1]=S[i+1]*w00+S[i+5]*w10+S[j+1]*w01+S[j+5]*w11;D[o+2]=S[i+2]*w00+S[i+6]*w10+S[j+2]*w01+S[j+6]*w11;D[o+3]=255;o+=4;}}
+ og.putImageData(O,0,0);return out;}
+
+function lookLocal(src,look){ // 'clean' = white paper + even light (colour kept), 'gray', 'bw'
+ if(look==='orig')return src;const w=src.width,h=src.height,g=src.getContext('2d'),I=g.getImageData(0,0,w,h),D=I.data;
+ const f=8,sw=Math.max(4,Math.ceil(w/f)),sh=Math.max(4,Math.ceil(h/f)),sm=mkC();sm.width=sw;sm.height=sh;
+ const sg=sm.getContext('2d',{willReadFrequently:true});sg.imageSmoothingQuality='high';sg.drawImage(src,0,0,sw,sh);const sd=sg.getImageData(0,0,sw,sh).data;
+ let L=new Float32Array(sw*sh);for(let i=0;i<sw*sh;i++)L[i]=0.299*sd[4*i]+0.587*sd[4*i+1]+0.114*sd[4*i+2];
+ const R=Math.max(2,Math.round(Math.min(sw,sh)*0.035)),M=new Float32Array(sw*sh);          // paper brightness = the brightest nearby (text is darker)
+ const T=new Float32Array(sw*sh);for(let y=0;y<sh;y++)for(let x=0;x<sw;x++){let m=0;for(let i=Math.max(0,x-R);i<=Math.min(sw-1,x+R);i++){const v=L[y*sw+i];if(v>m)m=v;}T[y*sw+x]=m;}
+ for(let y=0;y<sh;y++)for(let x=0;x<sw;x++){let m=0;for(let i=Math.max(0,y-R);i<=Math.min(sh-1,y+R);i++){const v=T[i*sw+x];if(v>m)m=v;}M[y*sw+x]=m;}
+ const B=blurF(blurF(M,sw,sh,R),sw,sh,R);
+ for(let y=0;y<h;y++){const fy=Math.min(sh-1.001,Math.max(0,y/f-0.5)),y0=fy|0,ty=fy-y0;
+  for(let x=0;x<w;x++){const fx=Math.min(sw-1.001,Math.max(0,x/f-0.5)),x0=fx|0,tx=fx-x0,i0=y0*sw+x0;
+   const bg=(B[i0]*(1-tx)+B[i0+1]*tx)*(1-ty)+(B[i0+sw]*(1-tx)+B[i0+sw+1]*tx)*ty,k=255/Math.max(bg,70),o=4*(y*w+x);
+   let r=D[o]*k,gn=D[o+1]*k,b=D[o+2]*k;
+   if(look==='bw'){const l=0.299*r+0.587*gn+0.114*b;let t=(l-150)/45;t=t<0?0:t>1?1:t;t=t*t*(3-2*t)*255;r=gn=b=t;}
+   else{r=(r-22)*1.12;gn=(gn-22)*1.12;b=(b-22)*1.12;if(look==='gray'){const l=0.299*r+0.587*gn+0.114*b;r=gn=b=l;}}
+   D[o]=r;D[o+1]=gn;D[o+2]=b;}}
+ const out=mkC();out.width=w;out.height=h;out.getContext('2d').putImageData(I,0,0);return out;}
+
+
+let WARP=null;
+const toBm=c=>IS_W?createImageBitmap(c):Promise.resolve(c);
+const LOOKS=['orig','clean','gray','bw'];
+const IFE={
+ async live(m){let r;PRIOR=m.prior||null;try{r=detectLocal(m.bmp,true);}finally{PRIOR=null;}if(IS_W&&m.bmp.close)m.bmp.close();return {quad:r.quad,found:r.found};},
+ async find(m){const r=detectLocal(m.bmp);if(IS_W&&m.bmp.close)m.bmp.close();return {quad:r.quad,found:r.found};},
+ async cut(m){ // cut the page out of the photo, keep it here, give back the chosen look + 4 small previews
+  WARP=null;const w=warpLocal(m.bmp,m.quad,m.maxSide);WARP=w;const prevs={};
+  try{const sm=warpLocal(m.bmp,m.quad,170);for(const l of LOOKS)prevs[l]=await toBm(lookLocal(sm,l));}catch(e){}
+  if(IS_W&&m.bmp.close)m.bmp.close();
+  return {res:await toBm(lookLocal(w,m.look)),prevs,w:w.width,h:w.height};},
+ async look(m){if(!WARP)throw new Error('no page');return {res:await toBm(lookLocal(WARP,m.look))};}
+};
+if(IS_W){let ok2d=null;
+ self.onmessage=async e=>{const m=e.data;
+  try{if(ok2d===null)ok2d=!!(new OffscreenCanvas(1,1).getContext('2d'));
+   if(!ok2d){self.postMessage({id:m.id,err:'NOSUP',nosup:true});return;}
+   const r=await IFE[m.op](m),x=[];if(r.res&&r.res.close)x.push(r.res);if(r.prevs)for(const k in r.prevs)if(r.prevs[k]&&r.prevs[k].close)x.push(r.prevs[k]);
+   r.id=m.id;self.postMessage(r,x);}
+  catch(err){self.postMessage({id:m.id,err:String(err&&err.message||err)});}};}
+else G.IFE=IFE;
+})(self);
+"""
+
+PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="theme-color" content="#0b0e14">
+<title>Image Fixer</title>
+<style>
+:root{--bg:#0b0e14;--card:#151a24;--card2:#1c2230;--line:#273046;--txt:#eef0f4;--mut:#8b93a7;--acc:#6366f1;--acc2:#a855f7;--ok:#30a46c;--bad:#e5484d;--r:18px}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent;-webkit-touch-callout:none}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--txt);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;overscroll-behavior:none}
+body{display:flex;flex-direction:column;height:100vh;height:100dvh;overflow:hidden;touch-action:manipulation;user-select:none;-webkit-user-select:none}
+button{font:inherit;color:inherit;border:0;background:none;padding:0;cursor:pointer;touch-action:manipulation}
+header{flex:none;display:flex;align-items:center;gap:12px;padding:calc(10px + env(safe-area-inset-top)) 16px 10px;background:var(--bg);border-bottom:1px solid #161b27}
+.logo{width:34px;height:34px;border-radius:11px;background:linear-gradient(135deg,var(--acc),var(--acc2));display:grid;place-items:center;font-weight:800;font-size:14px}
+header .t{flex:1;min-width:0}header b{font-size:16px;display:block;line-height:1.15}header small{color:var(--mut);font-size:12px}
+#dot{width:10px;height:10px;border-radius:50%;background:var(--bad);box-shadow:0 0 0 4px #e5484d22;transition:background .2s}#dot.on{background:var(--ok);box-shadow:0 0 0 4px #30a46c22}
+#bar{position:fixed;left:0;right:0;top:0;height:3px;z-index:50;opacity:0;transition:opacity .15s}
+#bar.on{opacity:1}#bar i{display:block;height:100%;width:40%;background:linear-gradient(90deg,var(--acc),var(--acc2));border-radius:0 3px 3px 0;animation:slide 1s ease-in-out infinite}
+@keyframes slide{0%{transform:translateX(-100%)}100%{transform:translateX(260%)}}
+/* screens: only one is shown, switching is instant (no layout work) */
+.scr{flex:1;min-height:0;display:none;flex-direction:column}.scr.on{display:flex;animation:in .14s ease-out}
+@keyframes in{from{opacity:.0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.body{flex:1;min-height:0;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:14px 16px;display:flex;flex-direction:column;gap:12px;max-width:760px;width:100%;margin:0 auto}
+.dock{flex:none;padding:10px 16px calc(10px + env(safe-area-inset-bottom));background:linear-gradient(0deg,var(--bg) 70%,#0b0e1400);display:flex;flex-direction:column;gap:10px;max-width:760px;width:100%;margin:0 auto}
+.btn{display:flex;align-items:center;justify-content:center;gap:8px;border:1px solid var(--line);border-radius:15px;padding:0 16px;background:var(--card2);font-size:16px;font-weight:550;min-height:52px;transition:transform .06s,opacity .1s}
+.btn:active{transform:scale(.97);opacity:.85}
+.btn.pri{background:linear-gradient(90deg,var(--acc),var(--acc2));border:0;color:#fff;font-weight:700;min-height:56px;font-size:17px}
+.btn.red{background:#33191f;border-color:#59262f;color:#ffb4bd}
+.btn:disabled{opacity:.45;pointer-events:none}
+.row{display:flex;gap:10px}.row>.btn{flex:1;min-width:0}
+.hero{display:flex;align-items:center;gap:16px;padding:22px 20px;border-radius:24px;background:linear-gradient(125deg,var(--acc),var(--acc2));text-align:left;width:100%;box-shadow:0 10px 30px -12px #6366f1aa}
+.hero:active{transform:scale(.98)}
+.hero .ic{flex:none;width:60px;height:60px;border-radius:18px;background:#ffffff2e;display:grid;place-items:center}
+.hero b{display:block;font-size:21px}.hero small{display:block;margin-top:3px;opacity:.9;font-size:14px;line-height:1.3}
+.tiles{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.tile{display:flex;flex-direction:column;gap:10px;align-items:flex-start;text-align:left;padding:16px;border-radius:var(--r);background:var(--card);border:1px solid var(--line);min-height:112px}
+.tile:active{transform:scale(.97)}
+.tile .ic{width:42px;height:42px;border-radius:13px;background:var(--card2);display:grid;place-items:center}
+.tile b{font-size:16px}.tile small{color:var(--mut);font-size:12.5px;line-height:1.3;display:block;margin-top:2px}
+svg{width:26px;height:26px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;pointer-events:none}
+.btn svg{width:20px;height:20px}
+.sent{display:flex;flex-direction:column;gap:8px}.sent div{display:flex;gap:10px;align-items:center;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:11px 14px;font-size:14px;color:var(--mut)}.sent b{color:var(--ok)}
+.hint{color:var(--mut);font-size:13.5px;line-height:1.35;text-align:center;padding:0 4px}
+.chips{display:flex;gap:8px;overflow-x:auto;scrollbar-width:none;padding:2px 0}.chips::-webkit-scrollbar{display:none}
+.chip{flex:none;display:flex;align-items:center;gap:6px;border:1px solid var(--line);background:var(--card);border-radius:999px;padding:0 16px;font-size:14.5px;min-height:44px;white-space:nowrap;transition:background .1s}
+.chip:active{transform:scale(.96)}
+.chip.on{background:var(--acc);border-color:var(--acc);color:#fff}
+.chip svg{width:18px;height:18px}
+/* corner editor / review: the picture takes all the free space */
+.stage{flex:1;min-height:0;position:relative;display:grid;place-items:center;padding:4px 12px;max-width:760px;width:100%;margin:0 auto}
+.stage canvas{max-width:100%;max-height:100%;touch-action:none;border-radius:12px;background:#000;display:block}
+.stage .wait{position:absolute;inset:4px 12px;border-radius:12px;display:none;place-items:center;background:#0b0e1488;font-weight:600}
+.stage .wait.on{display:grid}
+.spin{width:30px;height:30px;border-radius:50%;border:3px solid #ffffff33;border-top-color:#fff;animation:sp .7s linear infinite;margin:0 auto 8px}
+@keyframes sp{to{transform:rotate(360deg)}}
+.pad{padding:8px 16px 0;max-width:760px;width:100%;margin:0 auto}
+.seg{display:grid;grid-template-columns:repeat(4,1fr);gap:4px;padding:4px;background:var(--card);border:1px solid var(--line);border-radius:15px}
+.seg button{min-height:42px;border-radius:11px;font-size:14px;color:var(--mut);font-weight:550}
+.seg button.on{background:var(--acc);color:#fff}
+.lks{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
+.lks button{display:flex;flex-direction:column;align-items:center;gap:5px;padding:5px 5px 6px;border-radius:13px;background:var(--card);border:2px solid var(--line);font-size:12.5px;color:var(--mut);font-weight:600}
+.lks button canvas{width:100%;height:64px;object-fit:contain;border-radius:7px;background:#000;display:block}
+.lks button.on{border-color:var(--acc);color:#fff;background:#1d2140}
+.pages{display:flex;flex-direction:column;gap:10px}
+.pg{display:flex;gap:12px;align-items:center;background:var(--card);border:1px solid var(--line);border-radius:18px;padding:10px}
+.pg .th{position:relative;flex:none}
+.pg img{width:66px;height:88px;object-fit:cover;border-radius:10px;background:#000;display:block}
+.pg .th i{position:absolute;left:-6px;top:-6px;min-width:22px;height:22px;border-radius:11px;background:var(--acc);font-style:normal;font-size:12px;font-weight:700;display:grid;place-items:center}
+.pg .n{flex:1;min-width:0;font-weight:600}.pg .n small{display:block;color:var(--mut);font-weight:400;font-size:13px}
+.pg .ab{display:grid;grid-template-columns:repeat(2,44px);gap:6px}
+.pg .ab button{width:44px;height:40px;border-radius:12px;background:var(--card2);border:1px solid var(--line);display:grid;place-items:center}
+.pg .ab button:active{transform:scale(.92)}
+.pg .ab button.red{background:#33191f;border-color:#59262f;color:#ffb4bd}
+.pg .ab svg{width:18px;height:18px}
+.sw{display:flex;align-items:center;justify-content:space-between;gap:10px;color:var(--mut);font-size:14px;padding:4px 2px}
+.tg{position:relative;width:46px;height:28px;border-radius:14px;background:#2a3144;flex:none;transition:background .15s}
+.tg::after{content:"";position:absolute;left:3px;top:3px;width:22px;height:22px;border-radius:50%;background:#fff;transition:transform .15s}
+.tg.on{background:var(--ok)}.tg.on::after{transform:translateX(18px)}
+#viewer{position:fixed;inset:0;background:#000f;display:none;align-items:center;justify-content:center;padding:12px;z-index:40}
+#viewer.on{display:flex}#viewer img{max-width:100%;max-height:100%;border-radius:8px}
+#toast{position:fixed;left:16px;right:16px;bottom:calc(86px + env(safe-area-inset-bottom));z-index:45;background:#232a3b;border:1px solid var(--line);padding:12px 14px;border-radius:14px;font-size:14px;text-align:center;display:none;box-shadow:0 8px 30px #0008}
+#toast.on{display:block}#toast.err{background:#3a1b22;border-color:#5a2630;color:#ffb4bd}
+#banner{position:fixed;left:12px;right:12px;top:calc(62px + env(safe-area-inset-top));z-index:44;background:#3a1b22;border:1px solid #5a2630;color:#ffb4bd;padding:10px 14px;border-radius:14px;font-size:13.5px;text-align:center;display:none}
+#banner.on{display:block}
+/* ---- camera (DocScanner look): the whole camera picture is shown, glass buttons float on top */
+#cam.on{position:fixed;inset:0;z-index:30;background:#000;display:block;animation:none}
+#camV{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000}
+#camO{position:absolute;inset:0;width:100%;height:100%;touch-action:none}
+.cTop{position:absolute;left:0;right:0;top:0;display:flex;align-items:center;gap:10px;padding:calc(12px + env(safe-area-inset-top)) 12px 0;pointer-events:none}
+.cTop>*{pointer-events:auto}.cTop .gap{flex:1;pointer-events:none}
+.cBot{position:absolute;left:0;right:0;bottom:0;display:flex;align-items:center;padding:0 20px calc(22px + env(safe-area-inset-bottom));pointer-events:none}
+.cBot>*{pointer-events:auto}.cBot .side{flex:1;display:flex}.cBot .side.r{justify-content:flex-end}
+.gb{position:relative;flex:none;width:44px;height:44px;border-radius:50%;display:grid;place-items:center;background:rgba(0,0,0,.4);border:1.5px solid transparent;color:#fff;font-weight:700;font-size:20px;transition:transform .08s,background .15s,color .15s,border-color .15s}
+.gb:active{transform:scale(.9)}.gb svg{width:22px;height:22px}
+.gb.on{background:rgba(251,191,36,.25);border-color:#fbbf24;color:#fbbf24}
+#camTorch .sl{stroke:#fff}#camTorch.on .sl{display:none}
+.thumb{position:relative;flex:none;width:48px;height:48px;border-radius:50%;overflow:hidden;display:grid;place-items:center;background:rgba(0,0,0,.4);border:2px solid #fff;color:#fff}
+.thumb svg{width:22px;height:22px}.thumb img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:none}.thumb.has img{display:block}.thumb.has svg{display:none}
+.fin{background:var(--acc);color:#fff;font-weight:700;font-size:15.5px;padding:0 20px;min-height:48px;border-radius:26px}
+#camShot{flex:none;width:78px;height:78px;border-radius:50%;border:4px solid #fff;padding:7px;display:grid;place-items:center;background:transparent;transition:border-color .25s}
+#camShot::after{content:"";width:100%;height:100%;border-radius:50%;background:#fff}
+#camShot.ready{border-color:#3ddc84}
+#camMsg{position:absolute;left:50%;transform:translateX(-50%);top:calc(70px + env(safe-area-inset-top));width:max-content;max-width:calc(100% - 36px);padding:8px 16px;border-radius:18px;text-align:center;pointer-events:none;background:rgba(0,0,0,.6);transition:background .3s}
+#camMsg b{display:block;font-size:14px;line-height:1.3}#camMsg small{display:block;font-size:12px;color:rgba(255,255,255,.8);margin-top:1px;line-height:1.3}#camMsg small:empty{display:none}
+#camMsg.k2{background:rgba(20,83,45,.87)}#camMsg.k0{background:rgba(120,53,15,.87)}
+#camRet{position:absolute;left:50%;transform:translateX(-50%);top:calc(130px + env(safe-area-inset-top));padding:6px 14px;border-radius:16px;background:rgba(79,70,229,.87);font-size:13px;font-weight:700;pointer-events:none;white-space:nowrap}
+#tips{position:absolute;inset:0;z-index:5;background:rgba(0,0,0,.55);display:none;align-items:center;justify-content:center;padding:24px}
+#tips.on{display:flex}
+#tips .card{width:100%;max-width:420px;background:#151a24;border-radius:28px;padding:20px}
+#tips h3{margin:0 0 12px;font-size:20px}
+#tips .ti{display:flex;gap:10px;align-items:flex-start;font-size:14px;line-height:1.4;margin-top:10px}
+#tips .ti i{flex:none;width:22px;height:22px;border-radius:50%;background:#26295a;color:#c7d2fe;font-style:normal;font-size:12px;font-weight:700;display:grid;place-items:center}
+#tips .btn{margin-top:16px;width:100%;min-height:48px;background:var(--acc);border:0;color:#fff;font-weight:700}
+.incam header,.incam #banner,.inedit header,.inedit #banner{display:none!important}
+.incam #toast,.inedit #toast{bottom:auto;top:calc(120px + env(safe-area-inset-top))}
+/* ---- crop screen (DocScanner look) */
+#edit{background:#0b0d12}
+.eTop{flex:none;display:flex;align-items:center;gap:2px;padding:calc(6px + env(safe-area-inset-top)) 8px 4px}
+.eTop .tb{min-height:44px;padding:0 10px;border-radius:12px;font-size:14.5px;font-weight:600;white-space:nowrap}
+.eTop .disc{color:#fca5a5}.eTop .rtk{color:#c7d2fe}
+.eTop b{flex:1;min-width:0;text-align:center;font-size:17px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.eTop .ib{flex:none;width:40px;height:44px;display:grid;place-items:center;color:#fff}.eTop .ib svg{width:21px;height:21px}
+.ban{flex:none;margin:0 12px;min-height:58px;border-radius:14px;padding:10px 14px;display:flex;align-items:center;font-size:13px;line-height:1.35;color:#fff;background:#1f2937;opacity:0;transition:background .45s,opacity .32s}
+.ban.ok{background:#064e3b;opacity:1}.ban.warn{background:#78350f;opacity:1}
+#edit .stage{padding:0}
+.pop{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%) scale(.9);opacity:0;pointer-events:none;transition:opacity .2s,transform .2s;background:rgba(17,24,39,.9);border-radius:22px;padding:16px 22px;box-shadow:0 8px 28px rgba(0,0,0,.5);text-align:center;z-index:3;white-space:nowrap}
+.pop.on{opacity:1;transform:translate(-50%,-50%) scale(1)}
+.pop .tk b{display:block;color:#5eead4;font-size:16px}.pop .tk small{display:block;color:rgba(255,255,255,.8);font-size:13px;margin-top:3px}
+.pop .sr{display:flex;align-items:center;justify-content:center;gap:12px;font-size:16px;font-weight:500}.pop .tk+.sr{margin-top:12px}
+.sdoc{position:relative;flex:none;width:20px;height:28px;border-radius:6px;background:#374151;overflow:hidden}
+.sdoc::before{content:"";position:absolute;left:18%;right:18%;top:22%;height:2px;border-radius:2px;background:rgba(128,136,152,.45);box-shadow:0 5px 0 rgba(128,136,152,.45),0 10px 0 rgba(128,136,152,.45)}
+.sdoc::after{content:"";position:absolute;left:0;right:0;top:6%;height:2px;background:#14b8a6;box-shadow:0 -8px 8px rgba(20,184,166,.45);animation:sdoc 2s ease-in-out infinite}
+@keyframes sdoc{0%,100%{top:6%}50%{top:92%}}
+.eBar{flex:none;display:flex;gap:10px;align-items:center;padding:12px 12px calc(12px + env(safe-area-inset-bottom))}
+.eBar .ol{min-height:50px;padding:0 18px;border-radius:25px;border:1px solid #6b7280;color:#fff;font-weight:500;font-size:14.5px;white-space:nowrap}
+.eBar .pr{flex:1;min-height:50px;border-radius:25px;background:var(--acc);color:#fff;font-weight:700;font-size:16px}
+.eBar button:disabled{opacity:.4;pointer-events:none}
+/* ---- home */
+.hh{padding:6px 2px 2px}.hh h1{margin:0 0 4px;font-size:30px;letter-spacing:-.6px;line-height:1.1}.hh p{margin:0;color:var(--mut);font-size:14.5px;line-height:1.45}
+.hero{position:relative;overflow:hidden;border-radius:26px;padding:22px 20px}
+.hero::after{content:"";position:absolute;right:-30px;top:-40px;width:150px;height:150px;border-radius:50%;background:radial-gradient(circle,#ffffff33,#ffffff00 70%);pointer-events:none}
+.hero .go{flex:none;width:36px;height:36px;border-radius:50%;background:#ffffff2e;display:grid;place-items:center;margin-left:auto}.hero .go svg{width:20px;height:20px}
+.waitc{display:flex;align-items:center;gap:14px;width:100%;padding:14px 16px;border-radius:20px;background:#13261d;border:1px solid #1f4630;text-align:left}
+.waitc:active{transform:scale(.98)}.waitc b{display:block;font-size:15.5px}.waitc small{color:#8fcfae;font-size:12.5px}
+.waitc .wi{flex:none;width:40px;height:40px;border-radius:13px;background:var(--ok);display:grid;place-items:center;font-weight:800;font-size:17px}
+.waitc>svg{margin-left:auto;width:20px;height:20px;color:#8fcfae}
+.conn{display:flex;align-items:center;gap:10px;font-size:13px;color:var(--mut);padding:2px 6px}
+.conn .cd{width:8px;height:8px;border-radius:50%;background:var(--bad);flex:none}.conn.on .cd{background:var(--ok)}
+.note{font-size:12.5px;line-height:1.45;color:#c9b27a;background:#221d10;border:1px solid #3a3118;border-radius:14px;padding:10px 12px}.note:empty{display:none}
+.tile{min-height:104px;border-radius:20px}
+.hide{display:none!important}
+</style></head><body>
+<div id="bar"><i></i></div>
+<header><div class="logo">IF</div><div class="t"><b>Image Fixer</b><small id="st">connecting...</small></div><span id="dot"></span></header>
+<div id="banner">Not connected to the computer. You can keep scanning - the pages stay on this phone. Connect to send them.</div>
+
+<section class="scr on" id="home">
+ <div class="body">
+  <div class="hh"><h1>Scan documents</h1><p>Point at a paper, tap, send. It is cut out and cleaned right on your phone.</p></div>
+  <button class="hero" id="bScan"><span class="ic"><svg viewBox="0 0 24 24" style="width:30px;height:30px"><path d="M4 8V6a2 2 0 0 1 2-2h2M16 4h2a2 2 0 0 1 2 2v2M20 16v2a2 2 0 0 1-2 2h-2M8 20H6a2 2 0 0 1-2-2v-2"/><circle cx="12" cy="12" r="3"/></svg></span><span><b>Scan a paper</b><small>Live outline, auto crop, works offline</small></span><span class="go"><svg viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></svg></span></button>
+  <button class="waitc hide" id="waitCard"><span class="wi" id="waitN">0</span><span><b id="waitT">Pages ready to send</b><small>Tap to review and send</small></span><svg viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></svg></button>
+  <div class="tiles">
+   <button class="tile" id="bGal"><span class="ic"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><circle cx="9" cy="10" r="1.6"/><path d="m21 16-5-5-8 8"/></svg></span><span><b>Scan a photo</b><small>Pick a saved photo and cut the page out.</small></span></button>
+   <button class="tile" id="bChoose"><span class="ic"><svg viewBox="0 0 24 24"><path d="M12 16V4M7 9l5-5 5 5M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg></span><span><b>Send pictures</b><small>Send photos as they are.</small></span></button>
+  </div>
+  <div class="conn" id="conn"><span class="cd"></span><span id="connT">Connecting to your computer ...</span></div>
+  <div class="note" id="liveHint"></div>
+  <div class="sent" id="sent"></div>
+ </div>
+</section>
+
+<section class="scr" id="edit">
+ <div class="eTop"><button class="tb disc" id="eDiscard">Discard</button><b>Crop the page</b><button class="tb rtk hide" id="eRetake">Retake</button><button class="ib" id="eRotL" aria-label="Turn left"><svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8M3 3v5h5"/></svg></button><button class="ib" id="eRotR" aria-label="Turn right"><svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-3-6.7L21 8M21 3v5h-5"/></svg></button></div>
+ <div class="ban" id="eBan"><span id="eBanT"></span></div>
+ <div class="stage"><canvas id="cv"></canvas>
+  <div class="pop" id="ePop"><div class="tk" id="ePopTk"><b>&#10003;&nbsp; Photo taken</b><small>You can move the phone away</small></div><div class="sr" id="ePopSr"><span class="sdoc"></span><span>Auto cropping&hellip;</span></div></div></div>
+ <div class="eBar"><button class="ol" id="eAuto">Auto</button><button class="ol" id="eFull">Whole photo</button><button class="pr" id="eOk">Crop</button></div>
+</section>
+
+<section class="scr" id="cam">
+ <video id="camV" playsinline muted autoplay></video><canvas id="camO"></canvas>
+ <div class="cTop">
+  <button class="gb" id="camBack" aria-label="Back"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button><span class="gap"></span>
+  <button class="gb" id="camTipB" aria-label="Tips">?</button>
+  <button class="gb" id="camAuto" aria-label="Auto capture"><svg viewBox="0 0 24 24"><circle cx="12" cy="13.5" r="7.5"/><path d="M12 9.5v4l2.5 2M9.5 2.5h5"/></svg></button>
+  <button class="gb" id="camNative" aria-label="Use the phone's own camera app"><svg viewBox="0 0 24 24"><path d="M4 8h3l2-3h6l2 3h3a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1z"/><circle cx="12" cy="13" r="3.5"/></svg></button>
+  <button class="gb" id="camTorch" aria-label="Light"><svg viewBox="0 0 24 24"><path d="M13.5 2 5 13.5h6L10 22l9-12h-6z"/><path class="sl" d="M4 3.6l16 16.8"/></svg></button>
+ </div>
+ <div id="camMsg" class="k1"><b id="camT1">Starting the camera ...</b><small id="camT2"></small></div>
+ <div id="camRet" class="hide"></div>
+ <div class="cBot">
+  <div class="side"><button class="thumb" id="camGal" aria-label="Pick a saved photo"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><circle cx="9" cy="10" r="1.6"/><path d="m21 16-5-5-8 8"/></svg><img id="camThumb" alt=""></button></div>
+  <button id="camShot" aria-label="Take the photo"></button>
+  <div class="side r"><button class="fin hide" id="camDone">Finish (0)</button></div>
+ </div>
+ <div id="tips"><div class="card"><h3>For the best scan</h3><div id="tipsL"></div><button class="btn" id="tipsOk">Got it</button></div></div>
+</section>
+
+<section class="scr" id="review">
+ <div class="stage"><canvas id="rcv"></canvas><div class="wait" id="rWait"><div><div class="spin"></div>Working</div></div></div>
+ <div class="pad"><div class="lks" id="looks"><button data-l="orig"><canvas width="1" height="1"></canvas><span>Original</span></button><button data-l="clean" class="on"><canvas width="1" height="1"></canvas><span>Clean</span></button><button data-l="gray"><canvas width="1" height="1"></canvas><span>Gray</span></button><button data-l="bw"><canvas width="1" height="1"></canvas><span>B&amp;W</span></button></div></div>
+ <div class="dock"><div class="row"><button class="btn" id="rRotL"><svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8M3 3v5h5"/></svg>Turn</button><button class="btn" id="rRotR">Turn<svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-3-6.7L21 8M21 3v5h-5"/></svg></button><button class="btn" id="rAdj">Corners</button></div><button class="btn pri" id="rUse">Use this page</button></div>
+</section>
+
+<section class="scr" id="list">
+ <div class="body">
+  <div class="row" style="align-items:center"><b id="lt" style="flex:1;font-size:20px"></b><button class="btn" id="lHome" style="flex:none;min-height:42px;padding:0 16px;font-size:14.5px">Home</button></div>
+  <div class="pages" id="pages"></div>
+  <button class="btn" id="lAdd" style="border-style:dashed;min-height:60px"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>Add another page</button>
+  <div class="sw" id="autoRow"><span>Open the camera again after each page</span><span class="tg" id="auto"></span></div>
+ </div>
+ <div class="dock"><button class="btn pri" id="lSend">Send to computer</button></div>
+</section>
+
+<div id="toast"></div>
+<input type="file" id="fFiles" accept="image/*" multiple class="hide">
+<input type="file" id="fCam" accept="image/*" capture="environment" class="hide">
+<input type="file" id="fGal" accept="image/*" class="hide">
+<div id="viewer"><img id="vimg"></div>
+<script>
+const $=id=>document.getElementById(id), base=location.pathname.replace(/\/$/,'');
+const TUN=/^\/s\//.test(location.pathname), MAXSIDE=TUN?2000:2400, OUTSIDE=TUN?1800:2200, JQ=0.88;   // the page that is sent is a bit smaller over the internet link
+let pages=[], retake=-1, cur=null, busy=false, sentLog=[], tt=0, seq=0, lastOk=Date.now(), active=0;
+const DPR=()=>Math.min(window.devicePixelRatio||1,2.5);
+const LOOKNAME={orig:'Original',clean:'Clean',gray:'Gray',bw:'Black & white'};
+const api=async(p,opt,tries)=>{active++;prog(true);try{for(let k=0;;k++){try{const r=await fetch(base+p,opt);lastOk=Date.now();return r;}
+  catch(e){if(k>=(tries==null?2:tries))throw e;await new Promise(r=>setTimeout(r,500*(k+1)));}}}   // a dropped connection is tried again
+ finally{active--;prog(active>0);}};
+function show(id){if(id!=='cam')stopCam();document.body.classList.toggle('incam',id==='cam');document.body.classList.toggle('inedit',id==='edit');if(id==='home')homeInfo();for(const s of ['home','edit','review','list','cam'])$(s).classList.toggle('on',s===id);}
+function toast(t,err,ms){clearTimeout(tt);const e=$('toast');if(!t){e.classList.remove('on');return;}e.textContent=t;e.className='on'+(err?' err':'');tt=setTimeout(()=>e.classList.remove('on'),ms||(err?5000:2200));}
+function prog(on){$('bar').classList.toggle('on',!!on);}
+function buzz(){try{navigator.vibrate&&navigator.vibrate(15);}catch(e){}}
+const raf=()=>new Promise(r=>requestAnimationFrame(()=>r()));
+// ---- connection light (pings only when nothing else talked to the computer lately)
+let fails=0;
+function setConn(on){$('conn').classList.toggle('on',on);$('connT').textContent=on?'Connected to your computer':'Offline - scanning still works, pages wait on this phone';}
+function homeInfo(){const n=pages.length,c=$('waitCard');c.classList.toggle('hide',!n);if(n){$('waitN').textContent=n;$('waitT').textContent=n+' page'+(n==1?'':'s')+' ready to send';}}
+$('waitCard').onclick=()=>{if(pages.length)renderList();};
+async function ping(){if(document.hidden||active||Date.now()-lastOk<4000)return;
+ try{const r=await fetch(base+'/api/ping');if(!r.ok)throw 0;lastOk=Date.now();fails=0;$('dot').className='on';$('st').textContent='connected to your computer';setConn(true);$('banner').classList.remove('on');}
+ catch(e){if(++fails>=3){$('dot').className='';$('st').textContent='offline - scanning still works';setConn(false);$('banner').classList.add('on');}}}
+setInterval(ping,4000);ping();
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)ping();});
+function ok(){fails=0;$('dot').className='on';$('st').textContent='connected to your computer';setConn(true);$('banner').classList.remove('on');}
+
+// ---- images: decode once, rotate on the GPU canvas (no JPEG encode / decode, no computer needed)
+function loadImg(src){return new Promise((res,no)=>{const i=new Image();i.onload=()=>res(i);i.onerror=no;i.src=src;});}
+const toBlob=(c,q)=>new Promise(r=>{if(c.toBlob){c.toBlob(r,'image/jpeg',q||0.92);return;}   // an ImageBitmap (from the worker) goes through a canvas
+ const k=document.createElement('canvas');k.width=bw(c);k.height=bh(c);k.getContext('2d').drawImage(c,0,0);k.toBlob(r,'image/jpeg',q||0.92);});
+async function decode(blobOrFile){
+ try{return await createImageBitmap(blobOrFile,{imageOrientation:'from-image'});}catch(e){}
+ const u=URL.createObjectURL(blobOrFile);try{return await loadImg(u);}finally{setTimeout(()=>URL.revokeObjectURL(u),3000);}}
+const bw=b=>b.width||b.naturalWidth, bh=b=>b.height||b.naturalHeight;
+async function shrink(file,maxSide){ // photo -> {blob (upright JPEG), bmp}
+ const im=await decode(file),w=bw(im),h=bh(im),s=Math.min(1,maxSide/Math.max(w,h));
+ const c=document.createElement('canvas');c.width=Math.round(w*s);c.height=Math.round(h*s);
+ const g=c.getContext('2d');g.imageSmoothingQuality='high';g.drawImage(im,0,0,c.width,c.height);if(im.close)im.close();
+ return {bmp:c};}      // the JPEG for the computer is made while the photo is already on screen
+function turned(src,t){ // clockwise quarter turns of a bitmap/canvas, returns a canvas
+ t=((t%4)+4)%4;const w=bw(src),h=bh(src),c=document.createElement('canvas');c.width=t%2?h:w;c.height=t%2?w:h;
+ const g=c.getContext('2d');g.translate(c.width/2,c.height/2);g.rotate(t*Math.PI/2);g.drawImage(src,-w/2,-h/2);return c;}
+function rotQuad(q,w,h,cw){return q.map(p=>cw?{x:h-p.y,y:p.x}:{x:p.y,y:w-p.x});}
+function thumb(src,side){const w=bw(src),h=bh(src),s=side/Math.max(w,h),c=document.createElement('canvas');c.width=Math.max(1,Math.round(w*s));c.height=Math.max(1,Math.round(h*s));
+ c.getContext('2d').drawImage(src,0,0,c.width,c.height);return c.toDataURL('image/jpeg',0.7);}
+function fit(el,w,h,box){ // size a canvas to the free space of its stage, keeping the shape
+ const r=box.getBoundingClientRect(),aw=r.width-24,ah=r.height-8,k=Math.min(aw/w,ah/h),d=DPR();
+ const cw=Math.max(40,Math.floor(w*k)),ch=Math.max(40,Math.floor(h*k));el.style.width=cw+'px';el.style.height=ch+'px';
+ el.width=Math.round(cw*d);el.height=Math.round(ch*d);}
+
+// ---------- send pictures as they are
+$('bChoose').onclick=()=>{$('fFiles').value='';$('fFiles').click();};
+$('fFiles').onchange=async e=>{
+ const fs=[...e.target.files];if(!fs.length)return;
+ const batch=Date.now().toString(36)+Math.random().toString(36).slice(2,6);let n=0;
+ for(let i=0;i<fs.length;i++){toast('Sending '+(i+1)+' of '+fs.length+' ...',false,60000);
+  try{const r=await api('/api/upload?kind=file&batch='+batch+'&i='+i+'&n='+fs.length+'&name='+encodeURIComponent(fs[i].name),{method:'POST',body:fs[i]});
+   const j=await r.json();if(j.ok)n++;else toast(fs[i].name+': '+j.error,true);}
+  catch(err){toast('Connection lost. Scan the QR code on the computer again.',true);return;}}
+ buzz();toast('');ok();logSent(n+' picture'+(n==1?'':'s'));};
+function logSent(t){const d=new Date();sentLog.unshift('<b>&#10003;</b> '+t+' sent &middot; '+d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}));
+ sentLog=sentLog.slice(0,4);$('sent').innerHTML=sentLog.map(x=>'<div>'+x+'</div>').join('');}
+
+// ---------- scan
+function nativeCam(){$('fCam').value='';$('fCam').click();}
+function openCam(){if(LIVE())openLive();else nativeCam();}
+$('bScan').onclick=()=>{retake=-1;openCam();};
+$('bGal').onclick=()=>{retake=-1;$('fGal').value='';$('fGal').click();};
+$('fCam').onchange=e=>gotPhoto(e.target.files[0]);$('fGal').onchange=e=>gotPhoto(e.target.files[0]);
+// ---------- crop screen (DocScanner look). The page is searched on the phone (the same finder as the live outline, DocScanner's PageFinder).
+let searching=false,holdCard=false,holdT0=0,glide=null,foundT0=-1e9,eAnim=0,dragA=-1;
+const TEAL='#5EEAD4',INDIGO='#4F46E5',ease=t=>t<.5?4*t*t*t:1-Math.pow(-2*t+2,3)/2;
+const fullQ=(w,h,m)=>[{x:w*m,y:h*m},{x:w*(1-m),y:h*m},{x:w*(1-m),y:h*(1-m)},{x:w*m,y:h*(1-m)}];
+async function gotPhoto(f,opt){if(!f)return;opt=opt||{};
+ toast('Opening the photo ...',false,60000);prog(true);
+ try{const s=await shrink(f,MAXSIDE),o={blob:null,base:s.bmp,sr:0,view:s.bmp,w:bw(s.bmp),h:bh(s.bmp),quad:null,id:null,dp:null,look:'clean',rot:0,res:null,warp:false,sure:null,touched:false,fromShutter:!!opt.shot,back:retake>=0?'list':(opt.shot?'cam':'gal')};
+  if(opt.hint&&opt.asp&&Math.abs(o.w/o.h-opt.asp)/opt.asp<0.03)o.quad=opt.hint.map(p=>({x:p.x*o.w,y:p.y*o.h}));    // the corners start where the live outline saw the page
+  o.blobP=toBlob(s.bmp,JQ);cur=o;toast('');prog(false);
+  holdCard=!!opt.shot;holdT0=performance.now();
+  show('edit');setBanner();popUpdate();await raf();layout();
+  findHere();
+ }catch(err){prog(false);toast('Could not open this photo.',true);}}
+function setBanner(){const b=$('eBan'),s=cur?cur.sure:null;b.className='ban'+(s===true?' ok':s===false?' warn':'');
+ $('eBanT').textContent=s===true?'Page found. Drag a corner or a side if it is not exact.':s===false?'Not sure about the page. Drag the corners onto the page corners.':'';
+ $('eAuto').disabled=$('eOk').disabled=(s==null);$('eRetake').classList.toggle('hide',retake<0);}
+function popUpdate(){const sh=cur&&cur.fromShutter&&holdCard,v=cur&&(cur.fromShutter?holdCard:searching);
+ $('ePop').classList.toggle('on',!!v);$('ePopTk').style.display=sh?'block':'none';$('ePopSr').style.display=searching?'flex':'none';}
+function releaseHold(){if(!holdCard)return;const w=1500-(performance.now()-holdT0),me=cur;
+ const f=()=>{if(cur===me){holdCard=false;popUpdate();}};if(w>0)setTimeout(f,w);else f();}
+function findHere(){const me=cur,sr=me.sr,w=me.w,h=me.h,s=Math.min(1,1000/Math.max(w,h));me.touched=false;me.sure=null;searching=true;
+ if(!me.quad)me.quad=fullQ(w,h,0.01);
+ setBanner();popUpdate();draw();
+ heavy('find',asW=>asPic(smallCanvas(me.view,Math.max(8,Math.round(w*s)),Math.max(8,Math.round(h*s))),asW))
+ .then(r=>{if(cur!==me||me.sr!==sr)return;
+  if(!me.touched){glide={from:me.quad.map(p=>({x:p.x,y:p.y})),to:r.quad.map(p=>({x:p.x/s,y:p.y/s})),t0:performance.now()};}   // the 4 corners glide to the page
+  me.sure=!!r.found;foundT0=performance.now();})
+ .catch(()=>{if(cur===me&&me.sr===sr)me.sure=false;})
+ .then(()=>{if(cur===me){searching=false;if(me.sure==null)me.sure=false;setBanner();popUpdate();releaseHold();draw();}});}
+$('eAuto').onclick=()=>{buzz();findHere();};
+$('eFull').onclick=()=>{cur.touched=true;glide=null;cur.quad=fullQ(cur.w,cur.h,0.01);draw();};
+function turnSrc(cw){cur.touched=true;glide=null;cur.id=null;cur.dp=null;cur.quad=rotQuad(cur.quad,cur.w,cur.h,cw);cur.sr=(cur.sr+(cw?1:3))%4;cur.view=turned(cur.base,cur.sr);cur.w=bw(cur.view);cur.h=bh(cur.view);layout();draw();buzz();}
+$('eRotL').onclick=()=>turnSrc(false);$('eRotR').onclick=()=>turnSrc(true);
+
+const cv=$('cv'),cx=cv.getContext('2d');let drag=null,scale=1;
+function layout(){fit(cv,cur.w,cur.h,cv.parentNode);scale=cv.width/cur.w;}
+function startEdit(){searching=false;holdCard=false;glide=null;if(cur){cur.sure=true;cur.fromShutter=false;}show('edit');layout();setBanner();popUpdate();draw();}
+function mids(q){return q.map((p,i)=>({x:(p.x+q[(i+1)%4].x)/2,y:(p.y+q[(i+1)%4].y)/2}));}
+function draw(){if(!eAnim)eAnim=requestAnimationFrame(animLoop);}
+function animLoop(){eAnim=0;if(!cur||!cur.view||!cur.quad||!$('edit').classList.contains('on'))return;const now=performance.now();let again=false;
+ if(glide){if(cur.touched)glide=null;else{const t=Math.min(1,(now-glide.t0)/700),k=ease(t);cur.quad=glide.from.map((p,i)=>({x:p.x+(glide.to[i].x-p.x)*k,y:p.y+(glide.to[i].y-p.y)*k}));if(t>=1)glide=null;else again=true;}}
+ if(searching||now-foundT0<900)again=true;
+ paint(now);if(again)eAnim=requestAnimationFrame(animLoop);}
+function paint(now){const d=DPR(),W=cv.width,H=cv.height,clk=now/1000,st=2.5*d,fv=Math.max(0,1-(now-foundT0)/900);
+ cx.clearRect(0,0,W,H);cx.drawImage(cur.view,0,0,W,H);
+ const q=cur.quad.map(p=>({x:p.x*scale,y:p.y*scale})),m=mids(q);
+ if(searching){ // a scanning light travels over the picture while the page is searched, 4 brackets breathe
+  const ph=(clk/2.8)%1,scan=0.5-0.5*Math.cos(ph*2*Math.PI),down=ph<0.5,y=H*scan,trail=H*0.3,y0=down?y-trail:y,y1=down?y:y+trail;
+  cx.fillStyle='rgba(0,0,0,.2)';cx.fillRect(0,0,W,H);
+  const g=cx.createLinearGradient(0,y0,0,y1),glow='rgba(94,234,212,.27)',none='rgba(94,234,212,0)';g.addColorStop(0,down?none:glow);g.addColorStop(1,down?glow:none);cx.fillStyle=g;cx.fillRect(0,y0,W,trail);
+  const layer=(h,c,c0)=>{const gg=cx.createLinearGradient(0,0,W,0);gg.addColorStop(0,c0);gg.addColorStop(.1,c);gg.addColorStop(.9,c);gg.addColorStop(1,c0);cx.fillStyle=gg;cx.fillRect(0,y-h/2,W,h);};
+  layer(st*10,'rgba(94,234,212,.16)','rgba(94,234,212,0)');layer(st*4.5,'rgba(94,234,212,.4)','rgba(94,234,212,0)');layer(st*1.4,'#fff','rgba(255,255,255,0)');
+  const br=0.65+0.35*Math.sin(clk*3.7),gap=Math.min(W,H)*0.05*br,bl=Math.min(W,H)*0.11,x0=gap,y00=gap,x1=W-gap,y1b=H-gap;
+  cx.strokeStyle='rgba(255,255,255,.92)';cx.lineWidth=st*2.4;cx.lineCap='round';
+  for(const [px,py,dx,dy] of [[x0,y00,1,1],[x1,y00,-1,1],[x1,y1b,-1,-1],[x0,y1b,1,-1]]){cx.beginPath();cx.moveTo(px+dx*bl,py);cx.lineTo(px,py);cx.lineTo(px,py+dy*bl);cx.stroke();}}
+ const path=()=>{cx.beginPath();q.forEach((p,i)=>i?cx.lineTo(p.x,p.y):cx.moveTo(p.x,p.y));cx.closePath();};
+ if(searching&&!cur.touched){path();cx.setLineDash([9*d,6*d]);cx.lineDashOffset=-((clk*52)%36)*d*.4;cx.lineWidth=st;cx.strokeStyle='rgba(94,234,212,.55)';cx.stroke();cx.setLineDash([]);return;}
+ path();cx.fillStyle='rgba(79,70,229,.2)';cx.fill();
+ if(fv>.01){cx.fillStyle='rgba(94,234,212,'+(0.3*fv)+')';cx.fill();}
+ cx.lineJoin='round';cx.lineWidth=st;cx.strokeStyle=TEAL;cx.stroke();
+ if(fv>.01){path();cx.lineWidth=st*(1+7*fv);cx.strokeStyle='rgba(94,234,212,'+(0.55*fv)+')';cx.stroke();}
+ m.forEach((p,k)=>{const r=(dragA===4+k?1.5:1)*8*d;cx.fillStyle='#fff';cx.fillRect(p.x-r,p.y-r,2*r,2*r);cx.lineWidth=st*.8;cx.strokeStyle=INDIGO;cx.strokeRect(p.x-r,p.y-r,2*r,2*r);});
+ q.forEach((p,i)=>{const r=(dragA===i?1.5:1)*11*d*(1+0.35*fv);cx.beginPath();cx.arc(p.x,p.y,r,0,7);cx.fillStyle='#fff';cx.fill();cx.lineWidth=st;cx.strokeStyle=INDIGO;cx.stroke();});
+ if(dragA>=0)loupe(dragA<4?cur.quad[dragA]:{x:(cur.quad[dragA-4].x+cur.quad[(dragA-3)%4].x)/2,y:(cur.quad[dragA-4].y+cur.quad[(dragA-3)%4].y)/2},d);}
+function loupe(fp,d){ // a round magnifier above the finger: the exact spot under the dragged corner / side, 2.8x
+ const W=cv.width,H=cv.height,r=54*d,pad=r+8*d,ax=fp.x*scale,ay=fp.y*scale,lx=Math.max(pad,Math.min(W-pad,ax));let ly=ay-r-64*d;if(ly<pad)ly=ay+r+64*d;ly=Math.max(pad,Math.min(H-pad,ly));
+ const half=(r/2.8)/scale;
+ cx.save();cx.fillStyle='rgba(0,0,0,.33)';cx.beginPath();cx.arc(lx,ly+3*d,r+5*d,0,7);cx.fill();cx.fillStyle='#111827';cx.beginPath();cx.arc(lx,ly,r,0,7);cx.fill();
+ cx.beginPath();cx.arc(lx,ly,r,0,7);cx.clip();try{cx.drawImage(cur.view,fp.x-half,fp.y-half,2*half,2*half,lx-r,ly-r,2*r,2*r);}catch(e){}cx.restore();
+ const arm=11*d;cx.lineCap='round';cx.strokeStyle='rgba(0,0,0,.67)';cx.lineWidth=3.5*d;cx.beginPath();cx.moveTo(lx-arm,ly);cx.lineTo(lx+arm,ly);cx.moveTo(lx,ly-arm);cx.lineTo(lx,ly+arm);cx.stroke();
+ cx.strokeStyle='#fff';cx.lineWidth=1.6*d;cx.stroke();
+ cx.beginPath();cx.arc(lx,ly,r,0,7);cx.lineWidth=3*d;cx.strokeStyle='#fff';cx.stroke();cx.beginPath();cx.arc(lx,ly,r-3*d,0,7);cx.lineWidth=1.5*d;cx.strokeStyle=TEAL;cx.stroke();}
+function pos(e){const r=cv.getBoundingClientRect(),k=cv.width/r.width;return{x:(e.clientX-r.left)*k,y:(e.clientY-r.top)*k};}
+cv.onpointerdown=e=>{if(!cur||!cur.quad)return;const p=pos(e),d=DPR(),hit=44*d,q=cur.quad.map(a=>({x:a.x*scale,y:a.y*scale})),m=mids(q);let best=-1,bd=1e9;
+ q.forEach((c,i)=>{const t=Math.hypot(c.x-p.x,c.y-p.y);if(t<bd){bd=t;best=i;}});
+ if(bd>hit){best=-1;bd=1e9;m.forEach((c,k)=>{const t=Math.hypot(c.x-p.x,c.y-p.y);if(t<bd){bd=t;best=4+k;}});if(bd>hit)best=-1;}
+ if(best>=0){cur.touched=true;glide=null;dragA=best;drag={i:best,start:cur.quad.map(a=>({x:a.x,y:a.y})),p0:p};cv.setPointerCapture(e.pointerId);buzz();draw();}};
+cv.onpointermove=e=>{if(!drag)return;const p=pos(e),dx=(p.x-drag.p0.x)/scale,dy=(p.y-drag.p0.y)/scale,S=drag.start;
+ const cl=(v,m)=>Math.max(0,Math.min(m,v));
+ if(drag.i<4){cur.quad[drag.i]={x:cl(S[drag.i].x+dx,cur.w),y:cl(S[drag.i].y+dy,cur.h)};}
+ else{const k0=drag.i-4,a=S[k0],b=S[(k0+1)%4],ux=b.x-a.x,uy=b.y-a.y,L=Math.hypot(ux,uy)||1,nx=-uy/L,ny=ux/L,t=dx*nx+dy*ny;
+  [k0,(k0+1)%4].forEach(k=>{cur.quad[k]={x:cl(S[k].x+nx*t,cur.w),y:cl(S[k].y+ny*t,cur.h)};});}
+ draw();};
+cv.onpointerup=cv.onpointercancel=()=>{drag=null;dragA=-1;draw();};
+addEventListener('resize',()=>{if($('edit').classList.contains('on')&&cur&&cur.view){layout();draw();}else if($('review').classList.contains('on')&&cur&&cur.res)paintReview();});
+$('eRetake').onclick=()=>{glide=null;searching=false;openCam();};
+$('eDiscard').onclick=()=>{const me=cur;if(!me)return;glide=null;searching=false;holdCard=false;
+ if(me.res){show('review');paintReview();return;}                      // came here from the review page (Corners): back to it
+ if(retake>=0&&pages[retake]===me){me.base=null;me.view=null;cur=null;retake=-1;renderList();return;}   // a saved page opened from the list: back to the list
+ cur=null;if(me.back==='cam'&&retake<0){openCam();return;}retake=-1;if(pages.length)renderList();else home();};
+
+// ---------- the scanner on the phone itself: finds the paper, cuts it out, cleans it. Nothing but the final picture goes to the computer.
+function polyArea(q){let a=0;for(let i=0;i<q.length;i++){const p=q[i],r=q[(i+1)%q.length];a+=p.x*r.y-r.x*p.y;}return Math.abs(a)/2;}
+// ---------- the heavy work (find the paper, cut out, clean) runs in a background worker: the screen and the camera never freeze.
+// If this browser cannot run the worker, the very same code (engine.js) runs on the page instead.
+let HW=null,HWfail=false,HWseq=0,engP=null;const HWp=new Map();
+const wfail=()=>Object.assign(new Error('worker'),{worker:true});
+function HWdie(){HWfail=true;try{if(HW)HW.terminate();}catch(e){}HW=null;for(const p of HWp.values())p.no(wfail());HWp.clear();}
+function hwStart(){if(HW||HWfail)return HW;
+ try{if(!window.Worker||typeof OffscreenCanvas==='undefined'||!window.createImageBitmap)throw 0;
+  HW=new Worker(base+'/engine.js');
+  HW.onmessage=e=>{const m=e.data,p=HWp.get(m.id);if(!p)return;HWp.delete(m.id);if(m.nosup){HWdie();p.no(wfail());}else if(m.err)p.no(new Error(m.err));else p.ok(m);};
+  HW.onerror=()=>HWdie();}
+ catch(e){HWfail=true;HW=null;}
+ return HW;}
+const mainEng=()=>engP||(engP=new Promise((res,no)=>{const sc=document.createElement('script');sc.src=base+'/engine.js';sc.onload=()=>res();sc.onerror=()=>{engP=null;no(new Error('engine'));};document.head.appendChild(sc);}));
+async function heavy(op,build){ // build(asBitmap) -> {msg, xfer}: a picture for the worker is an ImageBitmap (moved, not copied), on the page it is the canvas
+ const w=hwStart();
+ if(w){try{const b=await build(true);
+   return await new Promise((res,no)=>{const id=++HWseq;HWp.set(id,{ok:res,no});b.msg.id=id;b.msg.op=op;
+    try{w.postMessage(b.msg,b.xfer||[]);}catch(e){HWp.delete(id);no(wfail());}});}
+  catch(e){if(!e||!e.worker)throw e;}}
+ await mainEng();await raf();const b=await build(false);return IFE[op](b.msg);}
+const smallCanvas=(src,w,h)=>{const c=document.createElement('canvas');c.width=w;c.height=h;const g=c.getContext('2d');g.imageSmoothingQuality='high';g.drawImage(src,0,0,w,h);return c;};
+async function asPic(c,asW){const b=asW?await createImageBitmap(c):c;return {msg:{bmp:b},xfer:asW?[b]:[]};}
+setTimeout(hwStart,400);   // started early so the phone keeps engine.js for offline use
+
+// ---------- cut out + review: all on the phone
+const rcv=$('rcv'),rx=rcv.getContext('2d');
+function paintReview(){if(!cur||!cur.res)return;const src=cur.res,t=cur.rot,w=t%2?bh(src):bw(src),h=t%2?bw(src):bh(src);
+ fit(rcv,w,h,rcv.parentNode);rx.imageSmoothingQuality='high';rx.save();rx.translate(rcv.width/2,rcv.height/2);rx.rotate(t*Math.PI/2);
+ const dw=(t%2?rcv.height:rcv.width),dh=(t%2?rcv.width:rcv.height);rx.drawImage(src,-dw/2,-dh/2,dw,dh);rx.restore();}
+function markLook(){for(const b of document.querySelectorAll('#looks button'))b.classList.toggle('on',b.dataset.l===cur.look);}
+function closeRes(o){if(o.res&&o.res.close){try{o.res.close();}catch(e){}}o.res=null;}
+async function setLook(look){
+ cur.look=look;markLook();const my=cur;$('rWait').classList.add('on');
+ try{const r=await heavy('look',async()=>({msg:{look}}));if(cur!==my||my.look!==look)return;closeRes(my);my.res=r.res;paintReview();}
+ catch(e){toast('Could not clean the page.',true);}
+ if(cur===my)$('rWait').classList.remove('on');}
+async function crop(){ // from the corners screen: cut + look + previews happen in the background worker
+ const me=cur;me.rot=0;closeRes(me);me.warp=false;show('review');$('rWait').classList.add('on');
+ try{const r=await heavy('cut',async asW=>{const b=asW?await createImageBitmap(me.view):me.view;return {msg:{bmp:b,quad:me.quad.map(p=>({x:p.x,y:p.y})),maxSide:OUTSIDE,look:me.look},xfer:asW?[b]:[]};});
+  if(cur!==me){if(r.res&&r.res.close)r.res.close();return;}
+  me.res=r.res;me.warp=true;paintReview();fillLooks(r.prevs);}
+ catch(e){toast('Could not cut out the page. Try again.',true);}
+ if(cur===me)$('rWait').classList.remove('on');}
+function fillLooks(prevs){ // the four looks as small previews
+ try{for(const b of document.querySelectorAll('#looks button')){const o=prevs&&prevs[b.dataset.l],c=b.querySelector('canvas');if(!o)continue;
+  c.width=bw(o);c.height=bh(o);c.getContext('2d').drawImage(o,0,0);if(o.close)o.close();}}catch(e){}}
+$('eOk').onclick=()=>{if(cur&&cur.quad)crop();};
+for(const b of document.querySelectorAll('#looks button'))b.onclick=()=>{if(cur.look===b.dataset.l||!cur.warp)return;buzz();setLook(b.dataset.l);};
+$('rRotL').onclick=()=>{cur.rot=(cur.rot+3)%4;paintReview();buzz();};$('rRotR').onclick=()=>{cur.rot=(cur.rot+1)%4;paintReview();buzz();};
+$('rAdj').onclick=()=>{startEdit();};
+const autoOn=()=>{try{return localStorage.getItem('auto')==='1';}catch(e){return false;}};
+$('auto').classList.toggle('on',autoOn());
+$('autoRow').onclick=()=>{const v=!autoOn();try{localStorage.setItem('auto',v?'1':'0');}catch(e){}$('auto').classList.toggle('on',v);};
+$('rUse').onclick=()=>{
+ if(!cur.res)return;buzz();const p=cur,bm=p.res,t=p.rot;
+ p.th=thumb(t?turned(bm,t):bm,200);                                 // small picture for the list: cheap
+ p.final=null;p.saved=false;p.pending=(async()=>{await raf();p.final=await toBlob(t?turned(bm,t):bm,0.92);if(bm.close){try{bm.close();}catch(e){}}persist();})();     // the JPEG is made in the background
+ p.res=null;p.warp=false;p.base=null;p.view=null;                    // free the big pictures; the page keeps only the small ones
+ if(retake>=0)pages[retake]=p;else pages.push(p);
+ const again=retake<0&&autoOn();retake=-1;cur=null;renderList();if(again)openCam();};
+
+
+// ---------- live camera (DocScanner look): the whole camera picture is shown, the page outline glides over it, plain instructions, tap = focus
+const LIVE=()=>!!(window.isSecureContext&&navigator.mediaDevices&&navigator.mediaDevices.getUserMedia);
+let camS=null,camT=null,camIC=null,camTimer=0,camQ=null,camMiss=0,camStable=0,camBusy=false,camTap=null,camTorchOn=false,camSay='',camVib=false,camGrab=null,camGood=false,camLastLight=0,camLightN=0,camRaf=0,camFlashT=-1e9,camShown=new Float32Array(9),camLock=false,camAlt=0,camSeenT=0,camFocQ=null,camFocT=0;
+if(!LIVE())$('liveHint').innerHTML='The live paper outline needs a secure link: use the <b>Internet</b> link of the computer, or on Android Chrome open <b>chrome://flags/#unsafely-treat-insecure-origin-as-secure</b>, add <b>'+location.origin+'</b>, enable it and restart Chrome. Until then the phone\'s own camera app opens.';
+let camLoop=0;
+const TIPS=['Put the paper on a darker flat table so all 4 corners show clearly','Hold the phone straight above the paper, not tilted. Less tilt = sharper text','Use even light, daylight is good. Keep your own and the phone\'s shadow off the paper','On glossy paper, shift the phone a little if glare shows. Shoot without flash; use it only when it is really dark','Tap the paper once to focus, then hold still and press the button. A green ring means it is good','Keep the whole paper in the frame, with a small gap all around'];
+$('tipsL').innerHTML=TIPS.map((t,i)=>'<div class="ti"><i>'+(i+1)+'</i><span>'+t+'</span></div>').join('');
+function tipsShow(on){$('tips').classList.toggle('on',on);if(!on){try{localStorage.setItem('camtips','1');}catch(e){}}}
+$('camTipB').onclick=()=>tipsShow(true);$('tipsOk').onclick=()=>tipsShow(false);
+function stopCam(){clearTimeout(camTimer);camTimer=0;camLoop++;cancelAnimationFrame(camRaf);camRaf=0;if(camS){try{camS.getTracks().forEach(t=>t.stop());}catch(e){}}
+ camS=camT=camIC=null;camQ=null;camStable=0;camBusy=false;camTorchOn=false;camLock=false;camAlt=0;camSeenT=0;camFocQ=null;const v=$('camV');if(v){try{v.srcObject=null;}catch(e){}}}
+async function openLive(){
+ let st;
+ try{st=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:window.ImageCapture?1920:4096},height:{ideal:window.ImageCapture?1080:3072},frameRate:{ideal:24,max:30}},audio:false});}
+ catch(e){toast('The camera is blocked here. Opening the phone\'s camera app.',true);nativeCam();return;}
+ show('cam');camS=st;camT=st.getVideoTracks()[0];camQ=null;camMiss=0;camStable=0;camBusy=false;camTap=null;camTorchOn=false;camVib=false;camGood=false;camLock=false;camAlt=0;camSeenT=0;camFocQ=null;camLastLight=0;camLightN=0;camShown.fill(0);camSay='';
+ const v=$('camV');v.srcObject=st;try{await v.play();}catch(e){}
+ for(let i=0;i<40&&!v.videoWidth;i++)await new Promise(r=>setTimeout(r,50));
+ if(!v.videoWidth||camS!==st){stopCam();toast('Could not start the camera.',true);nativeCam();return;}
+ let caps={};try{caps=camT.getCapabilities?camT.getCapabilities():{};}catch(e){}
+ try{if((caps.focusMode||[]).includes('continuous'))await camT.applyConstraints({advanced:[{focusMode:'continuous'}]});}catch(e){}
+ $('camTorch').style.display=caps.torch?'grid':'none';$('camTorch').classList.remove('on');camBadge();
+ camIC=window.ImageCapture?new ImageCapture(camT):null;
+ camLayout();camSet(1,retake>=0?'Take the new photo of this page':'Keep the paper inside the frame','');
+ const rt=$('camRet');rt.classList.toggle('hide',retake<0);if(retake>=0)rt.textContent='Retaking page '+(retake+1);
+ camRaf=requestAnimationFrame(camFrame);camTick();
+ let seen=false;try{seen=localStorage.getItem('camtips')==='1';}catch(e){}if(!seen)tipsShow(true);}
+function camGeo(){const o=$('camO'),v=$('camV'),W=o.width,H=o.height,vw=v.videoWidth||1,vh=v.videoHeight||1,s=Math.min(W/vw,H/vh);return {W,H,vw,vh,s,dw:vw*s,dh:vh*s,ox:(W-vw*s)/2,oy:(H-vh*s)/2};}   // the camera picture is shown whole, centred (bars above / below)
+const camScr=(g,p)=>({x:g.ox+p.x*g.dw,y:g.oy+p.y*g.dh});
+function camLayout(){const o=$('camO'),r=o.getBoundingClientRect(),d=DPR();o.width=Math.max(80,Math.round(r.width*d));o.height=Math.max(80,Math.round(r.height*d));}
+function camBadge(){const n=pages.length,b=$('camDone'),t=$('camGal');b.classList.toggle('hide',!n);b.textContent='Finish ('+n+')';
+ const im=$('camThumb');if(n&&pages[n-1].th){im.src=pages[n-1].th;t.classList.add('has');}else{im.removeAttribute('src');t.classList.remove('has');}}
+addEventListener('resize',()=>{if(camS)camLayout();});
+function camSet(kind,txt,sub){const m=$('camMsg'),key=kind+'|'+txt+'|'+(sub||'');if(key===camSay)return;camSay=key;m.className='k'+kind;$('camT1').textContent=txt;$('camT2').textContent=sub||'';}
+async function camFocusAt(nx,ny){if(!camT)return;let caps={};try{caps=camT.getCapabilities();}catch(e){}
+ const modes=caps.focusMode||[],mode=modes.includes('continuous')?'continuous':modes.includes('single-shot')?'single-shot':null;
+ try{await camT.applyConstraints({advanced:[mode?{focusMode:mode,pointsOfInterest:[{x:nx,y:ny}]}:{pointsOfInterest:[{x:nx,y:ny}]}]});}catch(e){}}
+function camFocusLock(first){   // once the page is locked, the focus is locked on the middle of the page; it follows only when the page really moves
+ if(!camT||!camQ)return;const cx=camQ.reduce((a,p)=>a+p.x,0)/4,cy=camQ.reduce((a,p)=>a+p.y,0)/4,now=performance.now();
+ if(!first&&camFocQ&&(Math.hypot(cx-camFocQ.x,cy-camFocQ.y)<0.06||now-camFocT<1500))return;
+ camFocQ={x:cx,y:cy};camFocT=now;camFocusAt(cx,cy);
+ if(first){const g=camGeo(),o=$('camO');camTap={x:(g.ox+cx*g.dw)/o.width,y:(g.oy+cy*g.dh)/o.height,t:Date.now()};if(!camVib){camVib=true;buzz();}}}
+$('camO').onpointerdown=e=>{const o=$('camO'),r=o.getBoundingClientRect(),k=o.width/r.width,px=(e.clientX-r.left)*k,py=(e.clientY-r.top)*k,g=camGeo();
+ const vx=Math.min(1,Math.max(0,(px-g.ox)/g.dw)),vy=Math.min(1,Math.max(0,(py-g.oy)/g.dh));
+ camTap={x:px/o.width,y:py/o.height,t:Date.now()};camFocusAt(vx,vy);buzz();};
+$('camTorch').onclick=async()=>{if(!camT)return;camTorchOn=!camTorchOn;try{await camT.applyConstraints({advanced:[{torch:camTorchOn}]});$('camTorch').classList.toggle('on',camTorchOn);}catch(e){camTorchOn=false;}};
+$('camBack').onclick=()=>{retake=-1;pages.length?renderList():home();};
+$('camNative').onclick=()=>{stopCam();nativeCam();};
+$('camGal').onclick=()=>{$('fGal').value='';$('fGal').click();};
+$('camDone').onclick=()=>{if(pages.length){retake=-1;renderList();}};
+async function takeFull(){ // the live picture is only Full HD (light); the saved photo is the camera's real still, capped at ~4096 px
+ let st=null;try{const pc=await camIC.getPhotoCapabilities(),W=pc.imageWidth,H=pc.imageHeight;
+  if(W&&H&&W.max&&H.max){const k=Math.min(1,4096/Math.max(W.max,H.max)),f=(R,v)=>{const step=R.step||1;return Math.max(R.min||0,Math.min(R.max,(R.min||0)+Math.round((v-(R.min||0))/step)*step));};
+   st={imageWidth:f(W,W.max*k),imageHeight:f(H,H.max*k)};}}catch(e){}
+ if(st){try{return await camIC.takePhoto(st);}catch(e){}}
+ return camIC.takePhoto();}
+$('camShot').onclick=async()=>{if(camBusy||!camS)return;camBusy=true;buzz();clearTimeout(camTimer);camFlashT=performance.now();
+ let blob=null;const v=$('camV'),hint=(camQ&&performance.now()-camSeenT<800)?camQ.map(p=>({x:p.x,y:p.y})):null,asp=v.videoWidth/v.videoHeight;
+ if(camIC){try{blob=await Promise.race([takeFull(),new Promise((_,no)=>setTimeout(no,7000))]);}catch(e){blob=null;}}   // the camera's own still photo (sharper, focused), about 12 MP at most: enough for text, light for the phone
+ if(!blob){try{const c=document.createElement('canvas');c.width=v.videoWidth;c.height=v.videoHeight;c.getContext('2d').drawImage(v,0,0);blob=await toBlob(c,0.92);}catch(e){}}
+ if(!blob){camBusy=false;toast('Could not take the photo. Try again.',true);camTick();return;}
+ try{v.pause();}catch(e){}gotPhoto(blob,{shot:true,hint,asp});};
+async function camTick(){clearTimeout(camTimer);if(!camS||camBusy)return;
+ const v=$('camV'),t0=performance.now(),st=camS,my=++camLoop;
+ if(v.videoWidth&&v.readyState>=2&&!document.hidden){
+  try{
+   const m=320,s=Math.min(1,m/Math.max(v.videoWidth,v.videoHeight)),gw=Math.max(8,Math.round(v.videoWidth*s)),gh=Math.max(8,Math.round(v.videoHeight*s));
+   if(!camGrab||camGrab.width!==gw||camGrab.height!==gh){camGrab=document.createElement('canvas');camGrab.width=gw;camGrab.height=gh;}
+   const gx=camGrab.getContext('2d',{willReadFrequently:true});gx.drawImage(v,0,0,gw,gh);
+   const prior=camLock&&camQ?camQ.map(p=>({x:p.x,y:p.y})):null;
+   const r=await heavy('live',async asW=>{const b=await asPic(camGrab,asW);b.msg.prior=prior;return b;});   // the worker looks at the little frame; the page stays smooth. A locked page is searched near where it was.
+   if(camS!==st||my!==camLoop||camBusy)return;
+   const now=performance.now(),qd=(a,b)=>a.reduce((t,p,i)=>t+Math.hypot(p.x-b[i].x,p.y-b[i].y),0)/4;
+   let q=r.found?r.quad.map(p=>({x:p.x/gw,y:p.y/gh})):null,move=1,seen=false;
+   if(q){
+    if(camLock&&camQ){   // LOCKED: a new look must agree with the locked page. Small hand movement = follow it softly, a strange outline = ignored.
+     const dm=qd(q,camQ);
+     if(dm<0.08){seen=true;move=dm;camAlt=0;if(dm>=0.004)camQ=q.map((p,i)=>({x:camQ[i].x+(p.x-camQ[i].x)*0.6,y:camQ[i].y+(p.y-camQ[i].y)*0.6}));}   // under 0.4 % = jitter: the outline stays dead still
+     else if(++camAlt>=6){camLock=false;camVib=false;camAlt=0;camQ=q;seen=true;move=1;}    // 6 looks in a row somewhere else = really another page: let go, take the new one
+    }
+    else{seen=true;if(camQ){move=qd(q,camQ);q=q.map((p,i)=>({x:(p.x+camQ[i].x)/2,y:(p.y+camQ[i].y)/2}));}camQ=q;}
+   }
+   if(seen){camMiss=0;camSeenT=now;
+    camStable=move<0.014?camStable+1:(camLock&&move<0.04?Math.max(0,camStable-1):0);    // a small shake does not throw the steady count away once locked
+    if(!camLock&&camStable>=3){camLock=true;camAlt=0;camFocusLock(true);}               // found + steady for 3 looks = LOCK
+    else if(camLock)camFocusLock(false);
+    camJudge(v,gw,gh,gx);}
+   else if(camLock&&camQ){   // locked but this look found nothing (hand moved / shadow / blur): HOLD the outline, do not give up
+    camMiss++;
+    if(now-camSeenT>4000){camLock=false;camVib=false;camQ=null;camStable=0;camGood=false;camSet(1,'Looking for the paper…','Put it on a darker table and keep all 4 corners in view');}   // lost for 4 s: let go
+    else if(camMiss>2){camGood=false;camStable=0;camSet(1,'Page locked, hold still…','Keep the phone steady, the paper is still tracked');}}
+   else{camStable=0;camGood=false;if(++camMiss>2){camQ=null;camSet(1,'Looking for the paper…','Put it on a darker table and keep all 4 corners in view');}}
+  }catch(e){}}
+ if(camS!==st||my!==camLoop||camBusy)return;
+ camTimer=setTimeout(camTick,Math.max(150,Math.min(600,(performance.now()-t0)*0.8)));}   // the slower the phone, the more it rests between looks
+function camLight(q,gw,gh,gx){ // 0 = fine, 1 = too dark, 2 = shadow across the paper, 3 = glare. Looks at the paper only, a few hundred samples.
+ let D;try{D=gx.getImageData(0,0,gw,gh).data;}catch(e){return 0;}
+ const cl=(v,a,b)=>Math.max(a,Math.min(b,v)),x0=cl(Math.floor(Math.min(...q.map(p=>p.x))*gw),0,gw-1),x1=cl(Math.floor(Math.max(...q.map(p=>p.x))*gw),x0+1,gw),y0=cl(Math.floor(Math.min(...q.map(p=>p.y))*gh),0,gh-1),y1=cl(Math.floor(Math.max(...q.map(p=>p.y))*gh),y0+1,gh);
+ const GX=4,GY=5,cell=[];let glare=0,n=0;
+ for(let cy=0;cy<GY;cy++)for(let cx2=0;cx2<GX;cx2++){const tmp=[];
+  for(let j=0;j<6;j++)for(let i=0;i<6;i++){const px=cl(Math.floor(x0+((cx2+(i+.5)/6)/GX*(x1-x0))),0,gw-1),py=cl(Math.floor(y0+((cy+(j+.5)/6)/GY*(y1-y0))),0,gh-1),o=4*(py*gw+px),l=(D[o]*77+D[o+1]*150+D[o+2]*29)>>8;tmp.push(l);if(l>=251)glare++;n++;}
+  tmp.sort((a,b)=>a-b);cell.push(tmp[27]);}   // the paper brightness of this part (text is darker, so not the average)
+ const mx=Math.max(...cell),mn=Math.min(...cell),med=cell.slice().sort((a,b)=>a-b)[cell.length>>1];
+ return med<95?1:(mx>60&&mn/mx<0.62)?2:(glare/n>0.07)?3:0;}
+function camJudge(v,gw,gh,gx){camGood=false;
+ const q=camQ,W=v.videoWidth,H=v.videoHeight,area=polyArea(q),cx0=q.reduce((a,p)=>a+p.x,0)/4,cy0=q.reduce((a,p)=>a+p.y,0)/4,dx=cx0-0.5,dy=cy0-0.5;
+ const clip=q.some(p=>p.x<0.015||p.x>0.985||p.y<0.015||p.y>0.985);
+ const d=(a,b)=>Math.hypot((a.x-b.x)*W,(a.y-b.y)*H),rt=Math.max(d(q[0],q[1]),d(q[3],q[2]))/Math.max(1,Math.min(d(q[0],q[1]),d(q[3],q[2]))),rl=Math.max(d(q[0],q[3]),d(q[1],q[2]))/Math.max(1,Math.min(d(q[0],q[3]),d(q[1],q[2])));
+ const li=camLight(q,gw,gh,gx);camLightN=(li!==0&&li===camLastLight)?camLightN+1:(li!==0?1:0);camLastLight=li;const lightIssue=camLightN>=3?li:0;   // light is judged on 3 frames in a row, so one flicker does not change the message
+ if(clip)return camSet(0,'Move the phone back a little','All 4 corners of the paper must be inside the frame');
+ if(area<0.3)return camSet(0,'Move closer','The paper looks small in the frame');
+ if(Math.abs(dx)>0.07||Math.abs(dy)>0.07){const h=Math.abs(dx)>=Math.abs(dy)?(dx>0?'right':'left'):(dy>0?'down':'up');return camSet(0,'Move the phone a little '+h,'Keep the whole paper in the middle of the frame');}
+ if(Math.max(rt,rl)>1.28)return camSet(0,'Hold the phone flat, straight above the paper','The page looks tilted. Less tilt = a better scan');
+ if(lightIssue===1)return camSet(0,'Too dark','Move to a brighter place or turn the flash on');
+ if(lightIssue===2)return camSet(0,'Shadow on the paper','Move your hand or the phone\'s shadow away so the light is even');
+ if(lightIssue===3)return camSet(0,'Glare on the paper','Shift the phone or turn the paper a little to avoid the reflection');
+ if(camStable>=4){camGood=true;if(camAutoOn()&&camStable>=8&&!camBusy){setTimeout(()=>{if(camGood&&!camBusy&&camS)$('camShot').onclick();},0);}return camSet(2,'Good, take the photo','Hold still and tap the round button');}
+ camSet(1,camLock?'Page locked, hold still…':'Almost, hold still…',camLock?'The paper is locked and in focus':'The paper is found');}
+function camFrame(){camRaf=0;if(!camS)return;camRaf=requestAnimationFrame(camFrame);
+ const o=$('camO'),g=o.getContext('2d'),W=o.width,H=o.height,d=DPR(),G=camGeo(),now=performance.now();g.clearRect(0,0,W,H);
+ const fl=Math.max(0,1-(now-camFlashT)/420),f=fl*fl*(3-2*fl),good=!!(camQ&&camGood),sh=camShown;     // f = the soft "got it" pulse after the shutter
+ $('camShot').classList.toggle('ready',good);$('camShot').style.transform=f>0.001?'scale('+(1-0.12*f)+')':'';
+ if(camQ){if(sh[8]<0.02){for(let i=0;i<4;i++){sh[2*i]=camQ[i].x;sh[2*i+1]=camQ[i].y;}}else for(let i=0;i<8;i++){const tv=i%2?camQ[i>>1].y:camQ[i>>1].x;sh[i]+=(tv-sh[i])*0.3;}sh[8]+=(1-sh[8])*0.2;}else sh[8]+=(0-sh[8])*0.2;   // the outline glides to the newest look
+ const va=sh[8],mix=(a,b,t)=>Math.round(a+(b-a)*t);
+ if(va<0.98){ // no page seen yet: a dashed guide frame INSIDE the camera picture; on capture it closes in a little and turns teal
+  const mx=G.dw*0.07+f*14*d,my=G.dh*0.07+f*14*d,c=[mix(255,94,f),mix(255,234,f),mix(255,212,f)];
+  g.save();g.globalAlpha=(f>0?1:.8)*(1-va);g.strokeStyle='rgb('+c+')';g.lineWidth=(1.6+2.4*f)*d;g.setLineDash([9*d,7*d]);g.beginPath();g.roundRect?g.roundRect(G.ox+mx,G.oy+my,G.dw-2*mx,G.dh-2*my,10*d):g.rect(G.ox+mx,G.oy+my,G.dw-2*mx,G.dh-2*my);g.stroke();g.restore();}
+ if(va>0.02){const q=[0,1,2,3].map(i=>({x:G.ox+sh[2*i]*G.dw,y:G.oy+sh[2*i+1]*G.dh})),base=good?[61,220,132]:[255,209,102],col='rgb('+[mix(base[0],94,f),mix(base[1],234,f),mix(base[2],212,f)]+')';
+  g.fillStyle='rgba(0,0,0,'+(0.45*va)+')';g.beginPath();g.rect(G.ox,G.oy,G.dw,G.dh);g.moveTo(q[0].x,q[0].y);for(let i=3;i>=0;i--)g.lineTo(q[i].x,q[i].y);g.closePath();g.fill('evenodd');   // what is NOT paper is darkened = what the crop throws away
+  g.beginPath();q.forEach((p,i)=>i?g.lineTo(p.x,p.y):g.moveTo(p.x,p.y));g.closePath();g.fillStyle=col;g.globalAlpha=(good?.14:.08)*va;g.fill();
+  g.globalAlpha=.9*va;g.lineJoin='round';g.lineCap='round';g.strokeStyle=col;g.lineWidth=1.8*d;g.stroke();g.globalAlpha=va;
+  g.lineWidth=3.6*d;for(let i=0;i<4;i++){const p=q[i],a=q[(i+1)%4],b=q[(i+3)%4],la=Math.hypot(a.x-p.x,a.y-p.y)||1,lb=Math.hypot(b.x-p.x,b.y-p.y)||1,L=Math.min(34*d,.22*la,.22*lb);   // a bracket on every corner
+   g.beginPath();g.moveTo(p.x+(a.x-p.x)/la*L,p.y+(a.y-p.y)/la*L);g.lineTo(p.x,p.y);g.lineTo(p.x+(b.x-p.x)/lb*L,p.y+(b.y-p.y)/lb*L);g.stroke();}
+  g.globalAlpha=1;}
+ if(f>0.01){g.fillStyle='rgba(255,255,255,'+(0.16*f)+')';g.fillRect(0,0,W,H);}
+ if(camTap&&Date.now()-camTap.t<1100){const x=camTap.x*W,y=camTap.y*H,r=32*d;g.strokeStyle='#fff';g.lineWidth=2*d;g.beginPath();g.roundRect?g.roundRect(x-r,y-r,2*r,2*r,10*d):g.rect(x-r,y-r,2*r,2*r);g.stroke();}}
+
+const camAutoOn=()=>{try{return localStorage.getItem('autocap')==='1';}catch(e){return false;}};
+function camAutoUi(){$('camAuto').classList.toggle('on',camAutoOn());}
+$('camAuto').onclick=()=>{try{localStorage.setItem('autocap',camAutoOn()?'0':'1');}catch(e){}camAutoUi();toast(camAutoOn()?'Auto capture on: it takes the photo when the page is steady':'Auto capture off',false,1800);};camAutoUi();
+
+// ---------- pages stay on the phone (reload / lost connection safe) and the app shell is cached: only SENDING needs the computer
+const IDBN='if-pages';
+const idbOpen=()=>new Promise((res,no)=>{try{const r=indexedDB.open(IDBN,1);r.onupgradeneeded=()=>r.result.createObjectStore('p');r.onsuccess=()=>res(r.result);r.onerror=()=>no(r.error);}catch(e){no(e);}});
+async function idbTx(fn){const db=await idbOpen();return new Promise((res,no)=>{const t=db.transaction('p','readwrite'),s=t.objectStore('p');let out;try{out=fn(s);}catch(e){no(e);return;}t.oncomplete=()=>{db.close();res(out&&out.result);};t.onerror=()=>no(t.error);});}
+let pchain=Promise.resolve();
+function persist(){pchain=pchain.then(async()=>{try{
+ const keys=await idbTx(s=>s.getAllKeys()),ids=pages.filter(p=>p.final).map(p=>p.pid=p.pid||('p'+Date.now().toString(36)+Math.random().toString(36).slice(2,6)));
+ for(const p of pages){if(!p.final||p.saved)continue;p.blob=p.blob||await p.blobP;
+  await idbTx(s=>s.put({blob:p.blob,final:p.final,th:p.th,look:p.look,rot:p.rot,sr:p.sr,quad:p.quad,w:p.w,h:p.h},p.pid));p.saved=true;}
+ await idbTx(s=>s.put(ids,'_order'));
+ for(const k of keys)if(k!=='_order'&&!ids.includes(k))await idbTx(s=>s.delete(k));}catch(e){}});return pchain;}
+(async()=>{try{const o=await idbTx(s=>s.get('_order'));if(!o||!o.length)return;const out=[];
+ for(const id of o){const r=await idbTx(s=>s.get(id));if(r)out.push({pid:id,blob:r.blob,blobP:Promise.resolve(r.blob),final:r.final,th:r.th,look:r.look,rot:r.rot,sr:r.sr,quad:r.quad,w:r.w,h:r.h,saved:true,cache:{}});}
+ if(out.length&&!pages.length){pages=out;renderList();toast(out.length+' saved page'+(out.length==1?'':'s')+' found on this phone',false,3500);}}catch(e){}})();
+if('serviceWorker' in navigator&&window.isSecureContext){navigator.serviceWorker.register(base+'/sw.js').catch(()=>{});}
+{const ml=document.createElement('link');ml.rel='manifest';ml.href=base+'/manifest.webmanifest';document.head.appendChild(ml);}
+
+// ---------- page list
+function renderList(){show('list');$('lt').textContent=pages.length+' page'+(pages.length==1?'':'s');const box=$('pages');box.textContent='';
+ pages.forEach((p,i)=>{const d=document.createElement('div');d.className='pg';
+  d.innerHTML='<div class="th"><img alt=""><i></i></div><div class="n">Page '+(i+1)+'<small></small></div><div class="ab"></div>';
+  d.querySelector('img').src=p.th;d.querySelector('i').textContent=i+1;d.querySelector('small').textContent=LOOKNAME[p.look]||'';
+  const ab=d.querySelector('.ab');
+  const ic={u:'<svg viewBox="0 0 24 24"><path d="m6 15 6-6 6 6"/></svg>',dn:'<svg viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg>',ed:'<svg viewBox="0 0 24 24"><path d="M4 20h4L19 9l-4-4L4 16z"/></svg>',x:'<svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg>'};
+  const mk=(k,fn,c)=>{const b=document.createElement('button');if(c)b.className=c;b.innerHTML=ic[k];b.onclick=ev=>{ev.stopPropagation();fn();};ab.appendChild(b);};
+  mk('u',()=>{if(i>0){[pages[i-1],pages[i]]=[pages[i],pages[i-1]];renderList();}});
+  mk('dn',()=>{if(i<pages.length-1){[pages[i+1],pages[i]]=[pages[i],pages[i+1]];renderList();}});
+  mk('ed',async()=>{cur=p;retake=i;cur.cache={};try{cur.blob=cur.blob||await cur.blobP;cur.base=await decode(cur.blob);}catch(e){toast('Could not open the page.',true);return;}cur.view=turned(cur.base,cur.sr);cur.w=bw(cur.view);cur.h=bh(cur.view);startEdit();});
+  mk('x',()=>{pages.splice(i,1);pages.length?renderList():home();},'red');
+  d.querySelector('img').onclick=async()=>{if(p.pending)await p.pending;if(!p.final)return;if(p.vurl)URL.revokeObjectURL(p.vurl);p.vurl=URL.createObjectURL(p.final);$('vimg').src=p.vurl;$('viewer').classList.add('on');};
+  box.appendChild(d);});
+ $('lSend').textContent='Send '+pages.length+' page'+(pages.length==1?'':'s')+' to computer';persist();}
+$('viewer').onclick=()=>$('viewer').classList.remove('on');
+function home(){show('home');}
+$('lHome').onclick=home;$('lAdd').onclick=()=>{retake=-1;openCam();};
+$('lSend').onclick=async()=>{if(busy||!pages.length)return;busy=true;$('lSend').disabled=true;
+ const batch=Date.now().toString(36)+Math.random().toString(36).slice(2,6),n=pages.length;
+ try{for(let i=0;i<n;i++){toast('Sending page '+(i+1)+' of '+n+' ...',false,60000);
+   if(pages[i].pending)await pages[i].pending;
+   const r=await api('/api/upload?kind=scan&batch='+batch+'&i='+i+'&n='+n+'&name=page'+(i+1)+'.jpg',{method:'POST',body:pages[i].final});
+   const j=await r.json();if(!j.ok)throw new Error(j.error);}
+  toast('');pages=[];persist();home();buzz();ok();logSent(n+' page'+(n==1?'':'s'));
+ }catch(e){toast('Not sent - no connection to the computer. Your pages are safe on this phone; press Send again when connected.',true,6000);}
+ busy=false;$('lSend').disabled=false;};
+show('home');
+</script></body></html>
+"""
