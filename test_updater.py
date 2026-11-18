@@ -60,9 +60,9 @@ def main():
     # --- stage
     d = tempfile.mkdtemp()
     make_zip(d + "/a.zip", ["ImageFixer.exe", "_internal/x.dll"])
-    assert updater.stage(d + "/a.zip", d + "/sa") == d + "/sa"
+    assert os.path.normpath(updater.stage(d + "/a.zip", d + "/sa")) == os.path.normpath(d + "/sa")
     make_zip(d + "/b.zip", ["ImageFixer/ImageFixer.exe"])
-    assert updater.stage(d + "/b.zip", d + "/sb") == os.path.join(d, "sb", "ImageFixer")
+    assert os.path.normpath(updater.stage(d + "/b.zip", d + "/sb")) == os.path.normpath(os.path.join(d, "sb", "ImageFixer"))
     make_zip(d + "/c.zip", ["other.txt"])
     for z, why in (("c.zip", "no exe"),):
         try:

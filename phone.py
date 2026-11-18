@@ -1484,7 +1484,7 @@ function renderList(){show('list');$('lt').textContent=pages.length+' page'+(pag
   d.querySelector('img').src=p.th;d.querySelector('i').textContent=i+1;d.querySelector('small').textContent=LOOKNAME[p.look]||'';
   const ab=d.querySelector('.ab');
   const ic={u:'<svg viewBox="0 0 24 24"><path d="m6 15 6-6 6 6"/></svg>',dn:'<svg viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg>',ed:'<svg viewBox="0 0 24 24"><path d="M4 20h4L19 9l-4-4L4 16z"/></svg>',x:'<svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg>'};
-  const mk=(k,fn,c)=>{const b=document.createElement('button');if(c)b.className=c;b.innerHTML=ic[k];b.onclick=ev=>{ev.stopPropagation();fn();};ab.appendChild(b);};
+  const mk=(k,fn,c)=>{const b=document.createElement('button');if(c)b.className=c;b.innerHTML=ic[k];b.onclick=ev=>{ev.stopPropagation();if(busy){toast('Wait until sending is finished.',false,1800);return;}fn();};ab.appendChild(b);};
   mk('u',()=>{if(i>0){[pages[i-1],pages[i]]=[pages[i],pages[i-1]];renderList();}});
   mk('dn',()=>{if(i<pages.length-1){[pages[i+1],pages[i]]=[pages[i],pages[i+1]];renderList();}});
   mk('ed',async()=>{cur=p;retake=i;cur.cache={};try{cur.blob=cur.blob||await cur.blobP;cur.base=await decode(cur.blob);}catch(e){toast('Could not open the page.',true);return;}cur.view=turned(cur.base,cur.sr);cur.w=bw(cur.view);cur.h=bh(cur.view);startEdit();});
@@ -1496,12 +1496,12 @@ $('viewer').onclick=()=>$('viewer').classList.remove('on');
 function home(){show('home');}
 $('lHome').onclick=home;$('lAdd').onclick=()=>{retake=-1;openCam();};
 $('lSend').onclick=async()=>{if(busy||!pages.length)return;busy=true;$('lSend').disabled=true;
- const batch=Date.now().toString(36)+Math.random().toString(36).slice(2,6),n=pages.length;
+ const batch=Date.now().toString(36)+Math.random().toString(36).slice(2,6),snap=pages.slice(),n=snap.length;   // snapshot: the list cannot change under the loop
  try{for(let i=0;i<n;i++){toast('Sending page '+(i+1)+' of '+n+' ...',false,60000);
-   if(pages[i].pending)await pages[i].pending;
-   const r=await api('/api/upload?kind=scan&batch='+batch+'&i='+i+'&n='+n+'&name=page'+(i+1)+'.jpg',{method:'POST',body:pages[i].final});
+   if(snap[i].pending)await snap[i].pending;
+   const r=await api('/api/upload?kind=scan&batch='+batch+'&i='+i+'&n='+n+'&name=page'+(i+1)+'.jpg',{method:'POST',body:snap[i].final});
    const j=await r.json();if(!j.ok)throw new Error(j.error);}
-  toast('');pages=[];persist();home();buzz();ok();logSent(n+' page'+(n==1?'':'s'));
+  toast('');pages=pages.filter(p=>!snap.includes(p));persist();if(pages.length)renderList();else home();buzz();ok();logSent(n+' page'+(n==1?'':'s'));
  }catch(e){toast('Not sent - no connection to the computer. Your pages are safe on this phone; press Send again when connected.',true,6000);}
  busy=false;$('lSend').disabled=false;};
 show('home');

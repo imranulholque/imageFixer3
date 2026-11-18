@@ -131,7 +131,16 @@ step("shadow only inside selection", t_shadow)
 # 8 transform
 def t_transform():
     c.start_transform(); assert c._tool == "transform"
-    c.canvas._tf.update(cx=550.0, cy=400.0, sx=0.5, sy=0.5, ang=20.0)
+    import math
+    from PySide6.QtCore import QPointF
+    sc_ = c.scale; t = c.canvas._tf
+    x0, y0 = t["pts"][0].x(), t["pts"][0].y()
+    w_, h_ = t["w"], t["h"]                                   # the net is 4 corners now: TL TR BL BR (preview pixels)
+    cx_, cy_ = 550.0 * sc_, 400.0 * sc_; a_ = math.radians(20.0)
+    def corner(dx, dy):                                       # half size, turned 20 degrees, centred on (550, 400)
+        dx *= 0.5; dy *= 0.5
+        return QPointF(cx_ + dx * math.cos(a_) - dy * math.sin(a_), cy_ + dx * math.sin(a_) + dy * math.cos(a_))
+    t["pts"] = [corner(-w_ / 2, -h_ / 2), corner(w_ / 2, -h_ / 2), corner(-w_ / 2, h_ / 2), corner(w_ / 2, h_ / 2)]
     c.apply_pending()
     assert c.sel is not None
     assert tuple(c.base.getpixel((150, 150)))[0] > 200 and c.base.getpixel((150, 150))[1] > 200, "old place not cleared"
@@ -630,7 +639,7 @@ def t_auto_crop():
     cc.undo_step()
     assert cc.base.size == (W, H), "Undo gives the whole photo back"
     cc.auto_crop(True)
-    assert cc._tool == "persp", "Shift+A shows the 4 corners first"
+    assert cc._tool == "persp", "A shows the 4 corners first"
     cc.cancel_pending()
 step("auto crop finds the page, straightens it, undoable", t_auto_crop)
 
@@ -639,7 +648,7 @@ def t_shortcut_list():
     html = ui.shortcuts_html()
     for tool, key in cardmod.TOOL_KEYS.items():
         assert key in html, "the shortcut list must show %s (%s)" % (key, tool)
-    for key in ("A", "Shift+A", "Q", "F", "U"):
+    for key in ("A", "Q", "F", "U"):
         assert "<b>%s</b>" % key in html, key
     src = open(ui.__file__, encoding="utf-8").read()
     keys = re.findall(r'\bsc\("([^"]+)"', src) + [k for t, k in cardmod.TOOL_KEYS.items() if t != "transform"]
