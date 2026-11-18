@@ -10,7 +10,7 @@ from PySide6.QtCore import QMimeData
 from PySide6.QtGui import (QAction, QActionGroup, QColor, QCursor, QDesktopServices, QMouseEvent, QDrag, QFontMetrics, QIcon, QImage,
                            QKeySequence, QPainter, QPixmap, QShortcut, QTransform)
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QDialog, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel,
-                               QLineEdit, QAbstractSpinBox, QListView, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QProgressBar,
+                               QGridLayout, QToolButton, QLineEdit, QAbstractSpinBox, QListView, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QProgressBar,
                                QPushButton, QSizePolicy, QStackedLayout, QSystemTrayIcon, QTextBrowser, QVBoxLayout, QWidget)
 
 import core
@@ -851,6 +851,7 @@ class MainWindow(QMainWindow):
             sub.addAction(a)
 
     def _build_empty(self):
+        """Start screen: one big drop zone with four colour-coded start tiles (the same icons as the top bar)."""
         w = QWidget()
         l = QVBoxLayout(w)
         l.setContentsMargins(60, 40, 60, 40)
@@ -861,34 +862,49 @@ class MainWindow(QMainWindow):
         z.setAlignment(Qt.AlignmentFlag.AlignCenter)
         z.setSpacing(12)
         ico = QLabel()
-        ico.setPixmap(logo_pixmap(84))
+        ico.setPixmap(logo_pixmap(72))
         ico.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._empty_ico = ico
         t = QLabel("Drop pictures here")
         t.setObjectName("big")
         t.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        s = QLabel("or press Ctrl+V to paste copied pictures\n"
-                   "or select pictures in Explorer, right-click > Send to > Image Fixer")
+        s = QLabel("or pick how you want to start")
         s.setObjectName("muted")
-        s.setWordWrap(True)
         s.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._empty_sub = s
-        b = QPushButton("+  Choose files")
-        b.setProperty("accent", True)
-        b.setMinimumHeight(40)
-        b.setMinimumWidth(120)
-        b.clicked.connect(self.choose_files)
         z.addWidget(ico)
         z.addWidget(t)
         z.addWidget(s)
         z.addSpacing(8)
-        z.addWidget(b, 0, Qt.AlignmentFlag.AlignCenter)
-        b2 = QPushButton("New blank page")
-        b2.setToolTip("Start with an empty page of any color (Ctrl+N)")
-        b2.setMinimumHeight(34)
-        b2.clicked.connect(self.open_blank)
-        z.addWidget(b2, 0, Qt.AlignmentFlag.AlignCenter)
-        z.addSpacing(10)
+        grid = QGridLayout()
+        grid.setSpacing(12)
+        tiles = (("add", "Add pictures", "Ctrl+O", "#818cf8", self.choose_files),
+                 ("scan", "Scan", "Ctrl+Shift+N", "#22d3ee", self.open_scan),
+                 ("phone", "From phone", "Ctrl+Shift+P", "#34d399", self.open_phone),
+                 ("blank", "Blank page", "Ctrl+N", "#60a5fa", self.open_blank))
+        for n, (ic, name, keys, col, fn) in enumerate(tiles):
+            b = QToolButton()
+            b.setIcon(_ico(ic, 30))
+            b.setIconSize(QSize(30, 30))
+            b.setText(name + "\n" + keys)
+            b.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setMinimumSize(128, 92)
+            b.setToolTip(name + "   " + keys)
+            b.setStyleSheet(
+                "QToolButton { background: #161b28; border: 1px solid #2a3042; border-top: 3px solid %s; border-radius: 12px;"
+                " color: #dfe3ef; font-weight: 600; padding: 8px 10px; }"
+                "QToolButton:hover { background: #20263a; border-color: %s; }" % (col, col))
+            b.clicked.connect(fn)
+            grid.addWidget(b, n // 2, n % 2)
+        z.addLayout(grid)
+        z.addSpacing(6)
+        hint = QLabel("Ctrl+V  paste     |     drag & drop     |     F1  all shortcuts     |     Esc  go back")
+        hint.setObjectName("muted")
+        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        hint.setWordWrap(True)
+        z.addWidget(hint)
+        z.addSpacing(6)
         credit = QLabel("Made by " + AUTHOR)
         credit.setObjectName("muted")
         credit.setAlignment(Qt.AlignmentFlag.AlignCenter)

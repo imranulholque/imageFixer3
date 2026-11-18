@@ -12,7 +12,7 @@ from PIL import Image, ImageChops, ImageFilter, ImageOps
 from PySide6.QtCore import QEvent, QMimeData, QObject, QPointF, QRectF, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtCore import QRect
 from PySide6.QtWidgets import QGridLayout, QWidgetAction
-from PySide6.QtGui import QColor, QDrag, QFont, QIcon, QImage, QPainter, QPainterPath, QPen, QPixmap
+from PySide6.QtGui import QColor, QDrag, QIcon, QImage, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (QSplitter, QApplication, QButtonGroup, QCheckBox, QColorDialog, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu,
                                QAbstractItemView, QAbstractButton, QAbstractSlider, QAbstractSpinBox, QComboBox, QPushButton, QScrollArea, QSizePolicy, QSlider, QStackedWidget, QStyle, QStyledItemDelegate, QToolButton,
                                QVBoxLayout, QWidget)
@@ -249,6 +249,12 @@ class CornerPreview(QWidget):
         p.end()
 
 
+GROUP_ICONS = (("Color & light", "adjust"), ("Color range", "color"), ("Remove a stamp", "erase"), ("Picked colors", "dropper"),
+               ("One-click shadow", "shadow"), ("Manual shadow", "brush"), ("Text & line", "textfix"),
+               ("Newspaper", "picture"), ("Background of", "picture"), ("Border", "border"), ("Card corners", "crop"),
+               ("Layers", "layers"), ("Pictures on this page", "layers"))
+
+
 class SliderRow(QWidget):
     """title + value + slider (+ small captions under it)."""
     changed = Signal(int)
@@ -266,9 +272,12 @@ class SliderRow(QWidget):
         self.title.setObjectName("sub")
         self.val = QLabel("%d%s" % (value, unit))
         self.val.setObjectName("muted")
+        self.val.setStyleSheet("background: #1e2436; border-radius: 9px; padding: 1px 8px; color: #c7d2fe; font-weight: 600;")
         self.val.setMinimumWidth(46)
         self.val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self.btnReset = QPushButton("↺")
+        self.btnReset = QPushButton()
+        self.btnReset.setIcon(_ico("reset", 14))
+        self.btnReset.setIconSize(QSize(14, 14))
         self.btnReset.setProperty("flat", True)
         self.btnReset.setToolTip("Back to %d%s" % (value, unit))
         self.btnReset.setFixedWidth(30)
@@ -706,15 +715,7 @@ def side_sync():
 
 
 EYE_ROLE = Qt.ItemDataRole.UserRole + 1
-GROUP_ROLE = Qt.ItemDataRole.UserRole + 2      # group number (1, 2, 3 ...), 0 = not in a group
-GROUP_POS_ROLE = Qt.ItemDataRole.UserRole + 3  # place inside a run of neighbouring rows of one group: 0 alone, 1 first, 2 middle, 3 last
 EYE_W = 40
-# one colour per group: the stripe, the tint and the "G1" badge of its rows share it
-GROUP_COLORS = ("#2dd4bf", "#f59e0b", "#f472b6", "#60a5fa", "#a3e635", "#c084fc", "#fb7185", "#38bdf8")
-
-
-def group_color(n):
-    return QColor(GROUP_COLORS[(int(n) - 1) % len(GROUP_COLORS)])
 
 
 def eye_rect(row_rect):
@@ -725,52 +726,8 @@ def eye_rect(row_rect):
 class _EyeDelegate(QStyledItemDelegate):
     """Draws the normal row, then an eye on the right: open eye = layer shown, eye with a slash = hidden (like Photoshop)."""
 
-    def _paint_group(self, p, opt, idx, gn):
-        """Rows of a group: a tinted background, a coloured stripe on the left (joined between neighbours)
-        and a "G1" badge, so a group can be told from loose layers at a glance."""
-        col = group_color(gn)
-        pos = int(idx.data(GROUP_POS_ROLE) or 0)
-        r = QRectF(opt.rect).adjusted(0.5, 0.5, -0.5, -0.5)
-        p.save()
-        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        tint = QColor(col)
-        tint.setAlpha(34)
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(tint)
-        p.drawRoundedRect(r, 8, 8)
-        # stripe: stretched over the gap to the neighbouring row of the same group, so the rows look tied together
-        y0 = r.top() + (4 if pos in (0, 1) else -3)
-        y1 = r.bottom() - (4 if pos in (0, 3) else -3)
-        p.setBrush(col)
-        p.drawRoundedRect(QRectF(r.left() + 2, y0, 4, y1 - y0), 2, 2)
-        p.restore()
-
-    def _paint_badge(self, p, opt, gn):
-        col = group_color(gn)
-        f = QFont(opt.font)
-        f.setBold(True)
-        f.setPixelSize(10)
-        txt = "G%d" % gn
-        w, h = 26, 16
-        er = eye_rect(opt.rect)
-        r = QRectF(er.left() - w - 2, opt.rect.center().y() - h / 2.0, w, h)
-        p.save()
-        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(col)
-        p.drawRoundedRect(r, 8, 8)
-        p.setFont(f)
-        p.setPen(QColor("#0b0e14"))
-        p.drawText(r, int(Qt.AlignmentFlag.AlignCenter), txt)
-        p.restore()
-
     def paint(self, p, opt, idx):
-        gn = int(idx.data(GROUP_ROLE) or 0)
-        if gn:
-            self._paint_group(p, opt, idx, gn)
         super().paint(p, opt, idx)
-        if gn:
-            self._paint_badge(p, opt, gn)
         shown = bool(idx.data(EYE_ROLE))
         r = eye_rect(opt.rect)
         c = r.center()
@@ -1061,8 +1018,8 @@ class Card(QWidget):
         sc.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         host = QWidget()
         lay = QVBoxLayout(host)
-        lay.setContentsMargins(0, 2, 4, 2)
-        lay.setSpacing(6)
+        lay.setContentsMargins(0, 4, 4, 4)
+        lay.setSpacing(10)
         sc.setWidget(host)
         return sc, lay
 
@@ -1071,15 +1028,21 @@ class Card(QWidget):
         f = QFrame()
         f.setObjectName("group")
         outer = QVBoxLayout(f)
-        outer.setContentsMargins(8, 6, 8, 8)
+        outer.setContentsMargins(10, 6, 10, 10)
         outer.setSpacing(4)
+        _gi = next((v for k, v in GROUP_ICONS if title and title.startswith(k)), None)
+        if _gi:
+            f.setStyleSheet("QFrame#group { border-left: 3px solid %s; }" % _ico_color(_gi))
         body = QWidget()
         l = QVBoxLayout(body)
         l.setContentsMargins(0, 0, 0, 0)
-        l.setSpacing(6)
+        l.setSpacing(8)
         if title and collapsible:
             hdr = QPushButton(("\u25b8  " if collapsed else "\u25be  ") + title)
             hdr.setProperty("gh", True)
+            if _gi:
+                hdr.setIcon(_ico(_gi, 16))
+                hdr.setIconSize(QSize(16, 16))
             hdr.setCursor(Qt.CursorShape.PointingHandCursor)
             hdr.setToolTip("Click to fold / unfold")
 
@@ -1109,6 +1072,7 @@ class Card(QWidget):
         self._scope_labels.append(lab)
         btn = QPushButton("Apply to the selection")
         btn.setProperty("accent", True)
+        btn.setIcon(_ico("check", 16, normal="#ffffff"))
         btn.setToolTip("Makes these changes part of the picture. They stay when you deselect (undo with Ctrl+Z).\n"
                        "If you deselect without pressing this, it is applied automatically.")
         btn.clicked.connect(lambda: self._bake(None, True))
@@ -2232,6 +2196,11 @@ class Card(QWidget):
         self.btnText.clicked.connect(self.add_text_layer)
         self.btnLayerDone.clicked.connect(lambda: self.leave_layer())
         self.btnCopy.clicked.connect(self.copy_image)
+        for name, ic in (("btnRemoveStamp", "erase"), ("btnFill", "brush"), ("btnDelete", "trash"), ("btnPickFill", "dropper")):
+            b_ = getattr(self, name, None)
+            if b_ is not None:
+                b_.setIcon(_ico(ic, 16))
+                b_.setIconSize(QSize(16, 16))
         return side
 
     def show_tab(self, i):
@@ -4905,38 +4874,19 @@ class Card(QWidget):
 
     def _fill_layer_list(self):
         lw = self.layerList
-        vbar = lw.verticalScrollBar()
-        scroll = vbar.value()
-        lw.setUpdatesEnabled(False)                              # one repaint at the end: no flicker, no jumping
         lw.blockSignals(True)
         lw.clear()
         keep = {}
         flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsDragEnabled
-        order = list(reversed(self.layers))                      # top layer first
-        gnum = {}                                                # group id -> 1, 2, 3 ... in the order they appear from the top
-        for l in order:
-            g = l.get("group")
-            if g and g not in gnum:
-                gnum[g] = len(gnum) + 1
-        gsize = {}
-        for l in order:
-            if l.get("group"):
-                gsize[l["group"]] = gsize.get(l["group"], 0) + 1
-        for i, l in enumerate(order):
+        for l in reversed(self.layers):                          # top layer first
             icon = self._layer_icon(l)
             keep[(l["id"], id(l["rgb"]), id(l["a"]), l.get("opacity", 100), l.get("border"), l.get("rnd", 0))] = self._icon_cache[
                 (l["id"], id(l["rgb"]), id(l["a"]), l.get("opacity", 100), l.get("border"), l.get("rnd", 0))]
-            it = QListWidgetItem(icon, l["name"])
+            it = QListWidgetItem(icon, ("\u26d3 " if l.get("group") else "") + l["name"])
             it.setData(Qt.ItemDataRole.UserRole, l["id"])
-            g = l.get("group")
-            it.setData(GROUP_ROLE, gnum.get(g, 0) if g else 0)
-            prev_same = i > 0 and g and order[i - 1].get("group") == g
-            next_same = i + 1 < len(order) and g and order[i + 1].get("group") == g
-            it.setData(GROUP_POS_ROLE, 0 if not (prev_same or next_same) else (3 if prev_same and not next_same else (1 if next_same and not prev_same else 2)))
             it.setFlags(flags)
             it.setData(EYE_ROLE, bool(l.get("visible", True)))
-            it.setToolTip(l["name"] + ("\nGroup G%d  (%d layers move together)" % (gnum[g], gsize[g]) if g else "")
-                          + "\nClick = select and work on this layer.  Eye = show / hide "
+            it.setToolTip(l["name"] + "\nClick = select and work on this layer.  Eye = show / hide "
                           "(Alt + eye = only this one).  Drag = change the order.  Double click = edit.")
             lw.addItem(it)
             if l["id"] == self.sel_layer:
@@ -4948,8 +4898,6 @@ class Card(QWidget):
             lw.clearSelection()
         lw.setEnabled(True)
         lw.blockSignals(False)
-        lw.setUpdatesEnabled(True)
-        vbar.setValue(min(scroll, vbar.maximum()))               # the list stays where it was (a long list used to jump to the top)
         l = None if self.sel_layer is None else self._layer(self.sel_layer)
         on = l is not None
         is_text = l is not None and l.get("text") is not None
@@ -5508,6 +5456,7 @@ class Card(QWidget):
         prev = self.prev
         fuzz = self._fuzz
         local = self.localSlider.value() / 100.0 if self.chkLocal.isChecked() else 0.0
+        base_sel = self.sel
 
         def work(progress):
             lab = self._lab if self._lab is not None else core.rgb_to_lab(prev)

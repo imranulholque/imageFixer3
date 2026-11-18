@@ -9,11 +9,12 @@ import sys
 import tempfile
 import time
 
-from PySide6.QtCore import QProcess, QTimer, Qt
+from PySide6.QtCore import QProcess, QSize, QTimer, Qt
 from PySide6.QtGui import QColor
-from PySide6.QtWidgets import (QCheckBox, QColorDialog, QComboBox, QDialog, QFormLayout, QHBoxLayout, QLabel, QProgressBar,
+from PySide6.QtWidgets import (QCheckBox, QColorDialog, QComboBox, QDialog, QFormLayout, QFrame, QHBoxLayout, QLabel, QProgressBar,
                                QPushButton, QSlider, QVBoxLayout, QWidget)
 
+from icons import icon as _ico
 import idpreview
 import idscan
 import jobs
@@ -89,6 +90,45 @@ def build_side(path, dpi, fix, quad, progress):
     return {"path": path, "dpi": d, "card": card, "found": ok, "eff": eff, "quad": quad}
 
 
+CARD_CSS = ("QFrame#scanCard { background: #141926; border: 1px solid #2a3042; border-radius: 12px; }"
+            "QFrame#scanCard QLabel#cardCap { color: #9aa3bd; font-size: 11px; font-weight: 700; letter-spacing: 1px; }")
+
+
+class _Rows(QVBoxLayout):
+    """A column of widgets that understands form.addRow("", widget) - for the check boxes (no empty label column)."""
+    def addRow(self, _label, field):
+        if isinstance(field, QWidget):
+            self.addWidget(field)
+        else:
+            self.addLayout(field)
+
+
+def _card(caption, icon_name, vertical=False):
+    """A rounded section: small icon + CAPTION, then its rows.  Returns (frame, layout to add rows to)."""
+    fr = QFrame()
+    fr.setObjectName("scanCard")
+    fr.setStyleSheet(CARD_CSS)
+    v = QVBoxLayout(fr)
+    v.setContentsMargins(14, 10, 14, 12)
+    v.setSpacing(8)
+    head = QHBoxLayout()
+    head.setSpacing(6)
+    ic = QLabel()
+    ic.setPixmap(_ico(icon_name, 16).pixmap(QSize(16, 16)))
+    cap = QLabel(caption.upper())
+    cap.setObjectName("cardCap")
+    head.addWidget(ic)
+    head.addWidget(cap)
+    head.addStretch(1)
+    v.addLayout(head)
+    rows = _Rows() if vertical else QFormLayout()
+    rows.setSpacing(8)
+    if not vertical:
+        rows.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+    v.addLayout(rows)
+    return fr, rows
+
+
 class ScanDialog(QDialog):
     def __init__(self, win):
         super().__init__(win)
@@ -110,17 +150,28 @@ class ScanDialog(QDialog):
 
         root = QVBoxLayout(self)
         root.setSpacing(10)
+        root.setContentsMargins(16, 14, 16, 14)
+        th = QHBoxLayout()
+        th.setSpacing(8)
+        tic = QLabel()
+        tic.setPixmap(_ico("scan", 26).pixmap(QSize(26, 26)))
         title = QLabel("Scan from a scanner")
-        title.setStyleSheet("font-size: 15px; font-weight: 700;")
-        root.addWidget(title)
+        title.setStyleSheet("font-size: 16px; font-weight: 700;")
+        th.addWidget(tic)
+        th.addWidget(title)
+        th.addStretch(1)
+        root.addLayout(th)
 
-        form = QFormLayout()
-        form.setSpacing(8)
+        fr1, form = _card("Scanner", "scan")
+        fr2, form2 = _card("Paper & quality", "blank")
+        fr3, form3 = _card("Options", "settings", vertical=True)
+        self._idcard, form4 = _card("ID card", "border")
         row = QHBoxLayout()
         self.cmbDev = QComboBox()
         self.cmbDev.setMinimumWidth(300)
         self.btnRefresh = QPushButton("Find scanners")
         self.btnRefresh.setToolTip("Look for TWAIN and WIA scanners again")
+        self.btnRefresh.setIcon(_ico("reset", 18))
         self.btnRefresh.clicked.connect(self.refresh)
         row.addWidget(self.cmbDev, 1)
         row.addWidget(self.btnRefresh)
@@ -130,6 +181,7 @@ class ScanDialog(QDialog):
         self.lblFound.setWordWrap(True)
         form.addRow("", self.lblFound)
 
+        form = form2
         self.cmbMode = QComboBox()
         self.cmbMode.addItem("Normal: one picture for every page", "normal")
         self.cmbMode.addItem("ID card: front + back on one page (2 layers)", "id")
@@ -156,6 +208,7 @@ class ScanDialog(QDialog):
         self.cmbFix.addItem("Off: exactly as the scanner gave it", scanfix.OFF)
         self.cmbFix.setToolTip("Makes soft scans crisper. A higher scan dpi (600 for an ID card) gives the best result.")
         form.addRow("Sharpness", self.cmbFix)
+        form = form3
 
         self.chkUi = QCheckBox("Show the scanner's own window (driver settings)")
         self.chkUi.setToolTip("Like Photoshop: the driver of the scanner opens its own window to choose size, preview ...")
@@ -178,6 +231,7 @@ class ScanDialog(QDialog):
         self.cmbPlace = QComboBox()
         self.cmbPlace.addItem("centre of the page", "center")
         self.cmbPlace.addItem("top of the page", "top")
+        form = form4
         r3 = QHBoxLayout()
         r3.addWidget(self.cmbPage)
         r3.addWidget(self.cmbPlace)
@@ -238,8 +292,12 @@ class ScanDialog(QDialog):
         form.addRow("", self.chkPreview)
         self._idrows = (self.cmbPage, self.cmbPlace, self.lblPage, self.chkBorder, self.btnBorderColor, self.sldBorder,
                         self.lblBorderW, self.lblBorder, self.chkPreview,
-                        self.chkRound, self.sldRound, self.lblRoundV, self.lblRound, self.lblRoundT, self.sampleRound)
-        root.addLayout(form)
+                        self.chkRound, self.sldRound, self.lblRoundV, self.lblRound, self.lblRoundT, self.sampleRound,
+                        self._idcard)
+        root.addWidget(fr1)
+        root.addWidget(fr2)
+        root.addWidget(fr3)
+        root.addWidget(self._idcard)
 
         self.lblStep = QLabel("")
         self.lblStep.setWordWrap(True)
@@ -286,6 +344,10 @@ class ScanDialog(QDialog):
         self.btnAgain.clicked.connect(self._reset_id)
         self.btnClose = QPushButton("Close")
         self.btnClose.clicked.connect(self.close)
+        self.btnScan.setIcon(_ico("scan", 18, normal="#ffffff"))
+        self.btnScan.setMinimumHeight(36)
+        self.btnAgain.setIcon(_ico("reset", 18))
+        self.btnClose.setIcon(_ico("close", 18))
         btns.addWidget(self.btnScan)
         btns.addWidget(self.btnAgain)
         btns.addStretch(1)

@@ -174,7 +174,7 @@ QListWidget#strip { background: #0a0c10; border: none; outline: 0; }
 QListWidget#strip::item { color: #8d95a8; border: 1px solid transparent; border-radius: 10px; padding: 3px; }
 QListWidget#strip::item:hover { background: #171c28; }
 QListWidget#layers { background: #12151c; border: 1px solid #30374a; border-radius: 8px; outline: 0; padding: 4px; }
-QListWidget#layers::item { color: #d5d9e5; border: 1px solid transparent; border-radius: 8px; padding: 4px 4px 4px 10px; }
+QListWidget#layers::item { color: #d5d9e5; border: 1px solid transparent; border-radius: 8px; padding: 4px; }
 QListWidget#layers::item:hover { background: #171c28; }
 QListWidget#layers::item:selected { background: #1f2640; border: 1px solid #6366f1; color: white; }
 QListWidget#strip::item:selected { background: #1f2640; border: 1px solid #6366f1; color: white; }
@@ -204,6 +204,15 @@ QPushButton[lbl="true"], QToolButton[lbl="true"] { background: transparent; bord
 QPushButton[lbl="true"]:hover, QToolButton[lbl="true"]:hover { background: #2a3150; border-color: #4a5380; }
 QPushButton[lbl="true"]:checked, QToolButton[lbl="true"][active="true"] { background: #4f46e5; border-color: #6366f1; color: white; }
 QPushButton[lbl="true"]:disabled, QToolButton[lbl="true"]:disabled { background: transparent; border-color: transparent; color: #5d6475; }
+QComboBox:hover, QDoubleSpinBox:hover, QSpinBox:hover, QLineEdit:hover { border-color: #4a5380; }
+QComboBox:focus, QDoubleSpinBox:focus, QSpinBox:focus, QLineEdit:focus { border-color: #818cf8; }
+QCheckBox:hover { color: #ffffff; }
+QPushButton:focus { outline: none; }
+QPushButton:default { border: 1px solid #818cf8; }
+QSlider::handle:horizontal:pressed { background: #a5b4fc; }
+QPushButton[gh="true"] { background: transparent; border: none; text-align: left; font-weight: 700; font-size: 13px; color: #e4e7f2; padding: 4px 2px; }
+QPushButton[gh="true"]:hover { color: #ffffff; background: #1b2132; border-radius: 6px; }
+QLabel#hint { color: #7f879b; }
 QFrame#vsep { background: #2a3042; max-width: 1px; min-width: 1px; margin: 6px 3px; }
 QPushButton#nav { min-width: 30px; max-width: 30px; padding: 2px; font-size: 14px; }
 QToolTip { border-radius: 6px; }
