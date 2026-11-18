@@ -1,9 +1,13 @@
 """Self test (runs in the build): opens the real window invisibly and checks the main features.
 Run:  QT_QPA_PLATFORM=offscreen python smoke_test.py"""
+import faulthandler
 import os
 import sys
 import tempfile
 import traceback
+
+# if the test ever hangs (a window waiting for a click that never comes), print where and stop after 4 minutes
+faulthandler.dump_traceback_later(240, exit=True)
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter
