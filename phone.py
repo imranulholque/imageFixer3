@@ -1488,7 +1488,7 @@ function renderList(){show('list');$('lt').textContent=pages.length+' page'+(pag
   mk('u',()=>{if(i>0){[pages[i-1],pages[i]]=[pages[i],pages[i-1]];renderList();}});
   mk('dn',()=>{if(i<pages.length-1){[pages[i+1],pages[i]]=[pages[i],pages[i+1]];renderList();}});
   mk('ed',async()=>{cur=p;retake=i;cur.cache={};try{cur.blob=cur.blob||await cur.blobP;cur.base=await decode(cur.blob);}catch(e){toast('Could not open the page.',true);return;}cur.view=turned(cur.base,cur.sr);cur.w=bw(cur.view);cur.h=bh(cur.view);startEdit();});
-  mk('x',()=>{pages.splice(i,1);pages.length?renderList():home();},'red');
+  mk('x',()=>{pages.splice(i,1);if(pages.length)renderList();else{persist();home();}},'red');   // persist() also when the LAST page goes, or it comes back from the saved copy on the next open
   d.querySelector('img').onclick=async()=>{if(p.pending)await p.pending;if(!p.final)return;if(p.vurl)URL.revokeObjectURL(p.vurl);p.vurl=URL.createObjectURL(p.final);$('vimg').src=p.vurl;$('viewer').classList.add('on');};
   box.appendChild(d);});
  $('lSend').textContent='Send '+pages.length+' page'+(pages.length==1?'':'s')+' to computer';persist();}
