@@ -91,6 +91,7 @@ def build_side(path, dpi, fix, quad, progress):
 
 
 CARD_CSS = ("QFrame#scanCard { background: #141926; border: 1px solid #2a3042; border-radius: 12px; }"
+            "QFrame#scanCard QSlider::groove:horizontal { background: #3b4464; }"
             "QFrame#scanCard QLabel#cardCap { color: #9aa3bd; font-size: 11px; font-weight: 700; letter-spacing: 1px; }")
 
 
@@ -109,8 +110,8 @@ def _card(caption, icon_name, vertical=False):
     fr.setObjectName("scanCard")
     fr.setStyleSheet(CARD_CSS)
     v = QVBoxLayout(fr)
-    v.setContentsMargins(12, 8, 12, 10)
-    v.setSpacing(6)
+    v.setContentsMargins(10, 6, 10, 8)
+    v.setSpacing(4)
     head = QHBoxLayout()
     head.setSpacing(6)
     ic = QLabel()
@@ -122,7 +123,7 @@ def _card(caption, icon_name, vertical=False):
     head.addStretch(1)
     v.addLayout(head)
     rows = _Rows() if vertical else QFormLayout()
-    rows.setSpacing(6)
+    rows.setSpacing(5)
     if not vertical:
         rows.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
     v.addLayout(rows)
@@ -136,7 +137,7 @@ class ScanDialog(QDialog):
         self.st = win.settings
         self.setWindowTitle("Scan")
         self.setModal(False)
-        self.setMinimumWidth(820)
+        self.setMinimumWidth(720)
         self.work = tempfile.mkdtemp(prefix="scan_", dir=win.tmp)
         self._procs = []                  # running list jobs
         self._proc = None                 # the running scan
@@ -149,8 +150,8 @@ class ScanDialog(QDialog):
         self._errors = []
 
         root = QVBoxLayout(self)
-        root.setSpacing(8)
-        root.setContentsMargins(14, 12, 14, 12)
+        root.setSpacing(6)
+        root.setContentsMargins(12, 8, 12, 8)
         th = QHBoxLayout()
         th.setSpacing(8)
         tic = QLabel()
@@ -231,12 +232,19 @@ class ScanDialog(QDialog):
         self.cmbPlace = QComboBox()
         self.cmbPlace.addItem("centre of the page", "center")
         self.cmbPlace.addItem("top of the page", "top")
-        form = form4
+        for c in (self.cmbPage, self.cmbPlace):          # let the boxes shrink instead of pushing the window wider
+            c.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            c.setMinimumContentsLength(6)
+        self.cmbPage.setToolTip("Size of the page the card is put on")
+        self.cmbPlace.setToolTip("Where on the page the card goes")
+        form = form4                                     # compact: every row is one line, no label column
         r3 = QHBoxLayout()
-        r3.addWidget(self.cmbPage)
-        r3.addWidget(self.cmbPlace)
-        self.lblPage = QLabel("ID card page")
-        form.addRow(self.lblPage, r3)
+        r3.setSpacing(6)
+        self.lblPage = QLabel("Page")
+        r3.addWidget(self.lblPage)
+        r3.addWidget(self.cmbPage, 1)
+        r3.addWidget(self.cmbPlace, 2)
+        form.addRow(r3)
         self._r3 = (self.cmbPage, self.cmbPlace)
 
         # border of the card layers: colour + thickness (they can be changed later in the Border tab, too)
@@ -244,23 +252,25 @@ class ScanDialog(QDialog):
         self.chkBorder.setToolTip("A frame around each card (front and back). Colour and thickness can be changed any time\n"
                                   "later in the Border tab; nothing else (brightness, sharpness ...) changes it.")
         self.btnBorderColor = QPushButton()
-        self.btnBorderColor.setFixedSize(40, 26)
+        self.btnBorderColor.setFixedSize(34, 24)
         self.btnBorderColor.setToolTip("Border colour")
         self.btnBorderColor.clicked.connect(self._pick_border_color)
         self.sldBorder = QSlider(Qt.Orientation.Horizontal)
         self.sldBorder.setRange(1, 40)
+        self.sldBorder.setMinimumWidth(90)
         self.sldBorder.setToolTip("Border thickness")
         self.lblBorderW = QLabel("")
         self.lblBorderW.setMinimumWidth(24)
         self.sldBorder.valueChanged.connect(lambda v: self.lblBorderW.setText(str(v)))
         r4 = QHBoxLayout()
+        r4.setSpacing(6)
+        self.chkBorder.setMinimumWidth(70)
         r4.addWidget(self.chkBorder)
         r4.addWidget(self.btnBorderColor)
-        r4.addWidget(QLabel("thickness"))
         r4.addWidget(self.sldBorder, 1)
         r4.addWidget(self.lblBorderW)
-        self.lblBorder = QLabel("Card border")
-        form.addRow(self.lblBorder, r4)
+        self.lblBorder = QLabel("")                      # (kept so older code that hides it still works)
+        form.addRow(r4)
         self.chkBorder.toggled.connect(self._border_enable)
 
         # corners of the card layers: round on / off + how round (can be changed later in the Border tab, too)
@@ -269,39 +279,41 @@ class ScanDialog(QDialog):
                                  "Switch it off = square corners. How round can be changed any time later in the Border tab.")
         self.sldRound = QSlider(Qt.Orientation.Horizontal)
         self.sldRound.setRange(5, idscan.ROUND_MAX)
+        self.sldRound.setMinimumWidth(90)
         self.sldRound.setToolTip("How round the corners are:  100% = a real ID card,  less = sharper corners,  more = rounder corners")
         self.lblRoundV = QLabel("")
-        self.lblRoundV.setMinimumWidth(40)
+        self.lblRoundV.setMinimumWidth(36)
         self.sldRound.valueChanged.connect(lambda v: self.lblRoundV.setText("%d%%" % v))
-        self.sampleRound = idpreview.CornerSample()
+        self.sampleRound = idpreview.CornerSample(w=48)
         self.sldRound.valueChanged.connect(lambda _v: self._round_sample())
         r5 = QHBoxLayout()
+        r5.setSpacing(6)
+        self.chkRound.setMinimumWidth(70)
         r5.addWidget(self.chkRound)
-        self.lblRoundT = QLabel("roundness")
-        r5.addWidget(self.lblRoundT)
-        r5.addWidget(self.sldRound, 1)
+        r5.addWidget(self.sldRound, 1)                   # the slider gets all the free width of its own line
         r5.addWidget(self.lblRoundV)
         r5.addWidget(self.sampleRound)
-        self.lblRound = QLabel("Card corners")
-        form.addRow(self.lblRound, r5)
+        self.lblRound = QLabel("")
+        self.lblRoundT = QLabel("")
+        form.addRow(r5)
         self.chkRound.toggled.connect(self._round_enable)
         self.chkPreview = QCheckBox("Preview each side (front, back) before joining")
         self.chkPreview.setToolTip("After the FRONT and again after the BACK you see how the card will look (corners + border).\n"
                                    "OK = go on, Corner crop = drag the 4 corners yourself, Scan again = scan this side again.\n"
                                    "Switch it off to put the card on the page at once.")
-        form.addRow("", self.chkPreview)
+        form.addRow(self.chkPreview)
+        # (the small captions are not on screen any more, so they are not in this list)
         self._idrows = (self.cmbPage, self.cmbPlace, self.lblPage, self.chkBorder, self.btnBorderColor, self.sldBorder,
-                        self.lblBorderW, self.lblBorder, self.chkPreview,
-                        self.chkRound, self.sldRound, self.lblRoundV, self.lblRound, self.lblRoundT, self.sampleRound,
+                        self.lblBorderW, self.chkPreview, self.chkRound, self.sldRound, self.lblRoundV, self.sampleRound,
                         self._idcard)
         # the cards scroll when the screen is small; the title, the step text and the Scan / Close buttons never scroll away
         self._body = QWidget()
         bl = QHBoxLayout(self._body)                     # two columns: short enough for any laptop screen, no scrolling
         bl.setContentsMargins(0, 0, 0, 0)
-        bl.setSpacing(10)
+        bl.setSpacing(8)
         c1, c2 = QVBoxLayout(), QVBoxLayout()
-        c1.setSpacing(8)
-        c2.setSpacing(8)
+        c1.setSpacing(6)
+        c2.setSpacing(6)
         c1.addWidget(fr1)
         c1.addWidget(fr2)
         c1.addStretch(1)
@@ -366,7 +378,7 @@ class ScanDialog(QDialog):
         self.btnClose = QPushButton("Close")
         self.btnClose.clicked.connect(self.close)
         self.btnScan.setIcon(_ico("scan", 18, normal="#ffffff"))
-        self.btnScan.setMinimumHeight(36)
+        self.btnScan.setMinimumHeight(32)
         self.btnAgain.setIcon(_ico("reset", 18))
         self.btnClose.setIcon(_ico("close", 18))
         btns.addWidget(self.btnScan)
@@ -684,11 +696,11 @@ class ScanDialog(QDialog):
         scr = (self.screen() if self.isVisible() else None) or self.win.screen() or QApplication.primaryScreen()
         ag = scr.availableGeometry()
         maxh, maxw = int(ag.height() * 0.92), int(ag.width() * 0.92)
-        self.setMinimumWidth(min(820, maxw))
+        self.setMinimumWidth(min(720, maxw))
         self.setMaximumSize(maxw, maxh)
         fixed = self.sizeHint().height() - self._scroll.sizeHint().height()
         want = fixed + self._body.sizeHint().height() + 6
-        w = min(max(self.minimumWidth(), self.width() if self.isVisible() else 860), maxw)
+        w = min(max(self.minimumWidth(), self.width() if self.isVisible() else 760), maxw)
         self.resize(w, min(want, maxh))
         fg = self.frameGeometry()                       # keep the whole window inside the screen
         x = min(max(fg.x(), ag.x()), max(ag.x(), ag.right() - fg.width()))

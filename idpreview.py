@@ -24,9 +24,11 @@ class CornerSample(QWidget):
     see idscan.corner_radius).  set_pct(0) = square corners.  Used next to every 'Roundness' slider."""
     W, H = 112, 71                                       # the shape of a real card (85.6 x 54)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, w=None):
         super().__init__(parent)
         self._pct = idscan.ROUND_PCT
+        if w:                                            # a smaller sample (the compact Scan window)
+            self.W, self.H = int(w), int(round(w * 71 / 112.0))
         self.setFixedSize(self.W + 4, self.H + 4)
         self.setToolTip("This is how the corners of the card will look")
 
