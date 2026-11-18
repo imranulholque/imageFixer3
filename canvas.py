@@ -8,6 +8,7 @@ from PySide6.QtGui import QBrush, QColor, QImage, QPainter, QPainterPath, QPen, 
 from PySide6.QtWidgets import QAbstractSpinBox, QApplication, QComboBox, QLineEdit, QPlainTextEdit, QTextEdit, QWidget
 
 import core
+import strokefix
 from feedback import Effects, rotate_cursor
 from theme import copy_cursor, dropper_cursor, move_selection_cursor
 
@@ -90,6 +91,8 @@ class ImageCanvas(QWidget):
         self.clone_src = None                 # QPointF, spot to copy from
         self.paint_rgb = (255, 0, 0)          # colour brush: colour and opacity (only for the live preview of the stroke)
         self.paint_opacity = 1.0
+        self.paint_smooth = 50                # 0..100: how much the stroke is smoothed
+        self.paint_snap = True                # a stroke close to a line / circle / triangle / rectangle becomes that shape
         self.clone_delta = None               # QPointF, offset source - destination
         self._msg = "Loading..."
         self._masks = {"sel": None, "hl": None}      # float masks (preview size): the selection / the hovered colour
@@ -856,9 +859,13 @@ class ImageCanvas(QWidget):
         self.brush_prev = max(1.0, float(size_prev))
         self.update()
 
-    def set_paint(self, rgb, opacity):
+    def set_paint(self, rgb, opacity, smooth=None, snap=None):
         self.paint_rgb = tuple(int(v) for v in rgb)
         self.paint_opacity = max(0.05, min(1.0, float(opacity)))
+        if smooth is not None:
+            self.paint_smooth = max(0, min(100, int(smooth)))
+        if snap is not None:
+            self.paint_snap = bool(snap)
         self.update()
 
     def set_clone(self, src, delta):
@@ -1265,7 +1272,8 @@ class ImageCanvas(QWidget):
         z = self.zoom
         er = self._erase
         if er is not None and er["kind"] == "paint":
-            pts = [self.to_wid(q) for q in er["pts"]]
+            raw = [(q.x(), q.y()) for q in er["pts"]]
+            pts = [self.to_wid(QPointF(x, y)) for x, y in strokefix.smooth(raw, self.paint_smooth)]   # live preview is smoothed too
             col = QColor(*self.paint_rgb)
             col.setAlphaF(self.paint_opacity)
             w = max(1.0, self.brush_prev * z)
@@ -1747,7 +1755,8 @@ class ImageCanvas(QWidget):
         er, self._erase = self._erase, None
         if er is not None and self.mode == self.PAINT:
             if e.button() == Qt.MouseButton.LeftButton and er["kind"] == "paint":
-                self.paintFinished.emit([(q.x(), q.y()) for q in er["pts"]])
+                raw = [(q.x(), q.y()) for q in er["pts"]]
+                self.paintFinished.emit(strokefix.clean(raw, self.paint_smooth, self.paint_snap))
             self.update()
             er = None
         if er is not None and self.mode == self.SELECT and e.button() == Qt.MouseButton.LeftButton:

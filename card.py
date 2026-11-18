@@ -1377,11 +1377,24 @@ class Card(QWidget):
         self.softSlider.setToolTip("Edge of the brush: 0 = sharp, 100 = very soft")
         self.lblSoft = self._label("0%")
         self.lblSoft.setMinimumWidth(36)
+        self.smoothSlider = NoWheelSlider(Qt.Orientation.Horizontal)
+        self.smoothSlider.setRange(0, 100)
+        self.smoothSlider.setValue(50)
+        self.smoothSlider.setFixedWidth(100)
+        self.smoothSlider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.smoothSlider.setToolTip("Smooths shaky lines. 0 = exactly as you draw, 100 = very smooth. The shape stays as you drew it.")
+        self.lblSmooth = self._label("50%")
+        self.lblSmooth.setMinimumWidth(40)
+        self.snapCheck = QCheckBox("Snap to shape")
+        self.snapCheck.setChecked(True)
+        self.snapCheck.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.snapCheck.setToolTip("If a stroke is close to a straight line, circle, oval, triangle or rectangle, it becomes a clean one.")
         self.brushSwatch = QPushButton()
         self.brushSwatch.setFixedSize(34, 24)
         self.brushSwatch.setToolTip("Brush color. Click to choose another color.")
         for w in (self._label("Opacity"), self.opSlider, self.lblOp, self._label("Softness"), self.softSlider,
-                  self.lblSoft, self._label("Color"), self.brushSwatch):
+                  self.lblSoft, self._label("Smooth"), self.smoothSlider, self.lblSmooth, self.snapCheck,
+                  self._label("Color"), self.brushSwatch):
             pb.addWidget(w)
         a.addWidget(self.paintBox)
         self.tolBox = QWidget()
@@ -1493,6 +1506,8 @@ class Card(QWidget):
         self.btnPaint.clicked.connect(lambda: self.choose_tool("paint"))
         self.opSlider.valueChanged.connect(self._sync_paint)
         self.softSlider.valueChanged.connect(self._sync_paint)
+        self.smoothSlider.valueChanged.connect(self._sync_paint)
+        self.snapCheck.toggled.connect(self._sync_paint)
         self.brushSwatch.clicked.connect(self._pick_fill)
         self.modeGroup.idClicked.connect(lambda i: self._set_sel_mode(("new", "add", "sub", "int")[i]))
         self.btnSelAll.clicked.connect(self.select_all)
@@ -2287,7 +2302,8 @@ class Card(QWidget):
         self.swatch.setStyleSheet("background: rgb(%d,%d,%d); border-radius: 7px; border: 1px solid #4a5268;" % (r, g, b))
         if hasattr(self, "brushSwatch"):                 # the Color Brush uses the same color
             self.brushSwatch.setStyleSheet("background: rgb(%d,%d,%d); border-radius: 5px; border: 1px solid #4a5268;" % (r, g, b))
-            self.canvas.set_paint(self.fill_rgb, self.opSlider.value() / 100.0)
+            self.canvas.set_paint(self.fill_rgb, self.opSlider.value() / 100.0,
+                                  self.smoothSlider.value(), self.snapCheck.isChecked())
         if hasattr(self, "edHex") and not self.edHex.hasFocus():
             self.edHex.setText("#%02X%02X%02X" % (r, g, b))
         if getattr(self, "_prefs_ready", False):
@@ -5729,7 +5745,9 @@ class Card(QWidget):
     def _sync_paint(self, *_):
         self.lblOp.setText("%d%%" % self.opSlider.value())
         self.lblSoft.setText("%d%%" % self.softSlider.value())
-        self.canvas.set_paint(self.fill_rgb, self.opSlider.value() / 100.0)
+        self.lblSmooth.setText("%d%%" % self.smoothSlider.value())
+        self.canvas.set_paint(self.fill_rgb, self.opSlider.value() / 100.0,
+                              self.smoothSlider.value(), self.snapCheck.isChecked())
 
     def _on_paint(self, pts):
         """A Color Brush stroke: paint it with the fill color - inside the selection only, or anywhere without one."""
