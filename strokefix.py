@@ -35,18 +35,28 @@ def smooth(pts, amount, step=2.0, scale=1.0):
     a = resample(pts, step * max(0.05, scale))
     if len(a) < 4:
         return [(float(p[0]), float(p[1])) for p in a]
-    sigma = max(0.01, amount / 100.0 * 10.0)               # in samples (1 sample = `step` px)
+    # in samples (1 sample = `step` px).  A fixed window only kills tiny jitter; the slow hand wobble of a long stroke
+    # is wider, so the window also grows with the stroke length (a short stroke keeps its detail).
+    sigma = max(0.01, amount / 100.0 * 10.0, amount / 100.0 * 0.09 * len(a))
+    sigma = min(sigma, amount / 100.0 * 16.0 + 0.01)
+    if len(a) >= 8:                                         # two passes = a really even curve, still no kinks
+        pass_n = 2
+        sigma /= math.sqrt(2.0)
+    else:
+        pass_n = 1
     half = int(math.ceil(sigma * 3))
     k = np.exp(-0.5 * (np.arange(-half, half + 1) / sigma) ** 2)
     k /= k.sum()
-    h = min(half, len(a) - 1)
-    head = 2 * a[0] - a[1:h + 1][::-1]                      # mirror around the end points so they do not shrink
-    tail = 2 * a[-1] - a[-h - 1:-1][::-1]
-    if h < half:                                            # very short stroke: pad by repeating the ends
-        head = np.vstack([np.repeat(a[:1], half - h, axis=0), head])
-        tail = np.vstack([tail, np.repeat(a[-1:], half - h, axis=0)])
-    ext = np.vstack([head, a, tail])
-    out = np.column_stack([np.convolve(ext[:, 0], k, mode="valid"), np.convolve(ext[:, 1], k, mode="valid")])
+    out = a
+    for _ in range(pass_n):
+        h = min(half, len(out) - 1)
+        head = 2 * out[0] - out[1:h + 1][::-1]              # mirror around the end points so they do not shrink
+        tail = 2 * out[-1] - out[-h - 1:-1][::-1]
+        if h < half:                                        # very short stroke: pad by repeating the ends
+            head = np.vstack([np.repeat(out[:1], half - h, axis=0), head])
+            tail = np.vstack([tail, np.repeat(out[-1:], half - h, axis=0)])
+        ext = np.vstack([head, out, tail])
+        out = np.column_stack([np.convolve(ext[:, 0], k, mode="valid"), np.convolve(ext[:, 1], k, mode="valid")])
     out[0], out[-1] = a[0], a[-1]
     return [(float(p[0]), float(p[1])) for p in out]
 
@@ -79,6 +89,37 @@ def _rdp(a, eps):
     return np.array([s, e])
 
 
+def _arc(a, tol):
+    """Open stroke that is close to ONE circular arc (a 'C' or a bow): returns clean arc points, else None."""
+    p0, p1 = a[0], a[-1]
+    chord = float(math.hypot(*(p1 - p0)))
+    if chord < 12:
+        return None
+    x, y = a[:, 0], a[:, 1]
+    A = np.column_stack([2 * x, 2 * y, np.ones(len(a))])    # least-squares circle fit
+    try:
+        sol = np.linalg.lstsq(A, x * x + y * y, rcond=None)[0]
+    except np.linalg.LinAlgError:
+        return None
+    c = sol[:2]
+    r2 = sol[2] + float(c @ c)
+    if r2 <= 0:
+        return None
+    r = math.sqrt(r2)
+    if r > 4.0 * chord:                                     # almost straight and not a line: leave to smoothing
+        return None
+    err = float(np.mean(np.abs(np.hypot(*(a - c).T) - r))) / r
+    if err > 0.035 * tol:
+        return None
+    a0 = math.atan2(p0[1] - c[1], p0[0] - c[0])
+    ang = np.unwrap(np.arctan2(a[:, 1] - c[1], a[:, 0] - c[0]))
+    sweep = float(ang[-1] - ang[0])
+    if abs(sweep) > 1.6 * math.pi or abs(sweep) < 0.25:
+        return None
+    t = a0 + np.linspace(0.0, sweep, 64)
+    return [(float(c[0] + r * math.cos(u)), float(c[1] + r * math.sin(u))) for u in t]
+
+
 def snap(pts, tol=1.0):
     """If the stroke is close to a line / circle / ellipse / triangle / rectangle, returns (kind, clean_points).
     Otherwise None.  tol scales how forgiving it is (1.0 = normal)."""
@@ -104,8 +145,11 @@ def snap(pts, tol=1.0):
         if l < 10:
             return None
         dev = np.abs(se[0] * (a[:, 1] - a[0, 1]) - se[1] * (a[:, 0] - a[0, 0])) / l
-        if float(dev.max()) / l < 0.055 * tol and length / l < 1.12:
+        if float(dev.max()) / l < 0.07 * tol and length / l < 1.15:
             return "line", [(float(a[0, 0]), float(a[0, 1])), (float(a[-1, 0]), float(a[-1, 1]))]
+        arc = _arc(a, tol)                                  # a wobbly curve that is really one even arc
+        if arc is not None:
+            return "arc", arc
         return None
 
     # ---- closed shapes.  Close the loop first.
@@ -122,7 +166,7 @@ def snap(pts, tol=1.0):
     if ra > 3 and rb > 3:
         q = (uv - cu) / np.array([ra, rb])
         err = float(np.mean(np.abs(np.hypot(q[:, 0], q[:, 1]) - 1.0)))
-        if err < 0.09 * tol:
+        if err < 0.11 * tol:
             if min(ra, rb) / max(ra, rb) > 0.86:            # nearly round -> a real circle
                 r = (ra + rb) / 2.0
                 ra = rb = r
