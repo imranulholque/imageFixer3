@@ -715,6 +715,7 @@ def side_sync():
 
 
 EYE_ROLE = Qt.ItemDataRole.UserRole + 1
+MAIN_ROW = -1                                   # id of the fixed "Main page" row at the bottom of the layers list
 EYE_W = 40
 
 
@@ -728,6 +729,8 @@ class _EyeDelegate(QStyledItemDelegate):
 
     def paint(self, p, opt, idx):
         super().paint(p, opt, idx)
+        if idx.data(Qt.ItemDataRole.UserRole) == MAIN_ROW:
+            return                                          # the page itself cannot be hidden
         shown = bool(idx.data(EYE_ROLE))
         r = eye_rect(opt.rect)
         c = r.center()
@@ -777,7 +780,7 @@ class LayerList(QListWidget):
 
     def _eye_hit(self, e):
         it = self.itemAt(e.position().toPoint())
-        if it is not None and eye_rect(self.visualItemRect(it)).contains(e.position().toPoint()):
+        if it is not None and it.data(Qt.ItemDataRole.UserRole) != MAIN_ROW and eye_rect(self.visualItemRect(it)).contains(e.position().toPoint()):
             return it
         return None
 
@@ -2047,6 +2050,7 @@ class Card(QWidget):
         self.btnMainPic = QPushButton("\u25bc  Main picture  (always at the bottom) - click to work on it")
         self.btnMainPic.setToolTip("Go back to the whole page: all tools work on the main picture again")
         self.btnMainPic.clicked.connect(self._select_main)
+        self.btnMainPic.setVisible(False)                          # replaced by the "Main page" row in the list
         gl.addWidget(self.btnMainPic)
         lrow = QHBoxLayout()
         lrow.setSpacing(4)
@@ -2090,7 +2094,7 @@ class Card(QWidget):
         self.layerList.itemClicked.connect(self._layer_list_clicked)
         self.layerList.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.layerList.customContextMenuRequested.connect(self._layer_list_menu)
-        self.layerList.itemDoubleClicked.connect(lambda it: QTimer.singleShot(0, lambda: self.edit_layer(it.data(Qt.ItemDataRole.UserRole))))
+        self.layerList.itemDoubleClicked.connect(lambda it: it.data(Qt.ItemDataRole.UserRole) != MAIN_ROW and QTimer.singleShot(0, lambda: self.edit_layer(it.data(Qt.ItemDataRole.UserRole))))
         self.layerList.eyeClicked.connect(self._layer_eye_clicked)
         self.layerList.reordered.connect(self._layer_list_reordered)
         lay.addWidget(g)
@@ -3898,7 +3902,10 @@ class Card(QWidget):
         """The 'Main picture' button: leave the layer, all tools work on the page again."""
         def done():
             self.sel_layer = None
+            self.sel_group = set()
+            self.sel_main = False
             self._refresh_layers_ui()
+            self.message.emit("Working on the main page. Every tool changes the page now.")
         if self._tool == "transform" and self._place_id is not None:
             self._end_layer_session()
         self.leave_layer(done)
@@ -4403,6 +4410,8 @@ class Card(QWidget):
         if it is None:
             return
         lid = it.data(Qt.ItemDataRole.UserRole)
+        if lid == MAIN_ROW:
+            return
         self.sel_layer = lid
         self._layer_menu(lid, self.layerList.viewport().mapToGlobal(pos))
 
@@ -4913,6 +4922,23 @@ class Card(QWidget):
         self._icon_cache[key] = (l["rgb"], l["a"], icon)
         return icon
 
+    _page_icon_key = None
+    _page_icon_val = None
+
+    def _page_row_icon(self):
+        """Small picture of the page for the 'Main page' row (while a layer is open the last page picture is kept)."""
+        try:
+            if self.ctx is None and self.prev is not None and self._page_icon_key != id(self.prev):
+                im = Image.fromarray(np.ascontiguousarray(self.prev)).convert("RGB")
+                im.thumbnail((80, 80))
+                arr = np.ascontiguousarray(np.asarray(im.convert("RGBA")))
+                qi = QImage(arr.data, arr.shape[1], arr.shape[0], arr.shape[1] * 4, QImage.Format.Format_RGBA8888).copy()
+                self._page_icon_val = QIcon(QPixmap.fromImage(qi))
+                self._page_icon_key = id(self.prev)
+        except Exception:
+            _log("page row icon")
+        return self._page_icon_val if self._page_icon_val is not None else QIcon()
+
     def _fill_layer_list(self):
         lw = self.layerList
         lw.blockSignals(True)
@@ -4935,8 +4961,17 @@ class Card(QWidget):
             if l["id"] in self.sel_group:
                 it.setSelected(True)
         self._icon_cache = keep
+        main_on = self.ctx is None and (self.sel_layer is None or self._layer(self.sel_layer) is None)
+        mit = QListWidgetItem(self._page_row_icon(), "Main page" + ("   \u2714 working here" if main_on else ""))
+        mit.setData(Qt.ItemDataRole.UserRole, MAIN_ROW)
+        mit.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)          # not draggable: always at the bottom
+        mit.setToolTip("The page itself (always at the bottom).  Click = deselect every layer, all tools work on the page.")
+        lw.addItem(mit)
         if self.sel_layer is None or self._layer(self.sel_layer) is None:
             lw.clearSelection()
+            if main_on:
+                lw.setCurrentItem(mit)
+                mit.setSelected(True)
         lw.setEnabled(True)
         lw.blockSignals(False)
         l = None if self.sel_layer is None else self._layer(self.sel_layer)
@@ -4959,8 +4994,11 @@ class Card(QWidget):
             self._skip_click = False
             return
         lid = it.data(Qt.ItemDataRole.UserRole)
+        if lid == MAIN_ROW:
+            self._select_main()                                   # Main page row: every layer is deselected, tools work on the page
+            return
         if QApplication.keyboardModifiers() & Qt.KeyboardModifier.ControlModifier:
-            ids = {x.data(Qt.ItemDataRole.UserRole) for x in self.layerList.selectedItems()}
+            ids = {x.data(Qt.ItemDataRole.UserRole) for x in self.layerList.selectedItems()} - {MAIN_ROW}
             self.sel_group = ids if len(ids) > 1 else set()
             n = len(self.sel_group)
             self.message.emit("%d layers selected: every change goes to all of them." % n if n > 1
@@ -5007,6 +5045,7 @@ class Card(QWidget):
     def _layer_list_reordered(self):
         lw = self.layerList
         ids = [lw.item(i).data(Qt.ItemDataRole.UserRole) for i in range(lw.count())]       # top first
+        ids = [i for i in ids if i != MAIN_ROW]                                           # the Main page row is not a layer
         by = {l["id"]: l for l in self.layers}
         new = [by[i] for i in reversed(ids) if i in by]
         if len(new) == len(self.layers) and [l["id"] for l in new] != [l["id"] for l in self.layers]:
@@ -5491,6 +5530,15 @@ class Card(QWidget):
         if kind == "brush":
             self._set_selection(core.shape_mask((W, H), "brush", data, size_prev), mode)
             return
+        if kind == "color" and self.ctx is not None:
+            al = self._alpha_prev()
+            try:
+                if al is not None and al[min(max(int(data[1]), 0), H - 1), min(max(int(data[0]), 0), W - 1)] < 0.05:
+                    self.message.emit("That part of the picture is see-through, nothing to select. To work on the page click "
+                                      "'Main page' (bottom of the Layers list).")
+                    return
+            except Exception:
+                _log("color range transparent click")
         if kind == "color":
             self.canvas.fx.ring("select", data[0], data[1])
         tol = float(self._tolv)
