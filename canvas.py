@@ -92,6 +92,12 @@ class ImageCanvas(QWidget):
         self.paint_rgb = (255, 0, 0)          # colour brush: colour and opacity (only for the live preview of the stroke)
         self.paint_opacity = 1.0
         self.paint_smooth = 50                # 0..100: how much the stroke is smoothed
+        self._hold_timer = QTimer(self)               # Color Brush: mouse held still 3 s -> show the cleaned result
+        self._hold_timer.setSingleShot(True)
+        self._hold_timer.setInterval(3000)
+        self._hold_timer.timeout.connect(self._hold_fire)
+        self._hold_pts = None                 # the cleaned stroke shown after the hold (None = not yet)
+        self._hold_anchor = None
         self.paint_snap = True                # a stroke close to a line / circle / triangle / rectangle becomes that shape
         self.clone_delta = None               # QPointF, offset source - destination
         self._msg = "Loading..."
@@ -1267,13 +1273,23 @@ class ImageCanvas(QWidget):
             p.setPen(QPen(QColor(255, 255, 255), 1.4))
             p.drawEllipse(self._hover, r, r)
 
+    def _hold_fire(self):
+        """The mouse has been still for 3 s with the button down: show what the stroke will become (snapped shape or smooth)."""
+        er = self._erase
+        if er is None or er["kind"] != "paint" or self.mode != self.PAINT or len(er["pts"]) < 2:
+            return
+        raw = [(q.x(), q.y()) for q in er["pts"]]
+        self._hold_pts = strokefix.clean(raw, self.paint_smooth, self.paint_snap, scale=1.0 / self.zoom)
+        self.update()
+
     def _paint_colorbrush(self, p):
         """Colour brush: the stroke is shown in the real colour while drawing, plus the size circle under the mouse."""
         z = self.zoom
         er = self._erase
         if er is not None and er["kind"] == "paint":
             raw = [(q.x(), q.y()) for q in er["pts"]]
-            pts = [self.to_wid(QPointF(x, y)) for x, y in strokefix.smooth(raw, self.paint_smooth)]   # live preview is smoothed too
+            shown = self._hold_pts if self._hold_pts is not None else strokefix.smooth(raw, self.paint_smooth, scale=1.0 / self.zoom)
+            pts = [self.to_wid(QPointF(x, y)) for x, y in shown]        # live preview is smoothed too (after 3 s still: the final shape)
             col = QColor(*self.paint_rgb)
             col.setAlphaF(self.paint_opacity)
             w = max(1.0, self.brush_prev * z)
@@ -1594,6 +1610,9 @@ class ImageCanvas(QWidget):
                 self.update()
         elif self.mode == self.PAINT:
             self._erase = {"kind": "paint", "pts": [self._inside(ip)]}
+            self._hold_pts = None
+            self._hold_anchor = pos
+            self._hold_timer.start()
             self.update()
         elif self.mode == self.MOVESEL:
             self._start_float(ip, bool(e.modifiers() & Qt.KeyboardModifier.AltModifier) or self.copy_mode)
@@ -1684,6 +1703,14 @@ class ImageCanvas(QWidget):
             return
         if self._drag_to(pos):
             return
+        if self._erase is not None and self._erase["kind"] == "paint" and self._hold_anchor is not None:
+            if math.hypot(pos.x() - self._hold_anchor.x(), pos.y() - self._hold_anchor.y()) <= 6.0:
+                if self._hold_pts is not None:          # result is showing and the hand only trembles: keep it steady
+                    return
+            else:                                       # really moving again: draw on, wait for the next 3 s stop
+                self._hold_anchor = pos
+                self._hold_pts = None
+                self._hold_timer.start()
         if self._erase is not None:
             ip = self._inside(self.to_img(pos))
             pts = self._erase["pts"]
@@ -1753,10 +1780,13 @@ class ImageCanvas(QWidget):
             self._pan_last = None
             return
         er, self._erase = self._erase, None
+        self._hold_timer.stop()
         if er is not None and self.mode == self.PAINT:
             if e.button() == Qt.MouseButton.LeftButton and er["kind"] == "paint":
                 raw = [(q.x(), q.y()) for q in er["pts"]]
-                self.paintFinished.emit(strokefix.clean(raw, self.paint_smooth, self.paint_snap))
+                self.paintFinished.emit(self._hold_pts if self._hold_pts is not None else
+                                        strokefix.clean(raw, self.paint_smooth, self.paint_snap, scale=1.0 / self.zoom))
+            self._hold_pts = None
             self.update()
             er = None
         if er is not None and self.mode == self.SELECT and e.button() == Qt.MouseButton.LeftButton:

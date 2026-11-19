@@ -26,11 +26,13 @@ def resample(pts, step):
     return np.column_stack([np.interp(t, d, a[:, 0]), np.interp(t, d, a[:, 1])])
 
 
-def smooth(pts, amount, step=2.0):
-    """amount 0..100.  0 = unchanged, 100 = very smooth.  The ends stay where the mouse started / stopped."""
+def smooth(pts, amount, step=2.0, scale=1.0):
+    """amount 0..100.  0 = unchanged, 100 = very smooth.  The ends stay where the mouse started / stopped.
+    scale = picture pixels per SCREEN pixel (1 / zoom): the smoothing is measured on the screen, so it looks the
+    same whether the picture is zoomed in or out (before, zoomed-out pictures got almost no smoothing)."""
     if len(pts) < 3 or amount <= 0:
         return [(float(x), float(y)) for x, y in pts]
-    a = resample(pts, step)
+    a = resample(pts, step * max(0.05, scale))
     if len(a) < 4:
         return [(float(p[0]), float(p[1])) for p in a]
     sigma = max(0.01, amount / 100.0 * 10.0)               # in samples (1 sample = `step` px)
@@ -170,10 +172,10 @@ def snap(pts, tol=1.0):
     return best[1], best[2]
 
 
-def clean(pts, smooth_amount=50, snap_on=True, tol=1.0):
+def clean(pts, smooth_amount=50, snap_on=True, tol=1.0, scale=1.0):
     """What the Color Brush should draw for the raw mouse points."""
     if snap_on:
         s = snap(pts, tol)
         if s is not None:
             return s[1]
-    return smooth(pts, smooth_amount)
+    return smooth(pts, smooth_amount, scale=scale)
