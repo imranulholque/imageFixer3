@@ -92,9 +92,9 @@ class ImageCanvas(QWidget):
         self.paint_rgb = (255, 0, 0)          # colour brush: colour and opacity (only for the live preview of the stroke)
         self.paint_opacity = 1.0
         self.paint_smooth = 50                # 0..100: how much the stroke is smoothed
-        self._hold_timer = QTimer(self)               # Color Brush: mouse held still 3 s -> show the cleaned result
+        self._hold_timer = QTimer(self)               # Color Brush: mouse held still 1 s -> show the cleaned result
         self._hold_timer.setSingleShot(True)
-        self._hold_timer.setInterval(3000)
+        self._hold_timer.setInterval(1000)
         self._hold_timer.timeout.connect(self._hold_fire)
         self._hold_pts = None                 # the cleaned stroke shown after the hold (None = not yet)
         self._hold_anchor = None
@@ -1274,7 +1274,7 @@ class ImageCanvas(QWidget):
             p.drawEllipse(self._hover, r, r)
 
     def _hold_fire(self):
-        """The mouse has been still for 3 s with the button down: show what the stroke will become (snapped shape or smooth)."""
+        """The mouse has been still for 1 s with the button down: show what the stroke will become (snapped shape or smooth)."""
         er = self._erase
         if er is None or er["kind"] != "paint" or self.mode != self.PAINT or len(er["pts"]) < 2:
             return
@@ -1289,7 +1289,7 @@ class ImageCanvas(QWidget):
         if er is not None and er["kind"] == "paint":
             raw = [(q.x(), q.y()) for q in er["pts"]]
             shown = self._hold_pts if self._hold_pts is not None else strokefix.smooth(raw, self.paint_smooth, scale=1.0 / self.zoom)
-            pts = [self.to_wid(QPointF(x, y)) for x, y in shown]        # live preview is smoothed too (after 3 s still: the final shape)
+            pts = [self.to_wid(QPointF(x, y)) for x, y in shown]        # live preview is smoothed too (after 1 s still: the final shape)
             col = QColor(*self.paint_rgb)
             col.setAlphaF(self.paint_opacity)
             w = max(1.0, self.brush_prev * z)
@@ -1707,7 +1707,7 @@ class ImageCanvas(QWidget):
             if math.hypot(pos.x() - self._hold_anchor.x(), pos.y() - self._hold_anchor.y()) <= 6.0:
                 if self._hold_pts is not None:          # result is showing and the hand only trembles: keep it steady
                     return
-            else:                                       # really moving again: draw on, wait for the next 3 s stop
+            else:                                       # really moving again: draw on, wait for the next 1 s stop
                 self._hold_anchor = pos
                 self._hold_pts = None
                 self._hold_timer.start()
