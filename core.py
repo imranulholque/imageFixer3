@@ -232,9 +232,14 @@ def adj_mask(lab, a):
         Ct = math.hypot(t[1], t[2])
         if Ct >= 22.0:
             return color_match(lab, t, a["tol"])
-        dL = (lab[..., 0] - t[0]) * 0.8
-        da = lab[..., 1] - t[1]
-        db = lab[..., 2] - t[2]
+        if a.get("pale", False) and Ct >= 6.0:                       # a pale tint (skin, cream, pastel): its colour counts, not only its lightness
+            dL = (lab[..., 0] - t[0]) * 0.5
+            da = (lab[..., 1] - t[1]) * 2.6
+            db = (lab[..., 2] - t[2]) * 2.6
+        else:
+            dL = (lab[..., 0] - t[0]) * 0.8
+            da = lab[..., 1] - t[1]
+            db = lab[..., 2] - t[2]
         d = np.sqrt(dL * dL + da * da + db * db)
         inner, outer = a["tol"] * 0.7, a["tol"] * 1.3
         return (1.0 - _smooth((d - inner) / (outer - inner))).astype(np.float32)
@@ -750,7 +755,7 @@ def apply_shadow_manual(x, g, l):
         x = np.minimum(x * (255.0 / (255.0 - wh * 0.9)), 255.0)
     bl = l.get("black", 0)
     if bl:
-        bp = bl * 0.6
+        bp = bl * 0.5
         x = np.clip((x - bp) * (255.0 / (255.0 - bp)), 0.0, 255.0)
     return x
 
@@ -1783,18 +1788,21 @@ def color_range_mask(lab, rgb, tol=30.0):
     """Every pixel whose colour matches rgb (like Photoshop's Color Range). Coloured targets match by hue + colour
     strength (so a dark pixel with a faint tint is not taken); white / grey / black match by lightness."""
     pt = rgb_to_lab(np.array([[list(rgb)]], dtype=np.uint8))[0, 0]
-    return adj_mask(lab, {"type": "color", "target": [float(pt[0]), float(pt[1]), float(pt[2])], "tol": float(tol)})
+    return adj_mask(lab, {"type": "color", "target": [float(pt[0]), float(pt[1]), float(pt[2])], "tol": float(tol),
+                          "pale": True})
 
 
 def fuzz_to_tol(fuzz):
     """Photoshop-like 'Fuzziness' 0..200 -> the colour distance used by color_range_mask."""
-    return 6.0 + float(fuzz) * 0.5          # never 0: a click always selects at least the colours that look the same
+    return 5.0 + float(fuzz) * 0.4          # never 0: a click always selects at least the colours that look the same
 
 
-def color_range_fuzzy(lab, rgb, fuzz=50, center=None, local=0.0):
+def color_range_fuzzy(lab, rgb, fuzz=30, center=None, local=0.0, alpha=None):
     """Color range with a fuzziness slider (0..200).  local > 0 (fraction of the picture's long side): only around 'center'
     (x, y) - 'localized color clusters', so the same colour far away is not taken."""
     m = color_range_mask(lab, rgb, fuzz_to_tol(fuzz))
+    if alpha is not None and alpha.shape == m.shape:      # inside a picture layer: its transparent part is never selected
+        m = m * np.clip(alpha, 0.0, 1.0).astype(np.float32)
     if center is not None and local > 0:
         H, W = m.shape
         R = max(8.0, local * max(H, W))

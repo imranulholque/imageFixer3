@@ -1410,7 +1410,7 @@ class Card(QWidget):
         self.lblTol = self._label("Tolerance")
         self.lblTolV = self._label("28")
         self.lblTolV.setMinimumWidth(30)
-        self._tolv, self._fuzz = 28, 50                  # tolerance (quick / deselect) and fuzziness (color range) are kept apart
+        self._tolv, self._fuzz = 28, 30                  # tolerance (quick / deselect) and fuzziness (color range) are kept apart
         self.chkLocal = QCheckBox("Near the click")
         self.chkLocal.setToolTip("Color range: only the colors around the place you click (not the same color far away)")
         self.localSlider = NoWheelSlider(Qt.Orientation.Horizontal)
@@ -2371,6 +2371,25 @@ class Card(QWidget):
         else:
             self._tolv = v
 
+    def _alpha_prev(self):
+        """Inside a picture layer: its transparency at preview size (float 0..1), so Color range never selects the see-through part."""
+        a = self.alpha
+        if self.ctx is None or a is None or self.prev is None:
+            return None
+        try:
+            H, W = self.prev.shape[:2]
+            arr = np.asarray(a, dtype=np.float32)
+            if arr.ndim == 3:
+                arr = arr[..., -1]
+            if arr.max() > 1.5:
+                arr = arr / 255.0
+            if arr.shape != (H, W):
+                arr = np.asarray(Image.fromarray(np.clip(arr * 255.0 + 0.5, 0, 255).astype(np.uint8)).resize(
+                    (W, H), Image.Resampling.BILINEAR), dtype=np.float32) / 255.0
+            return arr
+        except Exception:
+            return None
+
     def _recompute_color_range(self):
         """Fuzziness / 'near the click' changed after a click: the same selection, redone (no new undo step)."""
         on = self._tool == "color" and self.chkLocal.isChecked()
@@ -2386,9 +2405,10 @@ class Card(QWidget):
         fuzz, local = self._fuzz, (self.localSlider.value() / 100.0 if self.chkLocal.isChecked() else 0.0)
         token = cr["token"] = cr.get("token", 0) + 1
         rgb, center, base, mode = cr["rgb"], cr["center"], cr["base"], cr["mode"]
+        alpha = self._alpha_prev()
 
         def work(progress):
-            return core.color_range_fuzzy(lab, rgb, fuzz, center, local)
+            return core.color_range_fuzzy(lab, rgb, fuzz, center, local, alpha)
 
         def done(mask):
             if self._dead or cr.get("token") != token or self._cr is not cr or self.sel is not cr["sel"]:
@@ -5478,6 +5498,7 @@ class Card(QWidget):
         fuzz = self._fuzz
         local = self.localSlider.value() / 100.0 if self.chkLocal.isChecked() else 0.0
         base_sel = self.sel
+        alpha = self._alpha_prev() if kind == "color" else None
 
         def work(progress):
             lab = self._lab if self._lab is not None else core.rgb_to_lab(prev)
@@ -5487,7 +5508,7 @@ class Card(QWidget):
                 x, y = min(max(x, 0), W - 1), min(max(y, 0), H - 1)
                 patch = prev[max(0, y - 1):y + 2, max(0, x - 1):x + 2].reshape(-1, 3).mean(0)
                 rgb = tuple(int(round(float(v))) for v in patch)
-                mask = core.color_range_fuzzy(lab, rgb, fuzz, (x, y), local)
+                mask = core.color_range_fuzzy(lab, rgb, fuzz, (x, y), local, alpha)
                 info = (rgb, (x, y))
             else:
                 stroke = core.shape_mask((W, H), "brush", data, size_prev)
