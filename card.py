@@ -1788,6 +1788,12 @@ class Card(QWidget):
         self.fillOpacity = SliderRow("Fill opacity", 1, 100, 100, ("faint", "", "solid"),
                                      "How strongly the color covers: 100% = solid, less = see-through.", "%")
         gl2.addWidget(self.fillOpacity)
+        self.chkFillPrev = QCheckBox("Live preview on the picture")
+        self.chkFillPrev.setChecked(True)
+        self.chkFillPrev.setToolTip("Shows the fill (color + opacity) over the selection while you change it. "
+                                    "Nothing is changed until you press 'Fill selection'.")
+        gl2.addWidget(self.chkFillPrev)
+        self._fill_armed = True
         self.btnFill = QPushButton("Fill selection with this color")
         self.btnDelete = QPushButton("Delete selection  (Del)")
         self.btnDelete.setToolTip("Remove what is selected; the place is filled from its surroundings")
@@ -1804,6 +1810,9 @@ class Card(QWidget):
         lay.addStretch(1)
         self.stackPages.addWidget(pg)
         self.btnFill.clicked.connect(self.fill_selection)
+        self.fillOpacity.changed.connect(lambda _v=0: self._fill_prev_changed())
+        self.chkFillPrev.toggled.connect(lambda _on=False: self._fill_prev_changed())
+        self.stackPages.currentChanged.connect(lambda _i=0: self._update_fill_preview())
         self.btnDelete.clicked.connect(self.delete_selection)
         self.btnRemoveStamp.clicked.connect(self.delete_selection)
         self.swatch.clicked.connect(self._pick_fill)
@@ -2312,6 +2321,27 @@ class Card(QWidget):
             self.edHex.setText("#%02X%02X%02X" % (r, g, b))
         if getattr(self, "_prefs_ready", False):
             self._save_fill_pref()
+        self._fill_prev_changed()
+
+    def _fill_prev_changed(self):
+        """Colour / opacity / switch changed: the preview is live again (it is off right after a fill was made)."""
+        self._fill_armed = True
+        self._update_fill_preview()
+
+    def _update_fill_preview(self):
+        """The Color tab shows what 'Fill selection' will do, over the selection, before it is pressed."""
+        if not hasattr(self, "chkFillPrev") or not hasattr(self, "canvas"):
+            return
+        on = (getattr(self, "_loaded", False) and self._fill_armed and self.chkFillPrev.isChecked()
+              and self.sel is not None and self.stackPages.currentIndex() == self.TAB_COLOR)
+        if on:
+            self.canvas.set_fill_preview(self.fill_rgb, self.fillOpacity.value() / 100.0)
+        else:
+            self.canvas.set_fill_preview(None, 1.0)
+
+    def _fill_applied(self):
+        self._fill_armed = False                      # the fill is in the picture now: no second layer of the same colour on top
+        self._update_fill_preview()
 
     def _set_fill(self, rgb):
         self.fill_rgb = tuple(int(v) for v in rgb)
@@ -5336,6 +5366,7 @@ class Card(QWidget):
     def _sel_changed(self):
         self._sel_ver += 1
         self.canvas.set_selection(self.sel)
+        self._fill_prev_changed()
         self._update_ring()
         self._hl_key = None
         self._sel_label()
@@ -5673,7 +5704,7 @@ class Card(QWidget):
             if fop < 0.999:
                 m = m.point(lambda v, f=fop: int(v * f + 0.5))
             return ImageChops.lighter(alpha, m)
-        self._edit_base("Filling", make, alpha_make=alpha_fill if alpha is not None else None)
+        self._edit_base("Filling", make, alpha_make=alpha_fill if alpha is not None else None, after=self._fill_applied)
 
     # ---------------------------------------------------------------- tools
     def choose_tool(self, key):

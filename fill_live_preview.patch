@@ -1,0 +1,124 @@
+--- a/card.py	2026-11-19 22:46:23.504189877 +0600
++++ b/card.py	2026-11-19 22:46:23.580839563 +0600
+@@ -1788,6 +1788,12 @@
+         self.fillOpacity = SliderRow("Fill opacity", 1, 100, 100, ("faint", "", "solid"),
+                                      "How strongly the color covers: 100% = solid, less = see-through.", "%")
+         gl2.addWidget(self.fillOpacity)
++        self.chkFillPrev = QCheckBox("Live preview on the picture")
++        self.chkFillPrev.setChecked(True)
++        self.chkFillPrev.setToolTip("Shows the fill (color + opacity) over the selection while you change it. "
++                                    "Nothing is changed until you press 'Fill selection'.")
++        gl2.addWidget(self.chkFillPrev)
++        self._fill_armed = True
+         self.btnFill = QPushButton("Fill selection with this color")
+         self.btnDelete = QPushButton("Delete selection  (Del)")
+         self.btnDelete.setToolTip("Remove what is selected; the place is filled from its surroundings")
+@@ -1804,6 +1810,9 @@
+         lay.addStretch(1)
+         self.stackPages.addWidget(pg)
+         self.btnFill.clicked.connect(self.fill_selection)
++        self.fillOpacity.changed.connect(lambda _v=0: self._fill_prev_changed())
++        self.chkFillPrev.toggled.connect(lambda _on=False: self._fill_prev_changed())
++        self.stackPages.currentChanged.connect(lambda _i=0: self._update_fill_preview())
+         self.btnDelete.clicked.connect(self.delete_selection)
+         self.btnRemoveStamp.clicked.connect(self.delete_selection)
+         self.swatch.clicked.connect(self._pick_fill)
+@@ -2312,6 +2321,27 @@
+             self.edHex.setText("#%02X%02X%02X" % (r, g, b))
+         if getattr(self, "_prefs_ready", False):
+             self._save_fill_pref()
++        self._fill_prev_changed()
++
++    def _fill_prev_changed(self):
++        """Colour / opacity / switch changed: the preview is live again (it is off right after a fill was made)."""
++        self._fill_armed = True
++        self._update_fill_preview()
++
++    def _update_fill_preview(self):
++        """The Color tab shows what 'Fill selection' will do, over the selection, before it is pressed."""
++        if not hasattr(self, "chkFillPrev") or not hasattr(self, "canvas"):
++            return
++        on = (getattr(self, "_loaded", False) and self._fill_armed and self.chkFillPrev.isChecked()
++              and self.sel is not None and self.stackPages.currentIndex() == self.TAB_COLOR)
++        if on:
++            self.canvas.set_fill_preview(self.fill_rgb, self.fillOpacity.value() / 100.0)
++        else:
++            self.canvas.set_fill_preview(None, 1.0)
++
++    def _fill_applied(self):
++        self._fill_armed = False                      # the fill is in the picture now: no second layer of the same colour on top
++        self._update_fill_preview()
+ 
+     def _set_fill(self, rgb):
+         self.fill_rgb = tuple(int(v) for v in rgb)
+@@ -5336,6 +5366,7 @@
+     def _sel_changed(self):
+         self._sel_ver += 1
+         self.canvas.set_selection(self.sel)
++        self._fill_prev_changed()
+         self._update_ring()
+         self._hl_key = None
+         self._sel_label()
+@@ -5673,7 +5704,7 @@
+             if fop < 0.999:
+                 m = m.point(lambda v, f=fop: int(v * f + 0.5))
+             return ImageChops.lighter(alpha, m)
+-        self._edit_base("Filling", make, alpha_make=alpha_fill if alpha is not None else None)
++        self._edit_base("Filling", make, alpha_make=alpha_fill if alpha is not None else None, after=self._fill_applied)
+ 
+     # ---------------------------------------------------------------- tools
+     def choose_tool(self, key):
+--- a/canvas.py	2026-11-19 22:46:23.501860139 +0600
++++ b/canvas.py	2026-11-19 22:46:23.576711731 +0600
+@@ -107,6 +107,8 @@
+         self.sel_visible = True
+         self.sel_preview = False              # Color range preview: the selection shown as a white (selected) / black picture
+         self._pv = None                       # (mask version, QImage) cache of that preview
++        self._fillprev = None                 # Color tab: (rgb, opacity) = live preview of 'Fill selection', None = off
++        self._fp_cache = None                 # (key, buffer, QImage) of that preview
+         self._ring = None                     # Color range 'Near the click': (x, y, radius) in picture pixels, drawn as a circle
+         self.select_shape = "quick"
+         self.copy_mode = False
+@@ -198,6 +200,26 @@
+         self.sel_preview = bool(on)
+         self.update()
+ 
++    def set_fill_preview(self, rgb, opacity):
++        """Shows what 'Fill selection' would do (colour + opacity) over the selection, live.  rgb None = off."""
++        new = None if rgb is None else (tuple(int(v) for v in rgb), max(0.0, min(1.0, float(opacity))))
++        if new != self._fillprev:
++            self._fillprev = new
++            self.update()
++
++    def _fill_preview_image(self):
++        fp, m = self._fillprev, self._masks["sel"]
++        if fp is None or m is None or m.shape[0] != self._ih or m.shape[1] != self._iw:
++            return None
++        key = (self._mver["sel"], self._iw, self._ih, fp)
++        if self._fp_cache is None or self._fp_cache[0] != key:
++            buf = np.empty((m.shape[0], m.shape[1], 4), dtype=np.uint8)
++            buf[..., 0], buf[..., 1], buf[..., 2] = fp[0]
++            buf[..., 3] = np.clip(m * (fp[1] * 255.0) + 0.5, 0, 255).astype(np.uint8)
++            q = QImage(buf.data, buf.shape[1], buf.shape[0], buf.shape[1] * 4, QImage.Format.Format_RGBA8888)
++            self._fp_cache = (key, buf, q)           # buf must live as long as q
++        return self._fp_cache[2]
++
+     def _preview_image(self):
+         """The selection as a grey picture: white = selected, black = not, grey = partly.  None if there is no selection."""
+         m = self._masks["sel"]
+@@ -1046,6 +1068,15 @@
+             p.scale(self.zoom, self.zoom)
+             p.drawImage(0, 0, pv)
+             p.restore()
++        fpi = self._fill_preview_image() if (pv is None and self._float is None) else None
++        if fpi is not None:                                 # live preview of the fill (colour + opacity) over the selection
++            p.save()
++            p.translate(self.off)
++            p.scale(self.zoom, self.zoom)
++            if self._selmove is not None:                   # the outline is being dragged: the colour goes with it
++                p.translate(self._selmove["d"][0], self._selmove["d"][1])
++            p.drawImage(0, 0, fpi)
++            p.restore()
+         if self._float is not None:
+             self._paint_float(p)
+         if pv is None and self.sel_visible and self.mode not in (self.CROP, self.PERSP, self.TRANSFORM):

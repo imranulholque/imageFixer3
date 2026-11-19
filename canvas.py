@@ -107,6 +107,8 @@ class ImageCanvas(QWidget):
         self.sel_visible = True
         self.sel_preview = False              # Color range preview: the selection shown as a white (selected) / black picture
         self._pv = None                       # (mask version, QImage) cache of that preview
+        self._fillprev = None                 # Color tab: (rgb, opacity) = live preview of 'Fill selection', None = off
+        self._fp_cache = None                 # (key, buffer, QImage) of that preview
         self._ring = None                     # Color range 'Near the click': (x, y, radius) in picture pixels, drawn as a circle
         self.select_shape = "quick"
         self.copy_mode = False
@@ -197,6 +199,26 @@ class ImageCanvas(QWidget):
     def set_sel_preview(self, on):
         self.sel_preview = bool(on)
         self.update()
+
+    def set_fill_preview(self, rgb, opacity):
+        """Shows what 'Fill selection' would do (colour + opacity) over the selection, live.  rgb None = off."""
+        new = None if rgb is None else (tuple(int(v) for v in rgb), max(0.0, min(1.0, float(opacity))))
+        if new != self._fillprev:
+            self._fillprev = new
+            self.update()
+
+    def _fill_preview_image(self):
+        fp, m = self._fillprev, self._masks["sel"]
+        if fp is None or m is None or m.shape[0] != self._ih or m.shape[1] != self._iw:
+            return None
+        key = (self._mver["sel"], self._iw, self._ih, fp)
+        if self._fp_cache is None or self._fp_cache[0] != key:
+            buf = np.empty((m.shape[0], m.shape[1], 4), dtype=np.uint8)
+            buf[..., 0], buf[..., 1], buf[..., 2] = fp[0]
+            buf[..., 3] = np.clip(m * (fp[1] * 255.0) + 0.5, 0, 255).astype(np.uint8)
+            q = QImage(buf.data, buf.shape[1], buf.shape[0], buf.shape[1] * 4, QImage.Format.Format_RGBA8888)
+            self._fp_cache = (key, buf, q)           # buf must live as long as q
+        return self._fp_cache[2]
 
     def _preview_image(self):
         """The selection as a grey picture: white = selected, black = not, grey = partly.  None if there is no selection."""
@@ -1045,6 +1067,15 @@ class ImageCanvas(QWidget):
             p.translate(self.off)
             p.scale(self.zoom, self.zoom)
             p.drawImage(0, 0, pv)
+            p.restore()
+        fpi = self._fill_preview_image() if (pv is None and self._float is None) else None
+        if fpi is not None:                                 # live preview of the fill (colour + opacity) over the selection
+            p.save()
+            p.translate(self.off)
+            p.scale(self.zoom, self.zoom)
+            if self._selmove is not None:                   # the outline is being dragged: the colour goes with it
+                p.translate(self._selmove["d"][0], self._selmove["d"][1])
+            p.drawImage(0, 0, fpi)
             p.restore()
         if self._float is not None:
             self._paint_float(p)
