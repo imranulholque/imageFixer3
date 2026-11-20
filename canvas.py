@@ -717,7 +717,7 @@ class ImageCanvas(QWidget):
             gk = (pc[0], Wd, Hd, tuple(grid))
             vc = t.get("_vcache")
             if vc is None or vc[0] != gk:
-                layer = core.warp_layer(pc[1], (Wd, Hd), grid, n, 4)
+                layer = core.warp_layer(pc[1], (Wd, Hd), grid, n, 6)
                 qimg = QImage(layer.tobytes(), Wd, Hd, Wd * 4, QImage.Format.Format_RGBA8888).copy()
                 qimg.setDevicePixelRatio(dpr)
                 vc = (gk, qimg)

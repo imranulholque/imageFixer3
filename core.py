@@ -2272,15 +2272,17 @@ def smooth_net(grid, n, sub):
 
 
 def _warp_layer_smooth(patch, size, grid, n, sub_max=10):
-    """Warp (n > 1): the patch is bent over a smooth surface through the net's points.  Every output pixel looks up
-    where it comes from (cv2.remap), so lines stay whole and joined, with no seams between cells."""
+    """Warp (n > 1), the way a GPU / Photoshop does it: the smooth surface through the net's points is cut into many
+    small triangles that SHARE their corners; every triangle carries its piece of the picture (affine inside).  The
+    triangles are rasterised into an id map, from it every output pixel gets its (u, v) in the patch, and one
+    cv2.remap draws the whole picture.  Shared corners = one continuous map: no seams, no gaps, no pieces."""
     import cv2
     pw, ph = patch.size
     W, H = size
     layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     xs = [p[0] for p in grid]; ys = [p[1] for p in grid]
     cell_px = max(max(xs) - min(xs), max(ys) - min(ys)) / float(n)
-    sub = int(min(sub_max, max(2, math.ceil(cell_px / 8.0))))
+    sub = int(min(sub_max, max(2, math.ceil(cell_px / 6.0))))
     S = smooth_net(grid, n, sub)
     M = n * sub
     bx0, by0 = max(0, int(math.floor(S[..., 0].min())) - 2), max(0, int(math.floor(S[..., 1].min())) - 2)
@@ -2288,34 +2290,46 @@ def _warp_layer_smooth(patch, size, grid, n, sub_max=10):
     bw, bh = bx1 - bx0, by1 - by0
     if bw < 1 or bh < 1:
         return layer
-    mapx = np.full((bh, bw), -10.0, np.float32)
-    mapy = np.full((bh, bw), -10.0, np.float32)
-    for i in range(M):
-        v0, v1 = i * ph / float(M), (i + 1) * ph / float(M)
-        for j in range(M):
-            u0, u1 = j * pw / float(M), (j + 1) * pw / float(M)
-            dq = [S[i, j], S[i, j + 1], S[i + 1, j + 1], S[i + 1, j]]
-            qx = [p[0] - bx0 for p in dq]; qy = [p[1] - by0 for p in dq]
-            x0, x1 = max(0, int(math.floor(min(qx))) - 1), min(bw, int(math.ceil(max(qx))) + 1)
-            y0, y1 = max(0, int(math.floor(min(qy))) - 1), min(bh, int(math.ceil(max(qy))) + 1)
-            if x1 <= x0 or y1 <= y0:
-                continue
-            try:
-                Hm = homography([(p[0] - bx0, p[1] - by0) for p in dq], [(u0, v0), (u1, v0), (u1, v1), (u0, v1)])
-            except np.linalg.LinAlgError:
-                continue
-            X, Y = np.meshgrid(np.arange(x0, x1, dtype=np.float64) + 0.5, np.arange(y0, y1, dtype=np.float64) + 0.5)
-            d = Hm[2, 0] * X + Hm[2, 1] * Y + Hm[2, 2]
-            d = np.where(np.abs(d) < 1e-9, 1e-9, d)
-            u = (Hm[0, 0] * X + Hm[0, 1] * Y + Hm[0, 2]) / d
-            v = (Hm[1, 0] * X + Hm[1, 1] * Y + Hm[1, 2]) / d
-            eu, ev = 0.75 * (u1 - u0), 0.75 * (v1 - v0)   # a little slack: neighbouring pieces overlap, so no seams
-            ok = (u >= u0 - eu) & (u <= u1 + eu) & (v >= v0 - ev) & (v <= v1 + ev)
-            mx = mapx[y0:y1, x0:x1]; my = mapy[y0:y1, x0:x1]
-            mx[ok] = (u[ok] - 0.5).astype(np.float32)
-            my[ok] = (v[ok] - 0.5).astype(np.float32)
+    X = S[..., 0] - bx0
+    Y = S[..., 1] - by0
+    U, V = np.meshgrid(np.arange(M + 1, dtype=np.float64) * pw / M, np.arange(M + 1, dtype=np.float64) * ph / M)
+    # two triangles per cell, corners shared with the neighbours
+    i0, j0 = np.meshgrid(np.arange(M), np.arange(M), indexing="ij")
+    i0 = i0.ravel(); j0 = j0.ravel()
+    tris = [((i0, j0), (i0, j0 + 1), (i0 + 1, j0)), ((i0, j0 + 1), (i0 + 1, j0 + 1), (i0 + 1, j0))]
+    idmap = np.full((bh, bw), -1, np.int32)
+    coef_u, coef_v = [], []
+    base = 0
+    for t3 in tris:
+        px = [X[c] for c in t3]; py = [Y[c] for c in t3]
+        pu = [U[c] for c in t3]; pv = [V[c] for c in t3]
+        det = (px[1] - px[0]) * (py[2] - py[0]) - (px[2] - px[0]) * (py[1] - py[0])
+        good = np.abs(det) > 1e-9
+        dd = np.where(good, det, 1.0)
+        def solve(q):
+            a_ = ((q[1] - q[0]) * (py[2] - py[0]) - (q[2] - q[0]) * (py[1] - py[0])) / dd
+            b_ = ((q[2] - q[0]) * (px[1] - px[0]) - (q[1] - q[0]) * (px[2] - px[0])) / dd
+            c_ = q[0] - a_ * px[0] - b_ * py[0]
+            return np.stack([a_, b_, c_], 1)
+        coef_u.append(solve(pu)); coef_v.append(solve(pv))
+        T = len(det)
+        P = np.stack([np.stack([px[k], py[k]], 1) for k in range(3)], 1)           # (T, 3, 2) in continuous coords
+        P = np.round((P - 0.5) * 16.0).astype(np.int32)                             # cv2: pixel centres at integers
+        for k in range(T):
+            if good[k]:
+                cv2.fillConvexPoly(idmap, P[k], int(base + k), lineType=cv2.LINE_8, shift=4)
+        base += T
+    CU = np.concatenate(coef_u + [np.zeros((1, 3))]); CV = np.concatenate(coef_v + [np.zeros((1, 3))])
+    ok = idmap >= 0
+    idx = np.where(ok, idmap, len(CU) - 1)
+    gx, gy = np.meshgrid(np.arange(bw, dtype=np.float64) + 0.5, np.arange(bh, dtype=np.float64) + 0.5)
+    u = CU[idx, 0] * gx + CU[idx, 1] * gy + CU[idx, 2]
+    v = CV[idx, 0] * gx + CV[idx, 1] * gy + CV[idx, 2]
+    mapx = np.where(ok, u - 0.5, -10.0).astype(np.float32)
+    mapy = np.where(ok, v - 0.5, -10.0).astype(np.float32)
     src = np.frombuffer(patch.convert("RGBa").tobytes(), np.uint8).reshape(ph, pw, 4)   # premultiplied: no pale halo
-    out = cv2.remap(src, mapx, mapy, cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0, 0))
+    interp = cv2.INTER_CUBIC if sub_max >= 8 else cv2.INTER_LINEAR
+    out = cv2.remap(src, mapx, mapy, interp, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0, 0))
     piece = Image.frombytes("RGBa", (bw, bh), np.ascontiguousarray(out).tobytes()).convert("RGBA")
     layer.paste(piece, (bx0, by0))
     return layer
