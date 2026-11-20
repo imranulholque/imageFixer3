@@ -1359,6 +1359,14 @@ class Card(QWidget):
         sb.addWidget(self._label("Size"))
         sb.addWidget(self.sizeSlider)
         sb.addWidget(self.lblSize)
+        self.chkNodes = QCheckBox("Nodes")
+        self.chkNodes.setChecked(False)
+        self.chkNodes.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.chkNodes.setToolTip("Color brush / Erase brush: after the stroke you can drag its nodes to reshape it.\n"
+                                 "Click the line = add a node, right click a node = remove it.\n"
+                                 "Enter or a click elsewhere applies it, Esc cancels.")
+        self.chkNodes.toggled.connect(lambda on: (self.canvas.set_node_edit(bool(on)), _pref_set("edit_nodes", bool(on))))
+        sb.addWidget(self.chkNodes)
         a.addWidget(self.sizeBox)
         self.paintBox = QWidget()                       # Color Brush: opacity, softness, color
         pb = QHBoxLayout(self.paintBox)
@@ -2249,10 +2257,11 @@ class Card(QWidget):
                 fn()
             finally:
                 w.blockSignals(False)
-        for key, w in (("keep_ink", self.chkInk), ("near_click", self.chkLocal), ("snap_edges", self.chkSnap)):
+        for key, w in (("keep_ink", self.chkInk), ("near_click", self.chkLocal), ("snap_edges", self.chkSnap), ("edit_nodes", self.chkNodes)):
             v = _pref_get(key, w.isChecked(), bool)
             blocked(w, lambda w=w, v=v: w.setChecked(bool(v)))
         self.keep_ink = self.chkInk.isChecked()
+        self.canvas.set_node_edit(self.chkNodes.isChecked())
         v = int(_pref_get("near_pct", self.localSlider.value(), int))
         blocked(self.localSlider, lambda: self.localSlider.setValue(v))
         self.lblLocalV.setText("%d%%" % self.localSlider.value())
@@ -5774,6 +5783,7 @@ class Card(QWidget):
         self.optsB.setVisible(sel_t or key in MOVE_KEYS)
         self.modeBox.setVisible(sel_t)
         self.sizeBox.setVisible(key in ("quick", "brush", "erase_brush", "deselect", "paint"))
+        self.chkNodes.setVisible(key in ("paint", "erase_brush"))
         self.paintBox.setVisible(key == "paint")
         self.tolBox.setVisible(key in ("quick", "color", "deselect"))
         self._tol_mode(key)

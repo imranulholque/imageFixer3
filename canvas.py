@@ -8,6 +8,7 @@ from PySide6.QtGui import QBrush, QColor, QImage, QPainter, QPainterPath, QPen, 
 from PySide6.QtWidgets import QAbstractSpinBox, QApplication, QComboBox, QLineEdit, QPlainTextEdit, QTextEdit, QWidget
 
 import core
+import nodecurve
 import strokefix
 from feedback import Effects, rotate_cursor
 from theme import copy_cursor, dropper_cursor, move_selection_cursor
@@ -92,11 +93,14 @@ class ImageCanvas(QWidget):
         self.paint_rgb = (255, 0, 0)          # colour brush: colour and opacity (only for the live preview of the stroke)
         self.paint_opacity = 1.0
         self.paint_smooth = 50                # 0..100: how much the stroke is smoothed
-        self._hold_timer = QTimer(self)               # Color Brush: mouse held still 1 s -> show the cleaned result
+        self._hold_timer = QTimer(self)               # Color Brush: mouse held still 0.3 s -> show the cleaned result
         self._hold_timer.setSingleShot(True)
-        self._hold_timer.setInterval(1000)
+        self._hold_timer.setInterval(300)                # was 1 s: the shape now appears after a short pause
         self._hold_timer.timeout.connect(self._hold_fire)
         self._hold_pts = None                 # the cleaned stroke shown after the hold (None = not yet)
+        self.node_edit = False                # Color / Erase brush: after the stroke its nodes can be dragged before it is applied
+        self._nodes = None                    # pending stroke: {'kind': 'paint'|'erase', 'nodes': [...], 'closed': bool}
+        self._node_drag = None                # index of the node being dragged
         self._hold_anchor = None
         self.paint_snap = True                # a stroke close to a line / circle / triangle / rectangle becomes that shape
         self.clone_delta = None               # QPointF, offset source - destination
@@ -386,6 +390,7 @@ class ImageCanvas(QWidget):
 
     # --------------------------------------------------------------- mode
     def set_mode(self, m, shape=None):
+        self._node_commit()                           # a stroke waiting for its nodes is applied first
         self.mode = m
         if shape is not None:
             self.select_shape = shape
@@ -1100,6 +1105,8 @@ class ImageCanvas(QWidget):
                 self._paint_ring(p)
         elif self.mode == self.PAINT:
             self._paint_colorbrush(p)
+        if self._nodes is not None:
+            self._paint_nodes(p)
         self.fx.paint(p)
         self._paint_hud(p)
 
@@ -1304,8 +1311,101 @@ class ImageCanvas(QWidget):
             p.setPen(QPen(QColor(255, 255, 255), 1.4))
             p.drawEllipse(self._hover, r, r)
 
+    # ---------------------------------------------------- nodes of a finished brush stroke
+    NODE_R = 7.0                                  # screen pixels: the grab radius of a node
+
+    def set_node_edit(self, on):
+        self.node_edit = bool(on)
+        if not on:
+            self._node_commit()
+
+    def _node_begin(self, kind, pts):
+        """The stroke waits as a few draggable nodes.  False = not possible (the stroke is applied as it is)."""
+        try:
+            nodes, closed = nodecurve.fit_nodes(pts, 12)
+        except Exception:
+            return False
+        if len(nodes) < 2:
+            return False
+        self._nodes = {"kind": kind, "nodes": nodes, "closed": closed}
+        self._node_drag = None
+        self._hold_pts = None
+        self.update()
+        return True
+
+    def _node_step(self):
+        return max(1.0, 2.0 / self.zoom)
+
+    def _node_commit(self):
+        n, self._nodes, self._node_drag = self._nodes, None, None
+        if n is None:
+            return
+        pts = nodecurve.sample(n["nodes"], self._node_step(), n["closed"])
+        if len(pts) >= 2:
+            if n["kind"] == "paint":
+                self.paintFinished.emit(pts)
+            else:
+                self.eraseFinished.emit("brush", pts)
+        self.update()
+
+    def _node_cancel(self):
+        self._nodes = None
+        self._node_drag = None
+        self.update()
+
+    def _node_press(self, e):
+        """A click while nodes are shown: grab a node, add one on the curve, remove one (right click), or - anywhere else -
+        apply the stroke (that click is only used for this).  True = the click is used up."""
+        n = self._nodes
+        ip = self.to_img(e.position())
+        r = self.NODE_R / max(1e-6, self.zoom)
+        i = nodecurve.hit_node(n["nodes"], (ip.x(), ip.y()), r)
+        if e.button() == Qt.MouseButton.RightButton:
+            if i is None:
+                return False                                  # right click elsewhere: the usual pan
+            n["nodes"] = nodecurve.remove_node(n["nodes"], i, n["closed"])
+            self.update()
+            return True
+        if e.button() != Qt.MouseButton.LeftButton:
+            return False
+        if i is not None:
+            self._node_drag = i
+            return True
+        hit = nodecurve.hit_curve(n["nodes"], (ip.x(), ip.y()), r, n["closed"], self._node_step())
+        if hit is not None:
+            n["nodes"] = nodecurve.insert_node(n["nodes"], hit[0], hit[1])
+            self._node_drag = hit[0] + 1
+            self.update()
+            return True
+        self._node_commit()
+        return True
+
+    def _paint_nodes(self, p):
+        n = self._nodes
+        z = self.zoom
+        pts = [self.to_wid(QPointF(x, y)) for x, y in nodecurve.sample(n["nodes"], self._node_step(), n["closed"])]
+        w = max(1.0, self.brush_prev * z)
+        if n["kind"] == "paint":
+            col = QColor(*self.paint_rgb)
+            col.setAlphaF(max(0.35, self.paint_opacity))
+        else:
+            col = QColor(239, 68, 68, 140)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        if len(pts) > 1:
+            p.setPen(QPen(col, w, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+            p.drawPolyline(QPolygonF(pts))
+            p.setPen(QPen(QColor(20, 24, 34), 2.6))
+            p.drawPolyline(QPolygonF(pts))
+            p.setPen(QPen(QColor(255, 255, 255), 1.2))
+            p.drawPolyline(QPolygonF(pts))
+        for k, (x, y) in enumerate(n["nodes"]):
+            c = self.to_wid(QPointF(x, y))
+            p.setPen(QPen(QColor(20, 24, 34), 2.2))
+            p.setBrush(QBrush(QColor(255, 255, 255) if k != self._node_drag else QColor(255, 196, 0)))
+            p.drawEllipse(c, 5.0, 5.0)
+
     def _hold_fire(self):
-        """The mouse has been still for 1 s with the button down: show what the stroke will become (snapped shape or smooth)."""
+        """The mouse has been still for 0.3 s with the button down: show what the stroke will become (snapped shape or smooth)."""
         er = self._erase
         if er is None or er["kind"] != "paint" or self.mode != self.PAINT or len(er["pts"]) < 2:
             return
@@ -1320,7 +1420,7 @@ class ImageCanvas(QWidget):
         if er is not None and er["kind"] == "paint":
             raw = [(q.x(), q.y()) for q in er["pts"]]
             shown = self._hold_pts if self._hold_pts is not None else strokefix.smooth(raw, self.paint_smooth, scale=1.0 / self.zoom)
-            pts = [self.to_wid(QPointF(x, y)) for x, y in shown]        # live preview is smoothed too (after 1 s still: the final shape)
+            pts = [self.to_wid(QPointF(x, y)) for x, y in shown]        # live preview is smoothed too (after a short stop: the final shape)
             col = QColor(*self.paint_rgb)
             col.setAlphaF(self.paint_opacity)
             w = max(1.0, self.brush_prev * z)
@@ -1570,6 +1670,8 @@ class ImageCanvas(QWidget):
             return
         pos = e.position()
         btn = e.button()
+        if self._nodes is not None and self._node_press(e):
+            return
         self._rc_press = pos if btn == Qt.MouseButton.RightButton else None
         if btn == Qt.MouseButton.LeftButton and not self._space and self.layer_probe is not None \
                 and self.mode != self.TRANSFORM:
@@ -1724,6 +1826,11 @@ class ImageCanvas(QWidget):
         pos = e.position()
         self._hover = pos
         self._note_mods(e.modifiers())
+        if self._node_drag is not None and self._nodes is not None:
+            ip = self._inside(self.to_img(pos))
+            self._nodes["nodes"][self._node_drag] = (ip.x(), ip.y())
+            self.update()
+            return
         if self._pan_last is not None:
             d = pos - self._pan_last
             self._pan_last = pos
@@ -1738,7 +1845,7 @@ class ImageCanvas(QWidget):
             if math.hypot(pos.x() - self._hold_anchor.x(), pos.y() - self._hold_anchor.y()) <= 6.0:
                 if self._hold_pts is not None:          # result is showing and the hand only trembles: keep it steady
                     return
-            else:                                       # really moving again: draw on, wait for the next 1 s stop
+            else:                                       # really moving again: draw on, wait for the next short stop
                 self._hold_anchor = pos
                 self._hold_pts = None
                 self._hold_timer.start()
@@ -1767,6 +1874,10 @@ class ImageCanvas(QWidget):
 
     def mouseReleaseEvent(self, e):
         self._note_mods(e.modifiers())
+        if self._node_drag is not None:
+            self._node_drag = None
+            self.update()
+            return
         if e.button() == Qt.MouseButton.RightButton and self._rc_press is not None:
             moved = (e.position() - self._rc_press).manhattanLength()
             self._rc_press = None
@@ -1815,8 +1926,10 @@ class ImageCanvas(QWidget):
         if er is not None and self.mode == self.PAINT:
             if e.button() == Qt.MouseButton.LeftButton and er["kind"] == "paint":
                 raw = [(q.x(), q.y()) for q in er["pts"]]
-                self.paintFinished.emit(self._hold_pts if self._hold_pts is not None else
-                                        strokefix.clean(raw, self.paint_smooth, self.paint_snap, scale=1.0 / self.zoom))
+                final = self._hold_pts if self._hold_pts is not None else \
+                    strokefix.clean(raw, self.paint_smooth, self.paint_snap, scale=1.0 / self.zoom)
+                if not (self.node_edit and len(final) >= 2 and self._node_begin("paint", final)):
+                    self.paintFinished.emit(final)
             self._hold_pts = None
             self.update()
             er = None
@@ -1835,7 +1948,10 @@ class ImageCanvas(QWidget):
         if er is not None and e.button() == Qt.MouseButton.LeftButton:
             pts, kind = er["pts"], er["kind"]
             if kind in ("brush", "lasso"):
-                if kind == "brush" or len(pts) >= 3:
+                if kind == "brush" and self.node_edit and len(pts) >= 2 and self._node_begin(
+                        "erase", strokefix.smooth([(q.x(), q.y()) for q in pts], 40, scale=1.0 / self.zoom)):
+                    pass
+                elif kind == "brush" or len(pts) >= 3:
                     self.eraseFinished.emit(kind, [(q.x(), q.y()) for q in pts])
             elif len(pts) == 2 and abs(pts[0].x() - pts[1].x()) >= 3 and abs(pts[0].y() - pts[1].y()) >= 3:
                 self.eraseFinished.emit(kind, (pts[0].x(), pts[0].y(), pts[1].x(), pts[1].y()))
@@ -1945,6 +2061,12 @@ class ImageCanvas(QWidget):
             if not e.isAutoRepeat():
                 self._space = True
                 self._update_cursor()
+            return
+        if self._nodes is not None and e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self._node_commit()
+            return
+        if self._nodes is not None and e.key() == Qt.Key.Key_Escape:
+            self._node_cancel()
             return
         if self.mode in (self.CROP, self.PERSP, self.TRANSFORM) and e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             self.applyRequested.emit()

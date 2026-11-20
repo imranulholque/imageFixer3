@@ -1539,6 +1539,37 @@ def _grow_over_ink(reg, hole):
     return out, Image.fromarray((cur * 255).astype(np.uint8))
 
 
+def _grow_over_halo(reg, hole, reach=26):
+    """After painting with a soft brush the colour fades out slowly: the erase brush covers the strong part, but a faint,
+    smooth halo is left around it (a pink rim) and it also tints the fill.  The hole grows over such pixels: they differ a
+    little from the paper far away, and change slowly (no sharp edge, so writing / lines next to the hole are never eaten)."""
+    h0 = hole > 0.5
+    if not h0.any():
+        return hole, None
+    near = np.asarray(Image.fromarray((h0 * 255).astype(np.uint8)).filter(
+        ImageFilter.MaxFilter(2 * reach + 1))) > 127
+    far = ~near
+    if int(far.sum()) < 400:
+        return hole, None
+    F2 = fill_background(reg, far.astype(np.float32)).astype(np.float32)
+    sm = np.asarray(Image.fromarray(reg).filter(ImageFilter.GaussianBlur(1.2)), dtype=np.float32)
+    dev = np.abs(sm - F2).sum(2)
+    thr = max(6.0, 3.0 * float(np.median(dev[far])) + 3.0)
+    g = sm.sum(2)
+    gx = np.abs(np.diff(g, axis=1, prepend=g[:, :1]))
+    gy = np.abs(np.diff(g, axis=0, prepend=g[:1, :]))
+    smooth = np.maximum(gx, gy) < 45.0
+    cand = (dev > thr) & smooth & near
+    cur = h0
+    for _ in range(reach):
+        grow = np.asarray(Image.fromarray((cur * 255).astype(np.uint8)).filter(ImageFilter.MaxFilter(3))) > 127
+        new = cur | (grow & cand)
+        if new.sum() == cur.sum():
+            break
+        cur = new
+    return cur.astype(np.float32), Image.fromarray((cur * 255).astype(np.uint8))
+
+
 def _paper_like(reg, valid):
     """1 where a valid pixel looks like plain paper (not ink, not the dim halo around ink)."""
     F = fill_background(reg, valid)
@@ -1577,7 +1608,7 @@ def erase_region(img, mask, offset=None, feather=1.5, keep_ink=False):
         return img
     W, H = img.size
     bw, bh = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    m = max(24, int(0.6 * max(bw, bh)))
+    m = max(44, int(0.6 * max(bw, bh)))
     box = (max(0, bbox[0] - m), max(0, bbox[1] - m), min(W, bbox[2] + m), min(H, bbox[3] + m))
     full = np.asarray(img)
     reg = full[box[1]:box[3], box[0]:box[2]].copy()
@@ -1585,6 +1616,10 @@ def erase_region(img, mask, offset=None, feather=1.5, keep_ink=False):
     hole = np.asarray(hole_img, dtype=np.float32) / 255.0
     if offset is None:
         hole, hole_img = _grow_over_ink(reg, hole)           # the soft edge of the writing goes too: no grey ghost
+        if not keep_ink:                                     # eraser: the faint soft halo of a paint stroke goes too (no rim)
+            h2, i2 = _grow_over_halo(reg, hole)
+            if i2 is not None:
+                hole, hole_img = h2, i2
     valid = 1.0 - hole
     if offset is None:                                       # only real paper counts for the fill, never ink / halo
         valid = valid * _paper_like(reg, valid)
@@ -1598,6 +1633,9 @@ def erase_region(img, mask, offset=None, feather=1.5, keep_ink=False):
     k = 2 * int(math.ceil(f)) + 1
     soft = np.asarray(mask.crop(box).filter(ImageFilter.MaxFilter(max(3, k))).filter(ImageFilter.GaussianBlur(f)),
                       dtype=np.float32) / 255.0
+    if offset is None and not keep_ink:                      # the grown hole is replaced too, with a soft edge
+        gsoft = np.asarray(hole_img.filter(ImageFilter.MaxFilter(3)).filter(ImageFilter.GaussianBlur(1.2)), dtype=np.float32) / 255.0
+        soft = np.maximum(soft, gsoft)
     soft = np.clip(soft, 0, 1)[..., None]
 
     ring = (np.asarray(hole_img.filter(ImageFilter.MaxFilter(25)), dtype=np.float32) / 255.0 > 0.5) & (hole < 0.5)
@@ -2122,7 +2160,15 @@ def paint_brush(img, pts, brush, rgb, opacity=1.0, softness=0.0, sel=None, alpha
     if x1 <= x0 or y1 <= y0:
         return img
     local = [(x - x0, y - y0) for x, y in zip(xs, ys)]
-    m = make_mask((x1 - x0, y1 - y0), "brush", local, brush=w).filter(_PilFilter.GaussianBlur(rad))
+    lw, lh = x1 - x0, y1 - y0
+    ss = 3 if lw * lh * 9 <= 36e6 else (2 if lw * lh * 4 <= 36e6 else 1)
+    if ss > 1:                                               # anti-aliased edge: draw bigger, then shrink (no stair-steps)
+        big = make_mask((lw * ss, lh * ss), "brush", [(x * ss, y * ss) for x, y in local], brush=w * ss)
+        m = big.resize((lw, lh), Image.Resampling.BOX)
+        rad = rad if softness > 0 else 0.5
+    else:
+        m = make_mask((lw, lh), "brush", local, brush=w)
+    m = m.filter(_PilFilter.GaussianBlur(rad))
     a = np.asarray(m, dtype=np.float32) / 255.0
     if sel is not None:
         a = a * resize_mask(sel, (W, H))[y0:y1, x0:x1]
