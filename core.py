@@ -2244,9 +2244,93 @@ def warp_region(img, mask, grid, n, soft=1.0, copy=False):
     return out, layer.split()[3]
 
 
+def _cr_weights(t):
+    """Catmull-Rom weights of the 4 control points around a cell, for t in 0..1 (the curve passes through the points)."""
+    t2 = t * t
+    t3 = t2 * t
+    return (-0.5 * t3 + t2 - 0.5 * t, 1.5 * t3 - 2.5 * t2 + 1.0, -1.5 * t3 + 2.0 * t2 + 0.5 * t, 0.5 * t3 - 0.5 * t2)
+
+
+def smooth_net(grid, n, sub):
+    """The net of (n+1)*(n+1) points (row by row) as a SMOOTH surface: a Catmull-Rom surface that passes through every
+    point, sampled 'sub' times finer in both directions.  Returns an array (n*sub+1, n*sub+1, 2) of (x, y).
+    Pulling one point bends the area around it softly (neighbouring cells follow, no kinks), and a straight,
+    un-pulled net stays exactly straight."""
+    P = np.asarray(grid, np.float64).reshape(n + 1, n + 1, 2)
+    Q = np.empty((n + 3, n + 3, 2), np.float64)          # one extra ring around, extrapolated in a straight line
+    Q[1:-1, 1:-1] = P
+    Q[0, 1:-1] = 2 * P[0] - P[1]
+    Q[-1, 1:-1] = 2 * P[-1] - P[-2]
+    Q[:, 0] = 2 * Q[:, 1] - Q[:, 2]
+    Q[:, -1] = 2 * Q[:, -2] - Q[:, -3]
+    M = n * sub
+    s = np.arange(M + 1, dtype=np.float64) / sub
+    cell = np.minimum(np.floor(s).astype(int), n - 1)
+    w = _cr_weights(s - cell)
+    R = sum(w[k][None, :, None] * Q[:, cell + k] for k in range(4))       # along x: (n+3, M+1, 2)
+    return sum(w[k][:, None, None] * R[cell + k] for k in range(4))       # along y: (M+1, M+1, 2)
+
+
+def _warp_layer_smooth(patch, size, grid, n):
+    """Warp (n > 1): the patch is bent over a smooth surface through the net's points.  Every output pixel looks up
+    where it comes from (cv2.remap), so lines stay whole and joined, with no seams between cells."""
+    import cv2
+    pw, ph = patch.size
+    W, H = size
+    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    xs = [p[0] for p in grid]; ys = [p[1] for p in grid]
+    cell_px = max(max(xs) - min(xs), max(ys) - min(ys)) / float(n)
+    sub = int(min(10, max(3, math.ceil(cell_px / 8.0))))
+    S = smooth_net(grid, n, sub)
+    M = n * sub
+    bx0, by0 = max(0, int(math.floor(S[..., 0].min())) - 2), max(0, int(math.floor(S[..., 1].min())) - 2)
+    bx1, by1 = min(W, int(math.ceil(S[..., 0].max())) + 2), min(H, int(math.ceil(S[..., 1].max())) + 2)
+    bw, bh = bx1 - bx0, by1 - by0
+    if bw < 1 or bh < 1:
+        return layer
+    mapx = np.full((bh, bw), -10.0, np.float32)
+    mapy = np.full((bh, bw), -10.0, np.float32)
+    for i in range(M):
+        v0, v1 = i * ph / float(M), (i + 1) * ph / float(M)
+        for j in range(M):
+            u0, u1 = j * pw / float(M), (j + 1) * pw / float(M)
+            dq = [S[i, j], S[i, j + 1], S[i + 1, j + 1], S[i + 1, j]]
+            qx = [p[0] - bx0 for p in dq]; qy = [p[1] - by0 for p in dq]
+            x0, x1 = max(0, int(math.floor(min(qx))) - 1), min(bw, int(math.ceil(max(qx))) + 1)
+            y0, y1 = max(0, int(math.floor(min(qy))) - 1), min(bh, int(math.ceil(max(qy))) + 1)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            try:
+                Hm = homography([(p[0] - bx0, p[1] - by0) for p in dq], [(u0, v0), (u1, v0), (u1, v1), (u0, v1)])
+            except np.linalg.LinAlgError:
+                continue
+            X, Y = np.meshgrid(np.arange(x0, x1, dtype=np.float64) + 0.5, np.arange(y0, y1, dtype=np.float64) + 0.5)
+            d = Hm[2, 0] * X + Hm[2, 1] * Y + Hm[2, 2]
+            d = np.where(np.abs(d) < 1e-9, 1e-9, d)
+            u = (Hm[0, 0] * X + Hm[0, 1] * Y + Hm[0, 2]) / d
+            v = (Hm[1, 0] * X + Hm[1, 1] * Y + Hm[1, 2]) / d
+            eu, ev = 0.75 * (u1 - u0), 0.75 * (v1 - v0)   # a little slack: neighbouring pieces overlap, so no seams
+            ok = (u >= u0 - eu) & (u <= u1 + eu) & (v >= v0 - ev) & (v <= v1 + ev)
+            mx = mapx[y0:y1, x0:x1]; my = mapy[y0:y1, x0:x1]
+            mx[ok] = (u[ok] - 0.5).astype(np.float32)
+            my[ok] = (v[ok] - 0.5).astype(np.float32)
+    src = np.frombuffer(patch.convert("RGBa").tobytes(), np.uint8).reshape(ph, pw, 4)   # premultiplied: no pale halo
+    out = cv2.remap(src, mapx, mapy, cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0, 0))
+    piece = Image.frombytes("RGBa", (bw, bh), np.ascontiguousarray(out).tobytes()).convert("RGBA")
+    layer.paste(piece, (bx0, by0))
+    return layer
+
+
 def warp_layer(patch, size, grid, n):
-    """An RGBA patch bent onto a net of points (n = 1: 4 corners, n = 3: 4x4 points, row by row, picture pixels).
-    Returns an RGBA layer of the given size."""
+    """An RGBA patch bent onto a net of points (n = 1: 4 corners, n > 1: (n+1)x(n+1) points, row by row, picture
+    pixels).  n = 1 is an exact perspective; n > 1 is a smooth bend through the points.  Returns an RGBA layer."""
+    if n > 1:
+        return _warp_layer_smooth(patch, size, grid, n)
+    return _warp_layer_cells(patch, size, grid, n)
+
+
+def _warp_layer_cells(patch, size, grid, n):
+    """Cell by cell perspective (exact for n = 1)."""
     pw, ph = patch.size
     W, H = size
     layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
@@ -2286,6 +2370,10 @@ def warp_layer_hq(patch, size, grid, n, ss=3, max_px=36_000_000):
     Only the box around the picture is worked on.  Returns an RGBA layer of the given size."""
     W, H = size
     xs = [p[0] for p in grid]; ys = [p[1] for p in grid]
+    if n > 1:                                            # the smooth surface may bulge a little past its points
+        S = smooth_net(grid, n, 4)
+        xs, ys = list(S[..., 0].ravel()), list(S[..., 1].ravel())
+        max_px = min(max_px, 16_000_000)
     bx0, by0 = max(0, int(math.floor(min(xs))) - 2), max(0, int(math.floor(min(ys))) - 2)
     bx1, by1 = min(W, int(math.ceil(max(xs))) + 2), min(H, int(math.ceil(max(ys))) + 2)
     bw, bh = bx1 - bx0, by1 - by0

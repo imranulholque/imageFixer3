@@ -999,6 +999,15 @@ class ImageCanvas(QWidget):
             if want >= 8 and img.width() > want * 1.3:
                 img = self._small(img, want)
             w, h = float(img.width()), float(img.height())
+            ov = 0.0
+            if n > 1:                                    # Warp: a smooth surface through the points, drawn in many small pieces
+                xs = [q.x() for q in wp]; ys = [q.y() for q in wp]
+                cell = max(max(xs) - min(xs), max(ys) - min(ys)) / float(n)
+                sub = int(min(6, max(2, math.ceil(cell / 24.0))))
+                S = core.smooth_net([(q.x(), q.y()) for q in wp], n, sub)
+                wp = [QPointF(float(x), float(y)) for row in S for x, y in row]
+                n *= sub
+                ov = 0.5                                  # pieces overlap by half a pixel: no hairline gaps
             for i in range(n):
                 for j in range(n):
                     sq = [QPointF(j * w / n, i * h / n), QPointF((j + 1) * w / n, i * h / n),
@@ -1008,9 +1017,11 @@ class ImageCanvas(QWidget):
                         H = core.homography([(q.x(), q.y()) for q in sq], [(q.x(), q.y()) for q in dq])
                     except Exception:
                         continue
+                    r = QRectF(QPointF(max(0.0, sq[0].x() - ov), max(0.0, sq[0].y() - ov)),
+                               QPointF(min(w, sq[2].x() + ov), min(h, sq[2].y() + ov)))
                     p.save()
                     p.setTransform(QTransform(H[0, 0], H[1, 0], H[2, 0], H[0, 1], H[1, 1], H[2, 1], H[0, 2], H[1, 2], H[2, 2]))
-                    p.drawImage(QRectF(sq[0], sq[2]), img, QRectF(sq[0], sq[2]))
+                    p.drawImage(r, img, r)
                     p.restore()
         p.restore()
 
