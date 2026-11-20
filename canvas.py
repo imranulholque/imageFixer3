@@ -697,18 +697,28 @@ class ImageCanvas(QWidget):
         n = t["n"]
         w, h = t["w"], t["h"]
         wp = [self.to_wid(q) for q in t["pts"]]
-        for i in range(n):
-            for j in range(n):
-                sq = [QPointF(j * w / n, i * h / n), QPointF((j + 1) * w / n, i * h / n),
-                      QPointF((j + 1) * w / n, (i + 1) * h / n), QPointF(j * w / n, (i + 1) * h / n)]
-                dq = [wp[i * (n + 1) + j], wp[i * (n + 1) + j + 1], wp[(i + 1) * (n + 1) + j + 1], wp[(i + 1) * (n + 1) + j]]
+        dp, dn, ov = wp, n, 0.0
+        if n > 1:                                         # Warp: smooth surface through the points (no broken lines)
+            xs = [q.x() for q in wp]; ys = [q.y() for q in wp]
+            cell = max(max(xs) - min(xs), max(ys) - min(ys)) / float(n)
+            sub = int(min(6, max(2, math.ceil(cell / 24.0))))
+            S = core.smooth_net([(q.x(), q.y()) for q in wp], n, sub)
+            dp = [QPointF(float(x), float(y)) for row in S for x, y in row]
+            dn, ov = n * sub, 0.5
+        for i in range(dn):
+            for j in range(dn):
+                sq = [QPointF(j * w / dn, i * h / dn), QPointF((j + 1) * w / dn, i * h / dn),
+                      QPointF((j + 1) * w / dn, (i + 1) * h / dn), QPointF(j * w / dn, (i + 1) * h / dn)]
+                dq = [dp[i * (dn + 1) + j], dp[i * (dn + 1) + j + 1], dp[(i + 1) * (dn + 1) + j + 1], dp[(i + 1) * (dn + 1) + j]]
                 try:
                     H = core.homography([(q.x(), q.y()) for q in sq], [(q.x(), q.y()) for q in dq])
                 except Exception:
                     continue
+                r = QRectF(QPointF(max(0.0, sq[0].x() - ov), max(0.0, sq[0].y() - ov)),
+                           QPointF(min(w, sq[2].x() + ov), min(h, sq[2].y() + ov)))
                 p.save()
                 p.setTransform(QTransform(H[0, 0], H[1, 0], H[2, 0], H[0, 1], H[1, 1], H[2, 1], H[0, 2], H[1, 2], H[2, 2]))
-                p.drawImage(QRectF(sq[0], sq[2]), t["img"], QRectF(sq[0], sq[2]))
+                p.drawImage(r, t["img"], r)
                 p.restore()
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.setPen(QPen(QColor(255, 255, 255), 1.4))
