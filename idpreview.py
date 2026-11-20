@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (QCheckBox, QColorDialog, QDialog, QHBoxLayout, QL
                                QWidget)
 
 import idscan
+import valuedit
 
 
 def pil_to_pixmap(img):
@@ -337,6 +338,8 @@ class PreviewDialog(QDialog):
         r2.addWidget(self.lblR)
         r2.addWidget(self.sample)
         v.addLayout(r2)
+        valuedit.attach(self.lblB, self.sldB)
+        valuedit.attach(self.lblR, self.sldR)
         self.chkB.toggled.connect(self._controls_changed)
         self.sldB.valueChanged.connect(self._controls_changed)
         self.btnB.clicked.connect(self._pick_color)

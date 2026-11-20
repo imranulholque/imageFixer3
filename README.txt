@@ -3,6 +3,7 @@ IMAGE FIXER  (Windows)
 Made by Imranul Hoque Sabbir.
 Clean many text pictures (WhatsApp photos, scans) and print them. One big card per picture - slide to the next.
  Top bar (dropdown menus):  Select v | Move v | Eyedropper | Color Brush | Erase v | Crop v      Right side tabs: Adjust | Color | Shadow | Text | Picture | Aa;  Save v is at the top right, next to Settings
+ - TYPE A NUMBER:  every slider has its number beside it (30 px, 22%, 100% ...). Click the number, type the exact value, press Enter = the slider jumps there (Esc = cancel, Up / Down arrow = +1 / -1, Shift = 10). Works in all tabs, the bars above the picture, the layer opacity menu and the card / scan dialogs.
  - Select v:    Quick select, Brush, Box, Ellipse, Freehand, Color range (click a color). Options bar: New / Add / Subtract /
                 Intersect, All / None / Inverse, Grow / Shrink. Shift = add, Alt = subtract.
  - EVERYTHING acts only inside the selection (brightness, contrast, saturation, hue, warmth, color change, shadow removal,

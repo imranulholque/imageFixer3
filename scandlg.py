@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QColorDialog, QComboBox,
 from icons import icon as _ico
 import idpreview
 import idscan
+import valuedit
 import jobs
 import scanfix
 
@@ -262,6 +263,7 @@ class ScanDialog(QDialog):
         self.lblBorderW = QLabel("")
         self.lblBorderW.setMinimumWidth(24)
         self.sldBorder.valueChanged.connect(lambda v: self.lblBorderW.setText(str(v)))
+        valuedit.attach(self.lblBorderW, self.sldBorder)
         r4 = QHBoxLayout()
         r4.setSpacing(6)
         self.chkBorder.setMinimumWidth(70)
@@ -284,6 +286,7 @@ class ScanDialog(QDialog):
         self.lblRoundV = QLabel("")
         self.lblRoundV.setMinimumWidth(36)
         self.sldRound.valueChanged.connect(lambda v: self.lblRoundV.setText("%d%%" % v))
+        valuedit.attach(self.lblRoundV, self.sldRound)
         self.sampleRound = idpreview.CornerSample(w=48)
         self.sldRound.valueChanged.connect(lambda _v: self._round_sample())
         r5 = QHBoxLayout()

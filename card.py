@@ -22,6 +22,7 @@ import idscan
 import spill
 from idpreview import CornerSample
 import textbox
+import valuedit
 from canvas import ImageCanvas, np_to_qimage
 from compare import CompareOverlay
 from fullview import FullViewOverlay
@@ -289,6 +290,7 @@ class SliderRow(QWidget):
         self.sl.setRange(lo, hi)
         self.sl.setValue(value)
         self.sl.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        valuedit.attach(self.val, self.sl)                  # click the number, type a value, Enter
         if tip:
             self.sl.setToolTip(tip)
             self.title.setToolTip(tip)
@@ -376,6 +378,7 @@ class AdjRow(QFrame):
         self.sl.valueChanged.connect(self._on_k)
         self.sl.sliderPressed.connect(self._press)
         self.sl.sliderReleased.connect(self._release)
+        valuedit.attach(self.val, self.sl)                  # click the number, type a value, Enter
         v.addWidget(self.sl)
         cap = QHBoxLayout()
         for i, text in enumerate(("removed", "original", "stronger" if adj["type"] == "color" else "darker")):
@@ -402,8 +405,14 @@ class AdjRow(QFrame):
             self.rs.valueChanged.connect(self._on_tol)
             self.rs.sliderPressed.connect(self._press)
             self.rs.sliderReleased.connect(self._release)
+            self.lblRs = QLabel("%d" % int(adj["tol"]))
+            self.lblRs.setObjectName("muted")
+            self.lblRs.setMinimumWidth(30)
+            self.lblRs.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            valuedit.attach(self.lblRs, self.rs)
             rr.addWidget(lab)
             rr.addWidget(self.rs, 1)
+            rr.addWidget(self.lblRs)
             v.addLayout(rr)
         sr = QHBoxLayout()
         self.btnSelect = QPushButton("Select this color" if adj["type"] == "color" else "Select this shade")
@@ -461,6 +470,7 @@ class AdjRow(QFrame):
 
     def _on_tol(self, v):
         self.adj["tol"] = float(v)
+        self.lblRs.setText("%d" % v)
         self.changed.emit()
 
     def _press(self):
@@ -1533,6 +1543,10 @@ class Card(QWidget):
         self.btnShrink.clicked.connect(lambda: self.grow_selection(-self.growSlider.value()))
         self.growSlider.valueChanged.connect(lambda v: self.lblGrow.setText("%d px" % v))
         self.sizeSlider.valueChanged.connect(self._sync_brush)
+        for lab_, sl_ in ((self.lblCropRound, self.sldCropRound), (self.lblSize, self.sizeSlider), (self.lblOp, self.opSlider),
+                          (self.lblSoft, self.softSlider), (self.lblSmooth, self.smoothSlider), (self.lblTolV, self.tolSlider),
+                          (self.lblLocalV, self.localSlider), (self.lblGrow, self.growSlider)):
+            valuedit.attach(lab_, sl_)                      # click the number next to the slider, type a value, Enter
         self.btnClone.clicked.connect(self._clear_clone)
         self.canvas.pickRequested.connect(self._on_pick)
         self.canvas.zoomChanged.connect(lambda z: self.lblZoom.setText("%d%%" % round(z * self.scale * 100)))
@@ -4378,6 +4392,7 @@ class Card(QWidget):
         op_val = QLabel("%d%%" % op_sl.value())
         op_val.setMinimumWidth(36)
         op_sl.setToolTip("How strongly this layer shows on the page: 100% = solid, 0% = invisible.")
+        valuedit.attach(op_val, op_sl)
 
         def op_moved(v):
             op_val.setText("%d%%" % v)
