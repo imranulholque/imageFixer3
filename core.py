@@ -2271,7 +2271,7 @@ def smooth_net(grid, n, sub):
     return sum(w[k][:, None, None] * R[cell + k] for k in range(4))       # along y: (M+1, M+1, 2)
 
 
-def _warp_layer_smooth(patch, size, grid, n):
+def _warp_layer_smooth(patch, size, grid, n, sub_max=10):
     """Warp (n > 1): the patch is bent over a smooth surface through the net's points.  Every output pixel looks up
     where it comes from (cv2.remap), so lines stay whole and joined, with no seams between cells."""
     import cv2
@@ -2280,7 +2280,7 @@ def _warp_layer_smooth(patch, size, grid, n):
     layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     xs = [p[0] for p in grid]; ys = [p[1] for p in grid]
     cell_px = max(max(xs) - min(xs), max(ys) - min(ys)) / float(n)
-    sub = int(min(10, max(3, math.ceil(cell_px / 8.0))))
+    sub = int(min(sub_max, max(2, math.ceil(cell_px / 8.0))))
     S = smooth_net(grid, n, sub)
     M = n * sub
     bx0, by0 = max(0, int(math.floor(S[..., 0].min())) - 2), max(0, int(math.floor(S[..., 1].min())) - 2)
@@ -2321,11 +2321,11 @@ def _warp_layer_smooth(patch, size, grid, n):
     return layer
 
 
-def warp_layer(patch, size, grid, n):
+def warp_layer(patch, size, grid, n, sub_max=10):
     """An RGBA patch bent onto a net of points (n = 1: 4 corners, n > 1: (n+1)x(n+1) points, row by row, picture
     pixels).  n = 1 is an exact perspective; n > 1 is a smooth bend through the points.  Returns an RGBA layer."""
     if n > 1:
-        return _warp_layer_smooth(patch, size, grid, n)
+        return _warp_layer_smooth(patch, size, grid, n, sub_max)
     return _warp_layer_cells(patch, size, grid, n)
 
 

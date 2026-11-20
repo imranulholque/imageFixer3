@@ -690,6 +690,43 @@ class ImageCanvas(QWidget):
         out.append(("rot", self.to_img(QPointF(wm.x() + dx / d * 34.0, wm.y() + dy / d * 34.0))))
         return out
 
+    def _paint_warp_remap(self, p, t, wp, n):
+        """Warp preview as one picture: cv2.remap through a smooth surface (the same code the final Apply uses), so the
+        lines stay whole.  Returns False when it cannot (then the old piece-by-piece drawing is used)."""
+        try:
+            import cv2  # noqa: F401
+            from PIL import Image as _PI
+            dpr = self._dpr()
+            xs = [q.x() for q in wp]; ys = [q.y() for q in wp]
+            ext = max(max(xs) - min(xs), max(ys) - min(ys)) * dpr
+            if not (ext > 4.0) or ext > 20000:
+                return False
+            img = t["img"]
+            key = (img.cacheKey(), int(ext) // 16)
+            pc = t.get("_pcache")
+            if pc is None or pc[0] != key:
+                qi = img.convertToFormat(QImage.Format.Format_RGBA8888)
+                pil = _PI.frombuffer("RGBA", (qi.width(), qi.height()), bytes(qi.constBits()), "raw", "RGBA", qi.bytesPerLine(), 1)
+                want = max(8, int(ext))
+                if pil.width > want * 1.3:
+                    pil = pil.resize((want, max(1, int(round(pil.height * want / pil.width)))), _PI.Resampling.LANCZOS)
+                pc = (key, pil)
+                t["_pcache"] = pc
+            Wd, Hd = max(1, int(self.width() * dpr)), max(1, int(self.height() * dpr))
+            grid = [(q.x() * dpr, q.y() * dpr) for q in wp]
+            gk = (pc[0], Wd, Hd, tuple(grid))
+            vc = t.get("_vcache")
+            if vc is None or vc[0] != gk:
+                layer = core.warp_layer(pc[1], (Wd, Hd), grid, n, 4)
+                qimg = QImage(layer.tobytes(), Wd, Hd, Wd * 4, QImage.Format.Format_RGBA8888).copy()
+                qimg.setDevicePixelRatio(dpr)
+                vc = (gk, qimg)
+                t["_vcache"] = vc
+            p.drawImage(QPointF(0, 0), vc[1])
+            return True
+        except Exception:
+            return False
+
     def _paint_transform(self, p):
         t = self._tf
         if t is None:
@@ -697,29 +734,45 @@ class ImageCanvas(QWidget):
         n = t["n"]
         w, h = t["w"], t["h"]
         wp = [self.to_wid(q) for q in t["pts"]]
-        dp, dn, ov = wp, n, 0.0
-        if n > 1:                                         # Warp: smooth surface through the points (no broken lines)
-            xs = [q.x() for q in wp]; ys = [q.y() for q in wp]
-            cell = max(max(xs) - min(xs), max(ys) - min(ys)) / float(n)
-            sub = int(min(6, max(2, math.ceil(cell / 24.0))))
-            S = core.smooth_net([(q.x(), q.y()) for q in wp], n, sub)
-            dp = [QPointF(float(x), float(y)) for row in S for x, y in row]
-            dn, ov = n * sub, 0.5
-        for i in range(dn):
-            for j in range(dn):
-                sq = [QPointF(j * w / dn, i * h / dn), QPointF((j + 1) * w / dn, i * h / dn),
-                      QPointF((j + 1) * w / dn, (i + 1) * h / dn), QPointF(j * w / dn, (i + 1) * h / dn)]
-                dq = [dp[i * (dn + 1) + j], dp[i * (dn + 1) + j + 1], dp[(i + 1) * (dn + 1) + j + 1], dp[(i + 1) * (dn + 1) + j]]
-                try:
-                    H = core.homography([(q.x(), q.y()) for q in sq], [(q.x(), q.y()) for q in dq])
-                except Exception:
-                    continue
-                r = QRectF(QPointF(max(0.0, sq[0].x() - ov), max(0.0, sq[0].y() - ov)),
-                           QPointF(min(w, sq[2].x() + ov), min(h, sq[2].y() + ov)))
-                p.save()
-                p.setTransform(QTransform(H[0, 0], H[1, 0], H[2, 0], H[0, 1], H[1, 1], H[2, 1], H[0, 2], H[1, 2], H[2, 2]))
-                p.drawImage(r, t["img"], r)
-                p.restore()
+        if n > 1 and self._paint_warp_remap(p, t, wp, n):
+            pass                                          # Warp drawn as ONE picture (like Photoshop): no pieces, no seams
+        else:
+            dp, dn, ov = wp, n, 0.0
+            if n > 1:                                         # Warp: smooth surface through the points (no broken lines)
+                xs = [q.x() for q in wp]; ys = [q.y() for q in wp]
+                cell = max(max(xs) - min(xs), max(ys) - min(ys)) / float(n)
+                sub = int(min(6, max(2, math.ceil(cell / 24.0))))
+                S = core.smooth_net([(q.x(), q.y()) for q in wp], n, sub)
+                dp = [QPointF(float(x), float(y)) for row in S for x, y in row]
+                dn, ov = n * sub, 0.5
+            for i in range(dn):
+                for j in range(dn):
+                    sq = [QPointF(j * w / dn, i * h / dn), QPointF((j + 1) * w / dn, i * h / dn),
+                          QPointF((j + 1) * w / dn, (i + 1) * h / dn), QPointF(j * w / dn, (i + 1) * h / dn)]
+                    dq = [dp[i * (dn + 1) + j], dp[i * (dn + 1) + j + 1], dp[(i + 1) * (dn + 1) + j + 1], dp[(i + 1) * (dn + 1) + j]]
+                    r = QRectF(QPointF(max(0.0, sq[0].x() - ov), max(0.0, sq[0].y() - ov)),
+                               QPointF(min(w, sq[2].x() + ov), min(h, sq[2].y() + ov)))
+                    p.save()
+                    if n > 1:
+                        # tiny piece: a plain affine fit through its 4 corners (no perspective divide, so a pulled
+                        # point can never make a piece blow up or vanish)
+                        A = np.array([[q.x(), q.y(), 1.0] for q in sq], np.float64)
+                        try:
+                            cx = np.linalg.lstsq(A, np.array([q.x() for q in dq], np.float64), rcond=None)[0]
+                            cy = np.linalg.lstsq(A, np.array([q.y() for q in dq], np.float64), rcond=None)[0]
+                        except np.linalg.LinAlgError:
+                            p.restore()
+                            continue
+                        p.setTransform(QTransform(cx[0], cy[0], cx[1], cy[1], cx[2], cy[2]))
+                    else:
+                        try:
+                            H = core.homography([(q.x(), q.y()) for q in sq], [(q.x(), q.y()) for q in dq])
+                        except Exception:
+                            p.restore()
+                            continue
+                        p.setTransform(QTransform(H[0, 0], H[1, 0], H[2, 0], H[0, 1], H[1, 1], H[2, 1], H[0, 2], H[1, 2], H[2, 2]))
+                    p.drawImage(r, t["img"], r)
+                    p.restore()
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.setPen(QPen(QColor(255, 255, 255), 1.4))
         if n > 1:                                         # the net
