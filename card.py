@@ -3954,23 +3954,38 @@ class Card(QWidget):
             self._end_layer_session()
         self.leave_layer(done)
 
-    def layer_from_selection(self, cut=False, place=True):
+    def layer_from_selection(self, cut=False, place=True, stroke=None):
         """Ctrl+J: the selected area becomes a layer of its own (Ctrl+Shift+J = cut it out of the page as well).
-        Nothing selected = a copy of the selected layer.  The new layer opens at once: every tool works on it alone."""
+        A brush stroke that still waits for its nodes (Color brush / Erase brush) becomes a layer by itself.
+        Nothing selected = a copy of the selected layer; no layer selected either = a copy of the whole picture.
+        The new layer opens at once: every tool works on it alone."""
         if not self._loaded:
             return
+        if stroke is None and self.canvas.has_node_stroke():
+            taken = self.canvas.take_node_stroke()          # the stroke is NOT painted on the page, it goes into the layer
+            if taken is not None:
+                kind, spts = taken
+                s = self.scale
+                stroke = {"kind": kind, "payload": [(x / s, y / s) for x, y in spts], "size": self.sizeSlider.value(),
+                          "rgb": tuple(self.fill_rgb), "opacity": self.opSlider.value() / 100.0,
+                          "soft": self.softSlider.value()}
+                if kind == "paint":
+                    cut = False                                 # a paint stroke is not on the page yet: there is nothing to cut out
         if self._tool == "transform" and self._place_id is not None:
             self._end_layer_session()
         tf_pts = None
         if self._tool == "transform" and self._place_id is None and self.ctx is None and self.canvas.in_transform():
             tf_pts = self.canvas.transform_params()          # Ctrl+T was running: the layer gets the transformed shape,
             self._go_move()                                  # the main picture stays exactly as it was (nothing is applied to it)
-        if self.sel is None:
+        whole = False
+        if self.sel is None and stroke is None:
             if self.sel_layer is not None and self._layer(self.sel_layer) is not None and not cut:
                 self.duplicate_layer(self.sel_layer)
-            else:
-                self._warn("Nothing is selected. Select an area first (Select menu), then press Ctrl+J to make it a layer.")
-            return
+                return
+            if cut:
+                self._warn("Nothing is selected. Select an area first (Select menu), then press Ctrl+Shift+J to cut it to a layer.")
+                return
+            whole = True                                     # nothing selected, no layer chosen: the whole picture is copied to a layer
         inlayer = self.ctx is not None
         parent = self._layer(self.ctx) if inlayer else None
         if inlayer and (parent is None or parent["n"] != 1):
@@ -3982,14 +3997,30 @@ class Card(QWidget):
         label = "Cutting to a layer" if cut else "Making a layer"
 
         def work(progress):
-            mask = self._mask_img(sel, base.size)
+            if stroke is not None and stroke["kind"] == "paint":
+                # the stroke alone: painted white on black, the red channel is its soft-edged shape (inside the selection only)
+                mask = core.paint_brush(Image.new("RGB", base.size, (0, 0, 0)), stroke["payload"], stroke["size"],
+                                        (255, 255, 255), 1.0, stroke["soft"], sel, None).getchannel("R")
+            elif stroke is not None:                                   # an erase stroke: its area is what goes into the layer
+                mask = core.make_mask(base.size, "brush", stroke["payload"], brush=stroke["size"])
+                if sel is not None:
+                    m = np.asarray(mask, dtype=np.float32) * core.resize_mask(sel, base.size)
+                    mask = Image.fromarray(np.clip(m, 0, 255).astype(np.uint8))
+            elif whole:
+                mask = Image.new("L", base.size, 255)
+            else:
+                mask = self._mask_img(sel, base.size)
             bb = mask.point(lambda v: 255 if v > 8 else 0).getbbox()
             if bb is None:
                 return None
             progress(0.2, "")
-            shown = core.render_full(base, adjs, look, sel)            # what you SEE is what the layer gets
-            rgb = shown.crop(bb)
             a = mask.crop(bb)
+            if stroke is not None and stroke["kind"] == "paint":
+                rgb = Image.new("RGB", (bb[2] - bb[0], bb[3] - bb[1]), stroke["rgb"])
+                a = a.point(lambda v, f=max(0.0, min(1.0, stroke["opacity"])): int(v * f + 0.5))
+            else:
+                shown = core.render_full(base, adjs, look, sel)        # what you SEE is what the layer gets
+                rgb = shown.crop(bb)
             if alpha is not None:
                 a = ImageChops.multiply(a, alpha.crop(bb))
             if a.getextrema()[1] < 8:
@@ -4040,9 +4071,10 @@ class Card(QWidget):
                 self.show_tab(self.TAB_LAYERS)
                 self._refresh_layers_ui()
                 if place and not inlayer:
-                    self.sel = None                       # the part is a layer now: no selection left on the page
-                    self._sel_ver += 1
-                    self.canvas.set_selection(None)
+                    if stroke is None:
+                        self.sel = None                   # the part is a layer now: no selection left on the page
+                        self._sel_ver += 1
+                        self.canvas.set_selection(None)
                     self.place_layer_tool(lid)            # border at once: move / resize / rotate, sliders work on it
                 else:
                     self.edit_layer(lid)

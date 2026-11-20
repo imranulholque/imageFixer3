@@ -1354,6 +1354,23 @@ class ImageCanvas(QWidget):
         self._node_drag = None
         self.update()
 
+    def has_node_stroke(self):
+        return self._nodes is not None
+
+    def take_node_stroke(self):
+        """Ctrl+J while a stroke waits for its nodes: hands the stroke over as (kind, points) WITHOUT painting it on the page
+        (the caller turns it into a layer).  None = no stroke is waiting."""
+        n = self._nodes
+        if n is None:
+            return None
+        pts = nodecurve.sample(n["nodes"], self._node_step(), n["closed"])
+        self._nodes = None
+        self._node_drag = None
+        self.update()
+        if len(pts) < 2:
+            return None
+        return n["kind"], pts
+
     def _node_press(self, e):
         """A click while nodes are shown: grab a node, add one on the curve, remove one (right click), or - anywhere else -
         apply the stroke (that click is only used for this).  True = the click is used up."""

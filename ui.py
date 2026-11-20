@@ -474,7 +474,7 @@ SHORTCUT_GROUPS = (
         ("Ctrl+A", "Select all"),
         ("Ctrl+D", "Deselect"),
         ("Ctrl+Shift+I", "Inverse selection"),
-        ("Ctrl+J", "New layer from the selection (nothing selected = copy of the selected layer)"),
+        ("Ctrl+J", "New layer: from the selection, or from the brush stroke you just drew (nodes still showing). Nothing selected = copy of the selected layer / the whole picture"),
         ("Ctrl+Shift+J", "Cut the selection to a new layer (the place is filled from the paper around it)"),
         ("Shift + select", "Add to selection"),
         ("Alt + select", "Subtract from selection"),
