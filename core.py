@@ -2141,11 +2141,12 @@ def sel_grow(m, px):
     return out if float(out.max()) > 0.02 else None
 
 
-def paint_brush(img, pts, brush, rgb, opacity=1.0, softness=0.0, sel=None, alpha=None):
+def paint_brush(img, pts, brush, rgb, opacity=1.0, softness=0.0, sel=None, alpha=None, restore=None):
     """Color brush (like a paint brush in a picture editor).  pts = brush stroke in real picture pixels, brush = width.
     Paints `rgb` along the stroke.  sel = selection (float 0..1, any size) -> paint only inside it; None = everywhere.
     alpha = PIL 'L' transparency of a placed picture -> paint only where the picture is (transparent stays transparent).
-    opacity 0..1, softness 0 (hard edge) .. 100 (very soft).  Only the part around the stroke is processed (fast)."""
+    opacity 0..1, softness 0 (hard edge) .. 100 (very soft).  Only the part around the stroke is processed (fast).
+    restore = PIL picture of the same size: instead of a colour the brush brings back THAT picture (the eraser of the Color brush)."""
     img = img if img.mode == "RGB" else img.convert("RGB")
     W, H = img.size
     if not pts:
@@ -2176,7 +2177,10 @@ def paint_brush(img, pts, brush, rgb, opacity=1.0, softness=0.0, sel=None, alpha
         a = a * (np.asarray(alpha.crop((x0, y0, x1, y1)), dtype=np.float32) / 255.0)
     a = a * float(max(0.0, min(1.0, opacity)))
     reg = np.asarray(img.crop((x0, y0, x1, y1)), dtype=np.float32)
-    col = np.array([int(v) for v in rgb], dtype=np.float32)
+    if restore is not None and restore.size == img.size:
+        col = np.asarray(restore.convert("RGB").crop((x0, y0, x1, y1)), dtype=np.float32)
+    else:
+        col = np.array([int(v) for v in rgb], dtype=np.float32)
     res = reg + (col - reg) * a[..., None]
     out = img.copy()
     out.paste(Image.fromarray(np.clip(res + 0.5, 0, 255).astype(np.uint8)), (x0, y0))

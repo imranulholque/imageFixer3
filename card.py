@@ -1362,7 +1362,7 @@ class Card(QWidget):
         self.chkNodes = QCheckBox("Nodes")
         self.chkNodes.setChecked(False)
         self.chkNodes.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.chkNodes.setToolTip("Color brush / Erase brush: after the stroke you can drag its nodes to reshape it.\n"
+        self.chkNodes.setToolTip("Color brush: after the stroke you can drag its nodes to reshape it.\n"
                                  "Click the line = add a node, right click a node = remove it.\n"
                                  "Enter or a click elsewhere applies it, Esc cancels.")
         self.chkNodes.toggled.connect(lambda on: (self.canvas.set_node_edit(bool(on)), _pref_set("edit_nodes", bool(on))))
@@ -1400,11 +1400,15 @@ class Card(QWidget):
         self.snapCheck.setChecked(True)
         self.snapCheck.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.snapCheck.setToolTip("If a stroke is close to a straight line, circle, oval, triangle or rectangle, it becomes a clean one.")
+        self.chkPaintErase = QCheckBox("Erase paint")
+        self.chkPaintErase.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.chkPaintErase.setToolTip("The brush brings back the picture as it was before you painted: it removes only the paint you made\n"
+                                      "(Size, Softness and Opacity work the same).  Hold Shift while drawing = a straight line.")
         self.brushSwatch = QPushButton()
         self.brushSwatch.setFixedSize(34, 24)
         self.brushSwatch.setToolTip("Brush color. Click to choose another color.")
         for w in (self._label("Opacity"), self.opSlider, self.lblOp, self._label("Softness"), self.softSlider,
-                  self.lblSoft, self._label("Smooth"), self.smoothSlider, self.lblSmooth, self.snapCheck,
+                  self.lblSoft, self._label("Smooth"), self.smoothSlider, self.lblSmooth, self.snapCheck, self.chkPaintErase,
                   self._label("Color"), self.brushSwatch):
             pb.addWidget(w)
         a.addWidget(self.paintBox)
@@ -1519,6 +1523,7 @@ class Card(QWidget):
         self.softSlider.valueChanged.connect(self._sync_paint)
         self.smoothSlider.valueChanged.connect(self._sync_paint)
         self.snapCheck.toggled.connect(self._sync_paint)
+        self.chkPaintErase.toggled.connect(self._sync_paint)
         self.brushSwatch.clicked.connect(self._pick_fill)
         self.modeGroup.idClicked.connect(lambda i: self._set_sel_mode(("new", "add", "sub", "int")[i]))
         self.btnSelAll.clicked.connect(self.select_all)
@@ -5783,7 +5788,7 @@ class Card(QWidget):
         self.optsB.setVisible(sel_t or key in MOVE_KEYS)
         self.modeBox.setVisible(sel_t)
         self.sizeBox.setVisible(key in ("quick", "brush", "erase_brush", "deselect", "paint"))
-        self.chkNodes.setVisible(key in ("paint", "erase_brush"))
+        self.chkNodes.setVisible(key == "paint")
         self.paintBox.setVisible(key == "paint")
         self.tolBox.setVisible(key in ("quick", "color", "deselect"))
         self._tol_mode(key)
@@ -5858,6 +5863,22 @@ class Card(QWidget):
         self.lblSmooth.setText("%d%%" % self.smoothSlider.value())
         self.canvas.set_paint(self.fill_rgb, self.opSlider.value() / 100.0,
                               self.smoothSlider.value(), self.snapCheck.isChecked())
+        self.canvas.paint_erase = self.chkPaintErase.isChecked()
+        self.chkNodes.setEnabled(not self.chkPaintErase.isChecked())      # an eraser never has nodes
+        self.canvas.update()
+
+    _paint_snaps = None                          # [(picture, picture before the painting began)] : what the paint eraser brings back
+
+    def _paint_snap_for(self, base):
+        for b, snap in reversed(self._paint_snaps or []):
+            if b is base:
+                return snap
+        return None
+
+    def _paint_track(self, snap):
+        """After a stroke: the picture now showing remembers what it looked like before the painting began."""
+        self._paint_snaps = (self._paint_snaps or []) + [(self.base, snap)]
+        self._paint_snaps = self._paint_snaps[-6:]
 
     def _on_paint(self, pts):
         """A Color Brush stroke: paint it with the fill color - inside the selection only, or anywhere without one."""
@@ -5870,10 +5891,20 @@ class Card(QWidget):
         base, sel, alpha = self.base, self.sel, self.alpha
         if self.ctx is None:
             alpha = None
+        before = self._paint_snap_for(base)                     # the picture before this painting began (None = no paint yet)
+        if self.chkPaintErase.isChecked():
+            if before is None:
+                self.message.emit("There is no paint to erase here. (Use the Erase tool to remove something from the picture itself.)")
+                return
+            self._fx_hint = {"rect": self._bbox_rect(pts, size * s / 2.0 + 2), "effect": "pulse", "detail": "paint erased"}
+            self._edit_base("Painting", lambda progress: core.paint_brush(base, payload, size, rgb, 1.0, soft, sel, alpha, restore=before),
+                            after=lambda: self._paint_track(before), msg="Paint erased. Ctrl+Z undoes the stroke.")
+            return
+        keep = before if before is not None else base
         self._fx_hint = {"rect": self._bbox_rect(pts, size * s / 2.0 + 2), "effect": "pulse",
                          "detail": "%d%% opacity, #%02X%02X%02X" % (round(opacity * 100), rgb[0], rgb[1], rgb[2])}
         self._edit_base("Painting", lambda progress: core.paint_brush(base, payload, size, rgb, opacity, soft, sel, alpha),
-                        msg="Painted. Ctrl+Z undoes the stroke.")
+                        after=lambda: self._paint_track(keep), msg="Painted. Ctrl+Z undoes the stroke.")
 
     def _on_source(self, x, y):
         self.clone_src = (x, y)

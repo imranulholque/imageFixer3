@@ -98,6 +98,7 @@ class ImageCanvas(QWidget):
         self._hold_timer.setInterval(300)                # was 1 s: the shape now appears after a short pause
         self._hold_timer.timeout.connect(self._hold_fire)
         self._hold_pts = None                 # the cleaned stroke shown after the hold (None = not yet)
+        self.paint_erase = False              # Color brush: the stroke brings the picture back (eraser of the paint)
         self.node_edit = False                # Color / Erase brush: after the stroke its nodes can be dragged before it is applied
         self._nodes = None                    # pending stroke: {'kind': 'paint'|'erase', 'nodes': [...], 'closed': bool}
         self._node_drag = None                # index of the node being dragged
@@ -1385,7 +1386,7 @@ class ImageCanvas(QWidget):
         z = self.zoom
         pts = [self.to_wid(QPointF(x, y)) for x, y in nodecurve.sample(n["nodes"], self._node_step(), n["closed"])]
         w = max(1.0, self.brush_prev * z)
-        if n["kind"] == "paint":
+        if n["kind"] == "paint" and not self.paint_erase:
             col = QColor(*self.paint_rgb)
             col.setAlphaF(max(0.35, self.paint_opacity))
         else:
@@ -1407,7 +1408,7 @@ class ImageCanvas(QWidget):
     def _hold_fire(self):
         """The mouse has been still for 0.3 s with the button down: show what the stroke will become (snapped shape or smooth)."""
         er = self._erase
-        if er is None or er["kind"] != "paint" or self.mode != self.PAINT or len(er["pts"]) < 2:
+        if er is None or er["kind"] != "paint" or self.mode != self.PAINT or len(er["pts"]) < 2 or er.get("line"):
             return
         raw = [(q.x(), q.y()) for q in er["pts"]]
         self._hold_pts = strokefix.clean(raw, self.paint_smooth, self.paint_snap, scale=1.0 / self.zoom)
@@ -1421,8 +1422,9 @@ class ImageCanvas(QWidget):
             raw = [(q.x(), q.y()) for q in er["pts"]]
             shown = self._hold_pts if self._hold_pts is not None else strokefix.smooth(raw, self.paint_smooth, scale=1.0 / self.zoom)
             pts = [self.to_wid(QPointF(x, y)) for x, y in shown]        # live preview is smoothed too (after a short stop: the final shape)
-            col = QColor(*self.paint_rgb)
-            col.setAlphaF(self.paint_opacity)
+            col = QColor(239, 68, 68, 140) if self.paint_erase else QColor(*self.paint_rgb)
+            if not self.paint_erase:
+                col.setAlphaF(self.paint_opacity)
             w = max(1.0, self.brush_prev * z)
             if len(pts) > 1:
                 p.setPen(QPen(col, w, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
@@ -1849,6 +1851,25 @@ class ImageCanvas(QWidget):
                 self._hold_anchor = pos
                 self._hold_pts = None
                 self._hold_timer.start()
+        er0 = self._erase
+        if er0 is not None and er0["kind"] in ("paint", "brush") and self.mode in (self.PAINT, self.ERASE) \
+                and (e.modifiers() & Qt.KeyboardModifier.ShiftModifier) and er0["pts"]:
+            a0 = er0["pts"][0]                         # Shift: a dead straight line from where the stroke began
+            ip = self._inside(self.to_img(pos))
+            dx, dy = ip.x() - a0.x(), ip.y() - a0.y()
+            dist = math.hypot(dx, dy)
+            ang = math.atan2(dy, dx)
+            q = round(ang / (math.pi / 4.0)) * (math.pi / 4.0)
+            if abs(ang - q) < math.radians(5.0):       # close to sideways / up-down / diagonal: exactly that
+                ang = q
+            er0["pts"] = [a0, self._inside(QPointF(a0.x() + dist * math.cos(ang), a0.y() + dist * math.sin(ang)))]
+            er0["line"] = True
+            self._hold_pts = None
+            self._hold_timer.stop()
+            self.update()
+            return
+        if er0 is not None and er0.get("line"):        # Shift let go: the stroke goes on from the end of the line
+            er0["line"] = False
         if self._erase is not None:
             ip = self._inside(self.to_img(pos))
             pts = self._erase["pts"]
@@ -1926,9 +1947,9 @@ class ImageCanvas(QWidget):
         if er is not None and self.mode == self.PAINT:
             if e.button() == Qt.MouseButton.LeftButton and er["kind"] == "paint":
                 raw = [(q.x(), q.y()) for q in er["pts"]]
-                final = self._hold_pts if self._hold_pts is not None else \
-                    strokefix.clean(raw, self.paint_smooth, self.paint_snap, scale=1.0 / self.zoom)
-                if not (self.node_edit and len(final) >= 2 and self._node_begin("paint", final)):
+                final = raw if er.get("line") else (self._hold_pts if self._hold_pts is not None else
+                                                   strokefix.clean(raw, self.paint_smooth, self.paint_snap, scale=1.0 / self.zoom))
+                if not (self.node_edit and not self.paint_erase and len(final) >= 2 and self._node_begin("paint", final)):
                     self.paintFinished.emit(final)
             self._hold_pts = None
             self.update()
@@ -1948,10 +1969,7 @@ class ImageCanvas(QWidget):
         if er is not None and e.button() == Qt.MouseButton.LeftButton:
             pts, kind = er["pts"], er["kind"]
             if kind in ("brush", "lasso"):
-                if kind == "brush" and self.node_edit and len(pts) >= 2 and self._node_begin(
-                        "erase", strokefix.smooth([(q.x(), q.y()) for q in pts], 40, scale=1.0 / self.zoom)):
-                    pass
-                elif kind == "brush" or len(pts) >= 3:
+                if kind == "brush" or len(pts) >= 3:
                     self.eraseFinished.emit(kind, [(q.x(), q.y()) for q in pts])
             elif len(pts) == 2 and abs(pts[0].x() - pts[1].x()) >= 3 and abs(pts[0].y() - pts[1].y()) >= 3:
                 self.eraseFinished.emit(kind, (pts[0].x(), pts[0].y(), pts[1].x(), pts[1].y()))
