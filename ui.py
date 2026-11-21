@@ -708,7 +708,6 @@ class MainWindow(QMainWindow):
         m.addSeparator()
         act("Save all edited...", self.save_all)
         act("All pages as one PDF", self.save_all_pdf)
-        act("Page numbers...", self.open_page_numbers)
         m.addSeparator()
         act("Clear all", self.clear_all)
         m.aboutToShow.connect(lambda: self.actMoreOpen.setEnabled(bool(self._dir())))
@@ -743,7 +742,6 @@ class MainWindow(QMainWindow):
         self.actSaveAs = act("Save as...", lambda: self._with_loaded(self.save_card_as))
         self.actSaveAll = act("Save all edited...", self.save_all)
         self.actPdfAll = act("All pages as one PDF", self.save_all_pdf)
-        self.actPageNums = act("Page numbers...", self.open_page_numbers)
         self.actPrint = act("Print...\tCtrl+P", lambda: self._with_loaded(lambda c: self.print_cards(self.print_targets())))
         m.addSeparator()
         self.actCopy = act("Copy picture\tCtrl+C", lambda: self._with_loaded(lambda c: c.copy_image()))
@@ -1772,9 +1770,6 @@ class MainWindow(QMainWindow):
         a = QAction("Choose the other program (.exe)...", self)
         a.triggered.connect(self.choose_print_exe)
         sub.addAction(a)
-        a = QAction("Page numbers...", self)
-        a.triggered.connect(self.open_page_numbers)
-        sub.addAction(a)
         sub.addSeparator()
         self.actPrintSleep = QAction("Other program only: after opening it go to the tray and sleep (saves RAM and power)", self)
         self.actPrintSleep.setCheckable(True)
@@ -1827,18 +1822,6 @@ class MainWindow(QMainWindow):
 
     def clear_print_exe(self):
         self._set_print_mode("windows")
-
-    def open_page_numbers(self):
-        """Page numbers: one setting for the print screen and for 'All pages as one PDF'."""
-        try:
-            from printstudio import PageNumberDialog, load_numspec
-        except ImportError:
-            self.say("Page numbers are not available in this build.")
-            return
-        if PageNumberDialog(self.settings, self).exec() == QDialog.DialogCode.Accepted:
-            sp = load_numspec(self.settings)
-            self.say("Page numbers are on: %s %s, first number %d. Used by Print and by All pages as one PDF."
-                     % ("bottom" if sp.pos == "bottom" else "top", sp.align, sp.start) if sp.on else "Page numbers are off.")
 
     def print_targets(self):
         """Ctrl+P: two or more selected thumbnails = all of them; otherwise only the picture that is being worked on."""
@@ -1988,17 +1971,24 @@ class MainWindow(QMainWindow):
         except Exception:                                     # no web engine in this build: the older Qt print screen
             printweb = None
         if printweb is not None:
+            everything = list(self.carousel.cards)               # the whole list, in the order of the thumbnails:
+            for c in cards:                                       # a page keeps its own number (picture 4 prints as 4)
+                if c not in everything:
+                    everything.append(c)
+            chosen = {c.uid for c in cards}
+
             def show(files):
-                files = [f for f in files if f and os.path.isfile(f)]
-                if not files:
+                pairs = [(f, c) for f, c in zip(files, everything) if f and os.path.isfile(f)]
+                ticked = {f for f, c in pairs if c.uid in chosen}
+                if not ticked:
                     self.say("Nothing to print.")
                     return
 
                 def go():
-                    if not printweb.open_print_screen(self, self.settings, files):
+                    if not printweb.open_print_screen(self, self.settings, [f for f, _ in pairs], ticked):
                         self._print_builtin_qt(cards)         # the print screen could not start: the older Qt one
                 QTimer.singleShot(0, go)
-            self._export_for_print(cards, "printing", show)
+            self._export_for_print(everything, "printing", show)
             return True
         return self._print_builtin_qt(cards)
 

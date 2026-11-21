@@ -109,6 +109,7 @@ def g_group(p): _rrect(p, 3, 3, 9, 9, 2); _rrect(p, 12, 12, 9, 9, 2); pen = QPen
 def g_ungroup(p): _rrect(p, 2.5, 2.5, 9, 9, 2); _rrect(p, 12.5, 12.5, 9, 9, 2); _line(p, 15, 4, 20, 9); _line(p, 20, 4, 15, 9)
 def g_check(p): _line(p, 5, 12.5, 10, 17.5, 19, 7)
 def g_keys(p): _rrect(p, 2.5, 6, 19, 12, 2.5); [_dot(p, x, 10, 0.8) for x in (7, 11, 15, 19)]; _line(p, 7, 14.5, 17, 14.5)
+def g_hash(p): _line(p, 9.5, 4, 7.5, 20); _line(p, 16.5, 4, 14.5, 20); _line(p, 4, 9, 20, 9); _line(p, 3.5, 15, 19.5, 15)
 
 
 GLYPHS = {k[2:]: v for k, v in list(globals().items()) if k.startswith("g_") and callable(v)}
@@ -151,7 +152,7 @@ COLORS = {
     "select": "#60a5fa", "move": "#a78bfa", "erase": "#fb923c", "crop": "#4ade80", "layer": "#c084fc", "group": "#2dd4bf", "ungroup": "#fb923c", "text": "#fbbf24",
     "prev": "#a5b4fc", "next": "#a5b4fc", "pageL": "#94a3b8", "pageR": "#94a3b8", "check": "#4ade80",
     "adjust": "#818cf8", "color": "#f472b6", "shadow": "#fbbf24", "textfix": "#34d399", "picture": "#38bdf8",
-    "aa": "#fb923c", "layers": "#c084fc", "border": "#2dd4bf",
+    "aa": "#fb923c", "layers": "#c084fc", "border": "#2dd4bf", "hash": "#a78bfa",
 }
 
 
