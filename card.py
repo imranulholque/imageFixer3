@@ -820,7 +820,7 @@ class LayerList(QListWidget):
 
 
 class Card(QWidget):
-    TAB_ADJUST, TAB_COLOR, TAB_SHADOW, TAB_TEXT, TAB_PICTURE, TAB_TEXTBOX, TAB_LAYERS, TAB_BORDER = range(8)   # order of the side tabs
+    TAB_ADJUST, TAB_COLOR, TAB_SHADOW, TAB_TEXT, TAB_PICTURE, TAB_TEXTBOX, TAB_LAYERS, TAB_BORDER, TAB_NUMBERS = range(9)   # order of the side tabs
     SIDE_W = 350                                                                     # width of the side panel (shared, drag to change)
     NARROW_W = 720                                                                   # a narrower picture card: the panel goes UNDER the picture
     SHORT_H = 520                                                                    # a lower card: the hint line is hidden (warnings still show)
@@ -1718,7 +1718,7 @@ class Card(QWidget):
         self.tabGroup = QButtonGroup(self)
         self.tabGroup.setExclusive(True)
         self.stackPages = QStackedWidget()
-        names = ("Adjust", "Color", "Shadow", "Text", "Picture", "Aa", "Layers", "Border")
+        names = ("Adjust", "Color", "Shadow", "Text", "Picture", "Aa", "Layers", "Border", "Numbers")
         for i, n in enumerate(names):
             b = QPushButton(n)
             b.setCheckable(True)
@@ -1729,13 +1729,15 @@ class Card(QWidget):
                 b.setToolTip("Text box: write Bangla / English text on the page (font, size, color, bold ...)")
             elif n == "Layers":
                 b.setToolTip("All pictures and text boxes on the page: drag up / down to change which one is in front")
+            elif n == "Numbers":
+                b.setToolTip("Page numbers for Print and \"All pages as one PDF\" (same setting as in the print screen)")
             elif n == "Border":
                 b.setToolTip("Add / remove a border on the selected layer(s) and choose its colour and thickness.\n"
                              "Only this tab changes a border: brightness, sharpness, shadow removal ... never touch it.")
-            _style_btn(b, ("adjust", "color", "shadow", "textfix", "picture", "aa", "layers", "border")[i], n,
+            _style_btn(b, ("adjust", "color", "shadow", "textfix", "picture", "aa", "layers", "border", "hash")[i], n,
                        "", label=("Textbox" if n == "Aa" else n), size=18, extra_tip=b.toolTip())
             b.setProperty("tab", True)
-            _tc = _ico_color(("adjust", "color", "shadow", "textfix", "picture", "aa", "layers", "border")[i])
+            _tc = _ico_color(("adjust", "color", "shadow", "textfix", "picture", "aa", "layers", "border", "hash")[i])
             b.setStyleSheet("QPushButton:checked { border-bottom: 3px solid %s; background: #1a1f2e; }" % _tc)
             self.tabGroup.addButton(b, i)
             tabs.addWidget(b, i // 3, i % 3)
@@ -2214,6 +2216,13 @@ class Card(QWidget):
         self.borderRow.changed.connect(lambda v: self._border_changed("width"))
         self.btnBorderAll.clicked.connect(self._border_all)
         self._paint_border_swatch()
+
+        # ---------------- Numbers tab: page numbers (one setting, shared with the print screen)
+        pg, lay = self._page()
+        from numpanel import NumberTab
+        lay.addWidget(NumberTab())
+        lay.addStretch(1)
+        self.stackPages.addWidget(pg)
 
         # ---------------- Save / share: no tab any more - the window's top bar (Save v) calls the same actions.
         # These buttons are kept (not shown) so the existing enable / disable and signals keep working.

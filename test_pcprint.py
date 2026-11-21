@@ -39,6 +39,21 @@ def main():
     check("settings answer", r.status_code == 200)
     r = c.get("/api/profiles?printer=x", base_url="http://127.0.0.1:53187")
     check("profile list answers", r.status_code == 200 and r.get_json() == [])
+    # page numbers: Image Fixer -> page (push_num), page -> Image Fixer (hook)
+    got = []
+    server.HOOKS["num"] = got.append
+    n0 = server.SREV["n"]
+    server.push_num({"on": True, "pos": "top", "align": "left", "size": 20, "start": 3, "bold": True, "margin": 5, "keep_own": True})
+    j = c.get("/api/settings", base_url="http://127.0.0.1:53187").get_json()
+    check("Image Fixer's page numbers reach the page", j.get("num", {}).get("pos") == "top" and "keep_own" not in j["num"]
+          and server.SREV["n"] == n0 + 1)
+    c.post("/api/settings", base_url="http://127.0.0.1:53187", json={"num": {"on": False, "pos": "bottom", "align": "center",
+                                                                        "size": 12, "start": 1, "bold": False, "margin": 8}})
+    check("a change on the page reaches Image Fixer", len(got) == 1 and got[0]["on"] is False)
+    server.HOOKS["num"] = None
+    server.EMBED_UNTICK[:] = ["x1"]
+    check("unticked list is served", c.get("/api/untick", base_url="http://127.0.0.1:53187").get_json() == ["x1"])
+    server.EMBED_UNTICK.clear()
     with server.SLOCK:
         for fid in list(server.FILES):
             server.drop_file(fid)

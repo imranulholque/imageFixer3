@@ -65,6 +65,49 @@ def login():
 
 
 ''')
+# page numbers: Image Fixer's Numbers tab <-> this page (one setting). Pages Image Fixer did not choose start unticked.
+s = rep(s, '@app.get("/api/settings")\ndef settings_get():', '''EMBED_UNTICK = []      # file ids that start unticked (the other open pictures of Image Fixer: they only keep the numbering right)
+
+
+@app.get("/api/untick")
+def untick():
+    return jsonify(list(EMBED_UNTICK))
+
+
+def push_num(num):
+    """Image Fixer changed the page numbers: write them where the page reads them. The page follows (like a change
+    made on the other side)."""
+    num = {k: num[k] for k in ("on", "pos", "align", "size", "start", "bold", "margin") if k in num}
+    try:
+        os.makedirs(CFG_DIR, exist_ok=True)
+        try:
+            with open(SET_FILE, "r", encoding="utf-8") as fh:
+                old = json.load(fh)
+        except Exception:
+            old = {}
+        if old.get("num") == num:
+            return
+        old["num"] = num
+        with open(SET_FILE, "w", encoding="utf-8") as fh:
+            json.dump(old, fh)
+        SREV["n"] += 1
+    except Exception:
+        pass
+
+
+@app.get("/api/settings")
+def settings_get():''')
+s = rep(s, '''        old.update(d)   # keys written by the other side survive
+        with open(SET_FILE, "w", encoding="utf-8") as fh:
+            json.dump(old, fh)
+        SREV["n"] += 1
+''', '''        old.update(d)   # keys written by the other side survive
+        with open(SET_FILE, "w", encoding="utf-8") as fh:
+            json.dump(old, fh)
+        SREV["n"] += 1
+        if isinstance(d.get("num"), dict) and HOOKS.get("num"):
+            HOOKS["num"](d["num"])        # Image Fixer follows (its Numbers tab)
+''')
 # index: same page, only the phone / update buttons are hidden (they belong to the stand-alone PC Print program)
 s = rep(s, '''    page = "index.html" if origin() == "pc" else "phone.html"
     r = send_file(res("static/" + page))
@@ -90,6 +133,6 @@ p = os.path.join(dst, "static", "index.html")
 h = open(p, encoding="utf-8").read()
 h = rep(h, "(async()=>{initAuto();upLoad();svLoad();", "(async()=>{if(!window.EMBED){initAuto();upLoad()}svLoad();")
 # Image Fixer opens straight on the preview page (step 2); "Back to pages" still goes to the page list
-h = rep(h, "await refresh(true);setInterval(", "await refresh(true);if(window.EMBED&&FILES.length)go(2);setInterval(")
+h = rep(h, "await refresh(true);setInterval(", "await refresh(true);if(window.EMBED){try{const u=await (await api('/api/untick')).json();FILES.forEach(f=>{if(u.includes(f.id))for(let p=0;p<f.pages;p++)DESEL.add(key(f.id,p))});renderPages()}catch{}if(FILES.length)go(2)}setInterval(")
 open(p, "w", encoding="utf-8").write(h)
 print("ok", len(s.splitlines()), "lines in server.py")
