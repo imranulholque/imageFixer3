@@ -4,7 +4,7 @@ import time
 
 import numpy as np
 from PySide6.QtCore import QPointF, QRect, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QBrush, QColor, QImage, QPainter, QPainterPath, QPen, QPolygonF, QTransform
+from PySide6.QtGui import QBrush, QColor, QFont, QImage, QPainter, QPainterPath, QPen, QPolygonF, QTransform
 from PySide6.QtWidgets import QAbstractSpinBox, QApplication, QComboBox, QLineEdit, QPlainTextEdit, QTextEdit, QWidget
 
 import core
@@ -65,6 +65,7 @@ class ImageCanvas(QWidget):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMinimumSize(240, 240)
         self._img = None
+        self.page_no_fn = None                              # () -> this picture's page number (set by the Card)
         self._bare = None                     # the page WITHOUT the layers (shown instead of _img while layers are drawn live)
         self._grp, self._grp_ref = [], None    # the other selected layers (move / resize / rotate together with the open box)
         self._live = []                       # layers drawn live over it, at screen resolution: dicts img / pts / n
@@ -1120,6 +1121,63 @@ class ImageCanvas(QWidget):
 
     # -------------------------------------------------------------- paint
     def paintEvent(self, e):
+        self._paint_main(e)
+        if self._img is not None and self.page_no_fn is not None:
+            p = QPainter(self)
+            try:
+                self._paint_page_number(p)
+            finally:
+                p.end()
+
+    def _paint_page_number(self, p):
+        """The page number of this picture (its place among the thumbnails), where it will be printed.
+        The same setting as the Numbers tab / print screen. Only a preview: the picture itself is not changed."""
+        try:
+            n = self.page_no_fn()
+            if not n:
+                return
+            from numpanel import NumStore
+            spec = NumStore.get().spec()
+            if not spec.on:
+                return
+            iw, ih = self._img.width(), self._img.height()
+            if iw < 1 or ih < 1:
+                return
+            ppmm = iw / (297.0 if iw >= ih else 210.0)               # as printed on A4
+            k = self.zoom * ppmm                                       # screen pixels per mm
+            font = QFont("Times New Roman")
+            font.setBold(spec.bold)
+            font.setPixelSize(max(6, int(round(spec.size * 25.4 / 72 * k))))
+            p.setFont(font)
+            p.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+            text = str(spec.start - 1 + n)
+            fm = p.fontMetrics()
+            tr = fm.tightBoundingRect(text)
+            x0, y0 = self.off.x(), self.off.y()
+            W, H = iw * self.zoom, ih * self.zoom
+            m = spec.margin * k
+            if spec.align == "left":
+                x = x0 + m
+            elif spec.align == "right":
+                x = x0 + W - m - tr.width()
+            else:
+                x = x0 + (W - tr.width()) / 2
+            y = y0 + (m if spec.pos == "top" else H - m - tr.height())
+            # a thin light outline so it can be read on a dark or red picture too (the print is plain black)
+            from PySide6.QtGui import QPainterPath
+            path = QPainterPath()
+            path.addText(x - tr.left(), y - tr.top(), font, text)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            p.setPen(QPen(QColor(255, 255, 255, 230), max(2.0, font.pixelSize() * 0.12)))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawPath(path)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(0, 0, 0))
+            p.drawPath(path)
+        except Exception:
+            pass
+
+    def _paint_main(self, e):
         p = QPainter(self)
         p.fillRect(self.rect(), QColor("#0b0e13"))
         if self._img is None:

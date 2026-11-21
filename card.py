@@ -1510,6 +1510,12 @@ class Card(QWidget):
 
         # --- body: picture + tabs
         self.canvas = ImageCanvas()
+        self.canvas.page_no_fn = self._page_no
+        try:
+            from numpanel import NumStore
+            NumStore.get().changed.connect(lambda *_: self.canvas.update())     # Numbers tab / print screen changed
+        except Exception:
+            pass
         self.canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.canvas.setMinimumSize(120, 100)             # a small window must still be possible
         self.split = QSplitter(Qt.Orientation.Horizontal)          # drag the bar between picture and panel to resize
@@ -2830,6 +2836,15 @@ class Card(QWidget):
         self._cache = {}
 
     # ------------------------------------------------------------- loading
+    def _page_no(self):
+        """1-based place of this picture among the thumbnails (the carousel order), 0 when unknown."""
+        par = self.parentWidget()
+        cards = getattr(par, "cards", None)
+        try:
+            return cards.index(self) + 1 if cards else 0
+        except ValueError:
+            return 0
+
     def load_async(self, foreground=False):
         """Open the picture in a worker thread (reading + preview), so sliding to it never freezes the window.
         foreground = the picture the user is looking at: shows the progress bar.  Otherwise it is a quiet pre-load."""

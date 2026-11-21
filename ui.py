@@ -325,12 +325,20 @@ class Carousel(QWidget):
         self._idx = max(0, min(self._idx, len(self.cards) - 1))
         self._pos = float(self._idx)
         self._layout()
+        self._renumber()
         if self.cards:
             self.cards[self._idx].load_async(foreground=True)
         self.currentChanged.emit(self._idx)
 
     def current(self):
         return self.cards[self._idx] if self.cards else None
+
+    def _renumber(self):
+        """The order or the number of pictures changed: every picture shows its new page number."""
+        for c in self.cards:
+            cv = getattr(c, "canvas", None)
+            if cv is not None:
+                cv.update()
 
     def move_card(self, i, j):
         """Page order: the card at i goes to position j."""
@@ -342,6 +350,7 @@ class Carousel(QWidget):
         self._pos = float(j)
         self._anim.stop()
         self._layout()
+        self._renumber()
 
     def move_after(self, card, ref):
         """Puts `card` right behind `ref`.  The picture that is shown stays the picture that is shown."""
@@ -354,6 +363,7 @@ class Carousel(QWidget):
         self._pos = float(self._idx)
         self._anim.stop()
         self._layout()
+        self._renumber()
 
     def go_to(self, i, animate=True):
         if not self.cards:
@@ -1971,8 +1981,8 @@ class MainWindow(QMainWindow):
         except Exception:                                     # no web engine in this build: the older Qt print screen
             printweb = None
         if printweb is not None:
-            everything = list(self.carousel.cards)               # the whole list, in the order of the thumbnails:
-            for c in cards:                                       # a page keeps its own number (picture 4 prints as 4)
+            everything = [c for c in self.carousel.cards if c in cards]   # only the chosen pictures, in thumbnail order:
+            for c in cards:                                       # the print screen numbers them 1, 2, 3 ... itself
                 if c not in everything:
                     everything.append(c)
             chosen = {c.uid for c in cards}
@@ -1985,7 +1995,7 @@ class MainWindow(QMainWindow):
                     return
 
                 def go():
-                    if not printweb.open_print_screen(self, self.settings, [f for f, _ in pairs], ticked):
+                    if not printweb.open_print_screen(self, self.settings, [f for f, _ in pairs if f in ticked]):
                         self._print_builtin_qt(cards)         # the print screen could not start: the older Qt one
                 QTimer.singleShot(0, go)
             self._export_for_print(everything, "printing", show)
