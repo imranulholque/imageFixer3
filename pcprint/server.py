@@ -593,6 +593,35 @@ def move():
 
 
 # ------------------------------------------------------------- settings
+EMBED_UNTICK = []      # file ids that start unticked (the other open pictures of Image Fixer: they only keep the numbering right)
+
+
+@app.get("/api/untick")
+def untick():
+    return jsonify(list(EMBED_UNTICK))
+
+
+def push_num(num):
+    """Image Fixer changed the page numbers: write them where the page reads them. The page follows (like a change
+    made on the other side)."""
+    num = {k: num[k] for k in ("on", "pos", "align", "size", "start", "bold", "margin") if k in num}
+    try:
+        os.makedirs(CFG_DIR, exist_ok=True)
+        try:
+            with open(SET_FILE, "r", encoding="utf-8") as fh:
+                old = json.load(fh)
+        except Exception:
+            old = {}
+        if old.get("num") == num:
+            return
+        old["num"] = num
+        with open(SET_FILE, "w", encoding="utf-8") as fh:
+            json.dump(old, fh)
+        SREV["n"] += 1
+    except Exception:
+        pass
+
+
 @app.get("/api/settings")
 def settings_get():
     try:
@@ -619,6 +648,8 @@ def settings_set():
         with open(SET_FILE, "w", encoding="utf-8") as fh:
             json.dump(old, fh)
         SREV["n"] += 1
+        if isinstance(d.get("num"), dict) and HOOKS.get("num"):
+            HOOKS["num"](d["num"])        # Image Fixer follows (its Numbers tab)
     except Exception:
         pass
     return jsonify(ok=True)
