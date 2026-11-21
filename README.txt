@@ -322,3 +322,26 @@ Border tab (side panel, new):
   * With no layer selected the tab shows the border that the next ID card scan will use.
   * The border is drawn on the finished layer: brightness, contrast, sharpness, shadow removal, colours, tint and
     opacity never change its colour. Only the Border tab changes it.
+
+
+PRINT SCREEN (Ctrl+P)  - now has the same preview features as PC Print (PrintMerged)
+ Image Fixer's own print screen stays the default (no other program has to open, so nothing hangs and Image Fixer does not have to sleep).
+ Settings > Print can still send printing to another program; both ways work side by side.  Page numbers are in the print screen,
+ in More > Page numbers and in Settings > Print (one setting for all of them, also used by "All pages as one PDF").
+ - Page range (left, under "Pages"): type 1-5, 8, 10-12 and press Enter.  Empty = all pages.  "x of y selected" is shown.
+ - Transform (button above the sheets) now has: Fit (F), Perspective crop (C), Select all (Ctrl+A), Cut (Ctrl+X), Copy, Paste,
+   Duplicate (Ctrl+D), Delete, Add picture, Reset page, Reset all, Undo / Redo, and "?" = every shortcut.
+ - The numbers of the selected picture: W / H (lock = keep the shape), X / Y of the centre, Rot, in mm / cm / in.
+ - Perspective crop: pull 4 corners onto the area you want; edge handle = whole edge; inside = whole shape; Alt = magnets off; 3x
+   magnifier at the corner; arrow keys (Shift = 10 px); Enter = apply, Esc = cancel; "Remove crop" gives the whole picture back.
+   The area is cut from the ORIGINAL picture: a straight crop copies the pixels exactly, a slanted one is straightened once (bicubic).
+ - R turns the selected pictures 90 degrees (Shift + R = back).  With nothing selected (also with Transform off): mouse on a page =
+   that page, mouse elsewhere = all pages.
+ - Buttons above every sheet (Transform): "+ Blank page after" and "x Remove page".  Reset all brings back removed pages, removes added blank pages,
+   turns every page back and clears all Transform changes.  Ctrl+Z / Ctrl+Y undo everything (pictures, pages, turns).
+ - Changes made in Transform stay in use for printing when Transform is switched off (Reset all undoes them).
+ - Sharp / Fast (screen only, the printout is always full quality), Fit page, Fit width, 100% (Ctrl+0), Ctrl + wheel zoom.
+ - Presets (right side): save printer, paper, orientation, colour, two-sided, copies and layout under a name, and load them again.
+ - Ctrl+V with nothing copied: a picture from the clipboard becomes a new page.  Dropping picture files on the window adds them as pages.
+ - Not copied from PC Print on purpose: the first "choose files" page (Image Fixer already has the pictures) and the Windows DEVMODE printer
+   profiles (presets above cover the same settings; "Printer properties..." still opens the driver's own window).

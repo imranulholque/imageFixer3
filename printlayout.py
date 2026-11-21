@@ -140,11 +140,28 @@ class Page:
         self.size = size                  # (w, h) pixels of the full picture, known after load / make_preview
         self.preview = None
         self.error = None
+        self.turn = 0                     # extra clockwise turn of the whole page (0 / 90 / 180 / 270), set with the R key
+        self.base = None                  # perspective crop: the page this one was cut from ...
+        self.quad = None                  # ... and the 4 corners (0..1 of that page: TL, TR, BR, BL)
 
     def load(self):
         if self.blank or self.loader is None:
             return None
-        return flatten(self.loader())
+        img = flatten(self.loader())
+        if self.turn % 360:
+            img = img.rotate(-(self.turn % 360), expand=True)
+        return img
+
+    def turn_by(self, deg):
+        """Turns the whole page (a multiple of 90, clockwise).  The small screen copy is turned at once."""
+        deg = int(round(deg / 90.0)) * 90 % 360
+        if not deg or self.blank:
+            return
+        self.turn = (self.turn + deg) % 360
+        if self.preview is not None:
+            self.preview = self.preview.rotate(-deg, expand=True)
+        if self.size and deg in (90, 270):
+            self.size = (self.size[1], self.size[0])
 
     def make_preview(self):
         """Loads the picture once, keeps only a small copy.  Returns False when it could not be read."""
@@ -245,6 +262,214 @@ def fit_geometry(page, aw, ah, mode, pct, rotate):
     else:
         s = min(aw / fw, ah / fh)
     return nw * s, nh * s, (270.0 if rot else 0.0)
+
+
+# ------------------------------------------------------------------------------------------------ page range ("1-5, 8, 10-12")
+def parse_range(text, total):
+    """'1-5, 8, 10-12' -> (set of page numbers inside 1..total, list of words that are not understood, True if some number
+    was outside 1..total).  Separators: comma, semicolon, space.  Dash can also be written as en / em dash or colon."""
+    out, bad, over = set(), [], False
+    t = (text or "").strip()
+    for ch in "\u2013\u2014:":
+        t = t.replace(ch, "-")
+    t = "-".join(part.strip() for part in t.split("-")) if "-" in t else t
+    for tok in [x for x in t.replace(";", ",").replace(" ", ",").split(",") if x]:
+        a, _, b = tok.partition("-")
+        if not a.isdigit() or (_ and not b.isdigit()):
+            bad.append(tok)
+            continue
+        lo, hi = int(a), int(b) if b else int(a)
+        if lo > hi:
+            lo, hi = hi, lo
+        if lo < 1 or hi > total:
+            over = True
+        out.update(range(max(1, lo), min(hi, total) + 1))
+    return out, bad, over
+
+
+def compress_range(nums):
+    """[1,2,3,5,8,9] -> '1-3, 5, 8, 9'  (two in a row are written with a comma, three or more with a dash)."""
+    nums = sorted(set(nums))
+    out, i = [], 0
+    while i < len(nums):
+        j = i
+        while j + 1 < len(nums) and nums[j + 1] == nums[j] + 1:
+            j += 1
+        if j > i + 1:
+            out.append("%d-%d" % (nums[i], nums[j]))
+        elif j == i + 1:
+            out.append("%d, %d" % (nums[i], nums[j]))
+        else:
+            out.append(str(nums[i]))
+        i = j + 1
+    return ", ".join(out)
+
+
+# ------------------------------------------------------------------------------------------------ perspective crop
+# The crop is 4 corners (TL, TR, BR, BL) as numbers 0..1 of the whole picture, flattened: [x0, y0, x1, y1, x2, y2, x3, y3].
+# The area is cut from the ORIGINAL picture: a straight rectangle copies the pixels (nothing resampled), a slanted one is
+# straightened once (bicubic) into a picture as big as its longest sides.
+CROP_EPS = 0.75                          # pixels: a quad whose sides are this straight counts as a rectangle
+CROP_MAX_PIXELS = 120_000_000
+
+
+def full_quad():
+    return [0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0]
+
+
+def quad_is_full(q, eps=1e-4):
+    return all(abs(a - b) <= eps for a, b in zip(q, full_quad()))
+
+
+def quad_valid(q, min_side=0.02):
+    """Convex, clockwise, none of the sides tiny."""
+    P = [(q[2 * i], q[2 * i + 1]) for i in range(4)]
+    for i in range(4):
+        a, b, c = P[i], P[(i + 1) % 4], P[(i + 2) % 4]
+        if math.hypot(b[0] - a[0], b[1] - a[1]) < min_side:
+            return False
+        if (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0]) <= 1e-9:
+            return False
+    return True
+
+
+def crop_natural_mm(q, w_mm, h_mm):
+    """Size (mm) of the straightened area when the whole picture is w_mm x h_mm."""
+    P = [(q[2 * i] * w_mm, q[2 * i + 1] * h_mm) for i in range(4)]
+    d = lambda a, b: math.hypot(a[0] - b[0], a[1] - b[1])
+    return max(d(P[0], P[1]), d(P[3], P[2])), max(d(P[0], P[3]), d(P[1], P[2]))
+
+
+def _solve8(A, B):
+    n = 8
+    M = [list(map(float, A[i])) + [float(B[i])] for i in range(n)]
+    for c in range(n):
+        piv = max(range(c, n), key=lambda r: abs(M[r][c]))
+        if abs(M[piv][c]) < 1e-12:
+            raise ValueError("degenerate crop")
+        M[c], M[piv] = M[piv], M[c]
+        for r in range(c + 1, n):
+            f = M[r][c] / M[c][c]
+            if f:
+                for k in range(c, n + 1):
+                    M[r][k] -= f * M[c][k]
+    x = [0.0] * n
+    for r in range(n - 1, -1, -1):
+        x[r] = (M[r][n] - sum(M[r][k] * x[k] for k in range(r + 1, n))) / M[r][r]
+    return x
+
+
+def persp_coeffs(dst, src):
+    """Pillow PERSPECTIVE coefficients: for each pixel of the output rectangle dst, where to read in the source quad."""
+    A, B = [], []
+    for (x, y), (X, Y) in zip(dst, src):
+        A.append([x, y, 1, 0, 0, 0, -X * x, -X * y])
+        B.append(X)
+        A.append([0, 0, 0, x, y, 1, -Y * x, -Y * y])
+        B.append(Y)
+    return _solve8(A, B)
+
+
+def straighten(img, Q):
+    """Q = 4 corners (TL, TR, BR, BL) in pixels of img -> that area as an upright picture."""
+    W, H = img.size
+    TL, TR, BR, BL = Q
+    if (abs(TL[0] - BL[0]) <= CROP_EPS and abs(TR[0] - BR[0]) <= CROP_EPS
+            and abs(TL[1] - TR[1]) <= CROP_EPS and abs(BL[1] - BR[1]) <= CROP_EPS):
+        x0, x1 = round((TL[0] + BL[0]) / 2), round((TR[0] + BR[0]) / 2)
+        y0, y1 = round((TL[1] + TR[1]) / 2), round((BL[1] + BR[1]) / 2)
+        x0, y0 = max(0, min(W - 1, x0)), max(0, min(H - 1, y0))
+        x1, y1 = max(x0 + 1, min(W, x1)), max(y0 + 1, min(H, y1))
+        return img.crop((x0, y0, x1, y1))
+    Q = [(min(W - 0.5, max(0.5, x)), min(H - 0.5, max(0.5, y))) for x, y in Q]
+    d = lambda a, b: math.hypot(a[0] - b[0], a[1] - b[1])
+    TL, TR, BR, BL = Q
+    ow, oh = max(d(TL, TR), d(BL, BR)), max(d(TL, BL), d(TR, BR))
+    if ow * oh > CROP_MAX_PIXELS:
+        k = math.sqrt(CROP_MAX_PIXELS / (ow * oh))
+        ow, oh = ow * k, oh * k
+    ow, oh = max(1, round(ow)), max(1, round(oh))
+    coeffs = persp_coeffs([(0, 0), (ow, 0), (ow, oh), (0, oh)], Q)
+    return img.transform((ow, oh), Image.Transform.PERSPECTIVE, coeffs, Image.Resampling.BICUBIC)
+
+
+def crop_image(img, q):
+    W, H = img.size
+    return straighten(img, [(q[2 * i] * W, q[2 * i + 1] * H) for i in range(4)])
+
+
+def make_crop_page(key, base, q):
+    """A new Page that shows the perspective crop q of page base (cut from the full original when it is printed).
+    Its size and dpi are worked out from the base page, so it can be placed before its own small copy exists."""
+    q = [float(v) for v in q]
+    pg = Page(key, base.name, loader=lambda: crop_image(base.load(), q), dpi=base.dpi)
+    pg.base, pg.quad = base, q
+    if base.size:
+        bw, bh = base.size
+        ow, oh = crop_natural_mm(q, bw, bh)
+        pg.size = (max(1, round(ow)), max(1, round(oh)))
+    return pg
+
+
+# ------------------------------------------------------------------------------------------------ Transform helpers
+def item_bbox(it):
+    """The turned picture's outline on the sheet: (left, top, right, bottom) in mm."""
+    cs = item_corners(it)
+    xs, ys = [c[0] for c in cs], [c[1] for c in cs]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def group_bbox(items):
+    bs = [item_bbox(i) for i in items]
+    return min(b[0] for b in bs), min(b[1] for b in bs), max(b[2] for b in bs), max(b[3] for b in bs)
+
+
+def fit_group(items, aw, ah):
+    """The Fit button: the pictures (several = kept together as a group) go inside the printable area aw x ah, same shape,
+    centred.  Changes the items; returns False when there is nothing to fit."""
+    if not items:
+        return False
+    x0, y0, x1, y1 = group_bbox(items)
+    bw, bh = x1 - x0, y1 - y0
+    if not (bw > 0 and bh > 0):
+        return False
+    f = min(aw / bw, ah / bh)
+    gx, gy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+    for it in items:
+        it["cx"] = aw / 2.0 + (it["cx"] - gx) * f
+        it["cy"] = ah / 2.0 + (it["cy"] - gy) * f
+        it["w"] = _clamp(it["w"] * f, MIN_ITEM_MM, MAX_ITEM_MM)
+        it["h"] = _clamp(it["h"] * f, MIN_ITEM_MM, MAX_ITEM_MM)
+    return True
+
+
+def center_group(items, aw, ah):
+    if not items:
+        return False
+    x0, y0, x1, y1 = group_bbox(items)
+    dx, dy = aw / 2.0 - (x0 + x1) / 2.0, ah / 2.0 - (y0 + y1) / 2.0
+    for it in items:
+        it["cx"] += dx
+        it["cy"] += dy
+    return True
+
+
+UNITS = {"mm": 1.0, "cm": 10.0, "in": 25.4}
+
+
+def unit_text(v_mm, unit):
+    """A length in mm as the text of a field in mm / cm / in."""
+    u = UNITS.get(unit, 1.0)
+    return ("%.*f" % ({"mm": 1, "cm": 2, "in": 3}.get(unit, 1), v_mm / u)).rstrip("0").rstrip(".") or "0"
+
+
+def from_unit(text, unit):
+    """Text of a field -> mm, or None when it is not a number."""
+    try:
+        v = float(str(text).replace(",", ".").strip())
+    except Exception:
+        return None
+    return v * UNITS.get(unit, 1.0) if math.isfinite(v) else None
 
 
 # ------------------------------------------------------------------------------------------------ n-up
@@ -386,7 +611,7 @@ def plan(pages, nums, nup, copies, lay=None):
     for p in pages:
         items = None
         if lay is not None:
-            items = lay.get(p.key, [])
+            items = lay.get(p.key)           # None = this sheet has no layout of its own: it looks the normal way
         sheets.append(Sheet("blank" if p.blank else "page", [p], [nums.get(p.key)], key=p.key, items=items))
     return sheets, copies
 
@@ -694,6 +919,35 @@ class TransformModel:
         for key, it in self.selected():
             it["rot"] = (it["rot"] + deg) % 360.0
             self.edited.add(key)
+
+    def select_sheet(self, key):
+        self.sel = [it["id"] for it in self.lay.get(key, [])]
+
+    def set_fields(self, it, key, w=None, h=None, x=None, y=None, rot=None, lock=True):
+        """The numeric fields: W / H (lock = keep the shape), X / Y of the centre (mm), turn (degrees).  Returns True if changed."""
+        before = (it["w"], it["h"], it["cx"], it["cy"], it["rot"])
+        if w is not None or h is not None:
+            ar = it["w"] / max(1e-6, it["h"])
+            if w is not None:
+                w = _clamp(w, MIN_ITEM_MM, MAX_ITEM_MM)
+                it["h"] = _clamp(w / ar, MIN_ITEM_MM, MAX_ITEM_MM) if lock else it["h"]
+                it["w"] = w
+            else:
+                h = _clamp(h, MIN_ITEM_MM, MAX_ITEM_MM)
+                it["w"] = _clamp(h * ar, MIN_ITEM_MM, MAX_ITEM_MM) if lock else it["w"]
+                it["h"] = h
+            if h is not None and w is not None and not lock:
+                it["h"] = _clamp(h, MIN_ITEM_MM, MAX_ITEM_MM)
+        if x is not None:
+            it["cx"] = x
+        if y is not None:
+            it["cy"] = y
+        if rot is not None:
+            it["rot"] = rot % 360.0
+        changed = before != (it["w"], it["h"], it["cx"], it["cy"], it["rot"])
+        if changed:
+            self.edited.add(key)
+        return changed
 
     def forget_unedited(self):
         """Paper / scale changed: sheets the user never touched get their normal look again."""

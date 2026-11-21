@@ -14,14 +14,18 @@ import math
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 
-from PIL import Image
+from PIL import Image, ImageOps
+import json
+import os
+
 from PySide6.QtCore import QObject, QPointF, QRect, QRectF, QRunnable, QSize, Qt, QThreadPool, QTimer, Signal
-from PySide6.QtGui import (QColor, QCursor, QFont, QIcon, QImage, QPageLayout, QPageSize, QPainter, QPen, QPixmap, QPolygonF)
+from PySide6.QtGui import (QColor, QCursor, QFont, QIcon, QImage, QPageLayout, QPageSize, QPainter, QPainterPath, QPen,
+                           QPixmap, QPolygonF)
 from PySide6.QtPrintSupport import QPrintDialog, QPrinter, QPrinterInfo
-from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog, QFormLayout, QFrame,
-                               QGridLayout, QGroupBox, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMenu,
-                               QMessageBox, QProgressBar, QPushButton, QScrollArea, QSpinBox, QToolButton, QVBoxLayout,
-                               QWidget)
+from PySide6.QtWidgets import (QAbstractItemView, QAbstractSpinBox, QApplication, QCheckBox, QComboBox, QDialog,
+                               QDoubleSpinBox, QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QInputDialog,
+                               QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu, QMessageBox, QProgressBar,
+                               QPushButton, QScrollArea, QSpinBox, QToolButton, QVBoxLayout, QWidget)
 
 import printlayout as pl
 
@@ -369,6 +373,7 @@ class SheetCanvas(QWidget):
     changed = Signal()               # the Transform layout was edited
     current = Signal(int)            # the sheet in use changed
     message = Signal(str)
+    selection = Signal()             # the selected pictures (or one of them, while dragging) changed
 
     PAD, GAP = 20, 30
     HIT_PX = 8
@@ -385,6 +390,7 @@ class SheetCanvas(QWidget):
         self.opt = pl.Options()
         self.mono = False
         self.transform = False
+        self.sharp = True                # Sharp / Fast: only the picture on the screen, never the printout
         self.cur = 0
         self.gen = 0
         self.imgs = OrderedDict()
@@ -420,6 +426,24 @@ class SheetCanvas(QWidget):
         self._reset_images()
         self._relayout()
         self.update()
+
+    def set_sharp(self, on):
+        self.sharp = bool(on)
+        self.qcache.clear()
+        self._reset_images()
+        self.update()
+
+    def target_sheet(self):
+        """The sheet under the mouse, otherwise the sheet in use."""
+        i = self.sheet_at(self.mapFromGlobal(QCursor.pos()))
+        return i if i is not None else self.cur
+
+    def _hdr_rects(self, i):
+        """The two small buttons above a sheet (Transform): remove this page / add a blank page after it."""
+        pr = self._paper_rect(i)
+        dele = QRectF(pr.right() - 92, pr.y() - 23, 92, 18)
+        add = QRectF(dele.left() - 122, pr.y() - 23, 116, 18)
+        return dele, add
 
     def _reset_images(self):
         self.gen += 1
@@ -482,7 +506,7 @@ class SheetCanvas(QWidget):
         if i in self.pending or i in self.imgs or i >= len(self.sheets):
             return
         self.pending.add(i)
-        rp = max(3.0, min(8.0, self.ppm * self.devicePixelRatioF()))
+        rp = max(3.0, min(8.0, self.ppm * self.devicePixelRatioF())) if self.sharp else max(1.2, min(2.5, self.ppm * 0.6))
         W, H = max(1, int(self.area[2] * rp)), max(1, int(self.area[3] * rp))
         gen = self.gen
         job = _RenderJob(self.sig, gen, i, self.sheets[i], self.opt, W, H, W / max(1.0, self.area[2]), self.mono,
@@ -519,9 +543,10 @@ class SheetCanvas(QWidget):
         if pg is None or pg.preview is None:
             return None
         pv = pg.preview
-        if max(pv.size) > 1000:
+        side = 1000 if self.sharp else 450
+        if max(pv.size) > side:
             pv = pv.copy()
-            pv.thumbnail((1000, 1000), Image.BILINEAR)
+            pv.thumbnail((side, side), Image.BILINEAR)
         q = pil_to_qimage(pv)
         self.qcache[pk] = q
         while len(self.qcache) > 40:
@@ -531,7 +556,7 @@ class SheetCanvas(QWidget):
     # ---------------------------------------------------------------- painting
     def paintEvent(self, e):
         p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, self.sharp)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         clip = e.rect()
         p.fillRect(clip, self.palette().window())
@@ -561,6 +586,18 @@ class SheetCanvas(QWidget):
         p.drawText(QPointF(pr.x(), pr.y() - 8), label)
         f.setBold(False)
         p.setFont(f)
+        if self.transform and sheet.kind in ("page", "blank"):
+            dele, add = self._hdr_rects(i)
+            p.setPen(QPen(QColor(150, 150, 150), 1))
+            p.setBrush(QColor(255, 255, 255, 230))
+            p.drawRoundedRect(add, 4, 4)
+            p.setPen(QColor(30, 100, 40))
+            p.drawText(add, Qt.AlignmentFlag.AlignCenter, "+ Blank page after")
+            p.setPen(QPen(QColor(150, 150, 150), 1))
+            p.drawRoundedRect(dele, 4, 4)
+            p.setPen(QColor(190, 40, 40))
+            p.drawText(dele, Qt.AlignmentFlag.AlignCenter, "\u2715 Remove page")
+            p.setPen(self.palette().windowText().color())
         if self.transform and sheet.kind in ("page", "blank"):
             p.save()
             p.setClipRect(ar)
@@ -714,11 +751,21 @@ class SheetCanvas(QWidget):
         model = self.dlg.model
         mods = e.modifiers()
         ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
+        for si, sh in enumerate(self.sheets):                 # the two small buttons above every sheet
+            if sh.kind in ("page", "blank"):
+                dele, add = self._hdr_rects(si)
+                if dele.contains(pos):
+                    self.dlg.remove_page(sh.key)
+                    return
+                if add.contains(pos):
+                    self.dlg.insert_blank_after(sh.key)
+                    return
         hh = self._handle_hit(pos)
         if hh:
             si, it, h = hh
             self._push()
             self.drag = {"kind": "rot" if h == "rot" else "size", "handle": h, "si": si, "id": it["id"], "orig": dict(it)}
+            self.selection.emit()
             return
         if i is not None and self.can_edit(i):
             x, y = self.to_mm(i, pos)
@@ -736,11 +783,13 @@ class SheetCanvas(QWidget):
                         origin[iid] = (self._index_of_key(key), it["cx"], it["cy"])
                     self.drag = {"kind": "move", "ids": ids, "origin": origin, "start": QPointF(pos), "moved": False,
                                  "copy": bool(mods & Qt.KeyboardModifier.AltModifier), "pushed": False}
+                self.selection.emit()
                 self.update()
                 return
         if not ctrl:
             model.select([])
         self.drag = {"kind": "rubber", "a": QPointF(pos), "b": QPointF(pos), "add": ctrl, "base": list(model.sel)}
+        self.selection.emit()
         self.update()
 
     def mouseMoveEvent(self, e):
@@ -794,6 +843,7 @@ class SheetCanvas(QWidget):
                 it["rot"] = pl.rotation_for(d["orig"], x, y, snap=shift)
                 self.tag = "Rotate  %.0f\u00b0" % it["rot"]
             model.touch(key)
+            self.selection.emit()
             self.update()
         elif d["kind"] == "rubber":
             d["b"] = QPointF(pos)
@@ -805,6 +855,7 @@ class SheetCanvas(QWidget):
                     x1, y1 = self.to_mm(i, r.bottomRight())
                     ids.update(model.in_rect(self.sheets[i].key, x0, y0, x1, y1))
             model.sel = list(ids)
+            self.selection.emit()
             self.update()
 
     def mouseReleaseEvent(self, e):
@@ -840,6 +891,10 @@ class SheetCanvas(QWidget):
     def _hover(self, pos):
         cur = Qt.CursorShape.ArrowCursor
         if self.transform:
+            for si, sh in enumerate(self.sheets):
+                if sh.kind in ("page", "blank") and any(r.contains(pos) for r in self._hdr_rects(si)):
+                    self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+                    return
             hh = self._handle_hit(pos)
             if hh:
                 cur = _CURSORS.get(hh[2], cur)
@@ -860,43 +915,66 @@ class SheetCanvas(QWidget):
 
     # ---------------------------------------------------------------- keys + actions (also used by the tool buttons)
     def keyPressEvent(self, e):
+        if not self.handle_key(e):
+            e.ignore()
+
+    def handle_key(self, e):
+        """All the shortcuts of the print screen.  True = used.  (Also called by the window, so they work wherever the focus is.)"""
+        K, KM = Qt.Key, Qt.KeyboardModifier
         k, mods = e.key(), e.modifiers()
-        ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
-        if not self.transform:
-            e.ignore()
-            return
-        step = 5.0 if mods & Qt.KeyboardModifier.ShiftModifier else 0.5
-        arrows = {Qt.Key.Key_Left: (-step, 0), Qt.Key.Key_Right: (step, 0), Qt.Key.Key_Up: (0, -step), Qt.Key.Key_Down: (0, step)}
-        if k in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
-            self.do_delete()
-        elif ctrl and k == Qt.Key.Key_C:
-            self.do_copy()
-        elif ctrl and k == Qt.Key.Key_V:
-            self.do_paste()
-        elif ctrl and (k == Qt.Key.Key_Y or (k == Qt.Key.Key_Z and mods & Qt.KeyboardModifier.ShiftModifier)):
+        ctrl, shift, alt = bool(mods & KM.ControlModifier), bool(mods & KM.ShiftModifier), bool(mods & KM.AltModifier)
+        if ctrl and k == K.Key_0:
+            self.dlg.zoom_100()
+        elif ctrl and (k == K.Key_Y or (k == K.Key_Z and shift)):
             self.dlg.do_redo()
-        elif ctrl and k == Qt.Key.Key_Z:
+        elif ctrl and k == K.Key_Z:
             self.dlg.do_undo()
-        elif ctrl and k == Qt.Key.Key_A:
-            self.do_select_all()
-        elif k == Qt.Key.Key_Escape:
-            self.dlg.model.select([])
-            self.update()
-        elif k in arrows and self.dlg.model.sel:
-            self._push()
-            for key, it in self.dlg.model.selected():
-                it["cx"] += arrows[k][0]
-                it["cy"] += arrows[k][1]
-                self.dlg.model.touch(key)
-            self.changed.emit()
-            self.update()
+        elif k == K.Key_R and not ctrl and not alt:          # works with Transform off too
+            self.dlg.rotate_key(-90 if shift else 90)
+        elif not self.transform:
+            return False
         else:
-            e.ignore()
+            step = 10.0 if shift else 1.0
+            arrows = {K.Key_Left: (-step, 0), K.Key_Right: (step, 0), K.Key_Up: (0, -step), K.Key_Down: (0, step)}
+            if k in (K.Key_Delete, K.Key_Backspace):
+                self.do_delete()
+            elif ctrl and k == K.Key_C:
+                self.do_copy()
+            elif ctrl and k == K.Key_X:
+                self.do_cut()
+            elif ctrl and k == K.Key_V:
+                self.do_paste()
+            elif ctrl and k == K.Key_D:
+                self.do_duplicate()
+            elif ctrl and k == K.Key_A:
+                self.do_select_all()
+            elif not ctrl and k == K.Key_F:
+                self.do_fit()
+            elif not ctrl and k == K.Key_C:
+                self.dlg.crop_selected()
+            elif k == K.Key_Escape and self.dlg.model.sel:
+                self.dlg.model.select([])
+                self.selection.emit()
+                self.update()
+            elif k in arrows and self.dlg.model.sel:
+                self._push()
+                for key, it in self.dlg.model.selected():
+                    it["cx"] += arrows[k][0]
+                    it["cy"] += arrows[k][1]
+                    self.dlg.model.touch(key)
+                self.changed.emit()
+                self.selection.emit()
+                self.update()
+            else:
+                return False
+        e.accept()
+        return True
 
     def _done(self, text=""):
         if text:
             self.message.emit(text)
         self.changed.emit()
+        self.selection.emit()
         self.update()
 
     def do_delete(self):
@@ -911,13 +989,46 @@ class SheetCanvas(QWidget):
         if n:
             self.message.emit("Copied %d picture(s). Ctrl+V puts them on the sheet in use." % n)
 
-    def do_paste(self):
+    def do_cut(self):
+        if not self.dlg.model.sel:
+            return
+        self.do_copy()
+        self.do_delete()
+
+    def do_duplicate(self):
         m = self.dlg.model
-        if not m.clip or not self.sheets or not self.can_edit(self.cur):
+        if not m.sel:
             return
         self._push()
-        n = len(m.paste(self.sheets[self.cur].key))
-        self._done("Pasted %d picture(s) on page %d." % (n, self.cur + 1))
+        new = m.duplicate(list(m.sel), 6.0, 6.0)
+        m.select(new)
+        self._done("Duplicated %d picture(s)." % len(new))
+
+    def do_fit(self):
+        m = self.dlg.model
+        sel = m.selected()
+        if not sel:
+            return
+        self._push()
+        by_sheet = {}
+        for key, it in sel:
+            by_sheet.setdefault(key, []).append(it)
+        for key, items in by_sheet.items():                 # each page's pictures are fitted (together) inside the printable area
+            pl.fit_group(items, self.area[2], self.area[3])
+            m.touch(key)
+        self._done("Fitted inside the printable area.")
+
+    def do_paste(self):
+        m = self.dlg.model
+        if not m.clip:
+            self.dlg.paste_clipboard_image()                 # nothing copied here: a picture from the clipboard becomes a page
+            return
+        i = self.target_sheet()
+        if not self.sheets or not self.can_edit(i):
+            return
+        self._push()
+        n = len(m.paste(self.sheets[i].key))
+        self._done("Pasted %d picture(s) on page %d." % (n, i + 1))
 
     def do_turn(self, deg):
         if not self.dlg.model.sel:
@@ -934,8 +1045,10 @@ class SheetCanvas(QWidget):
         self._done("Centered on the page.")
 
     def do_select_all(self):
-        if self.can_edit(self.cur):
-            self.dlg.model.select([it["id"] for it in self.dlg.model.lay.get(self.sheets[self.cur].key, [])])
+        i = self.target_sheet()
+        if self.can_edit(i):
+            self.dlg.model.select_sheet(self.sheets[i].key)
+            self.selection.emit()
             self.update()
 
     def do_reset_sheet(self):
@@ -972,6 +1085,290 @@ class SheetCanvas(QWidget):
         self._done("Added %s to page %d." % (pg.name or "the picture", self.cur + 1))
 
 
+# ================================================================================================ perspective crop
+class CropView(QWidget):
+    """The whole picture with 4 corner handles (like Photoshop's Perspective Crop).  The corners are numbers 0..1 of the whole
+    picture (TL, TR, BR, BL).  Corner = moves that corner, edge handle = moves the whole edge, inside = moves the shape.
+    Magnets: the picture's border and the straight line of the next corner (hold Alt to switch them off).
+    Arrow keys move the chosen corner (1 pixel of the original, Shift = 10)."""
+    HIT = 11
+    SNAP_PX = 8
+
+    def __init__(self, img, real_size, quad, parent=None):
+        super().__init__(parent)
+        self.img = img                                  # QImage (the screen copy)
+        self.rw, self.rh = max(1, real_size[0]), max(1, real_size[1])
+        self.q = list(quad)
+        self.sel = -1
+        self.drag = None
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setMinimumSize(620, 460)
+
+    # ---- geometry
+    def _rect(self):
+        m = 22
+        avail = QRectF(m, m, max(10, self.width() - 2 * m), max(10, self.height() - 2 * m))
+        ar = self.img.width() / float(max(1, self.img.height()))
+        w, h = avail.width(), avail.width() / ar
+        if h > avail.height():
+            w, h = avail.height() * ar, avail.height()
+        return QRectF(avail.center().x() - w / 2, avail.center().y() - h / 2, w, h)
+
+    def _pt(self, i, q=None):
+        q = q or self.q
+        r = self._rect()
+        return QPointF(r.x() + q[2 * i] * r.width(), r.y() + q[2 * i + 1] * r.height())
+
+    def _mid(self, i):
+        a, b = self._pt(i), self._pt((i + 1) % 4)
+        return QPointF((a.x() + b.x()) / 2, (a.y() + b.y()) / 2)
+
+    def poly(self):
+        return QPolygonF([self._pt(i) for i in range(4)])
+
+    def quad(self):
+        return list(self.q)
+
+    def set_quad(self, q):
+        self.q = list(q)
+        self.sel = -1
+        self.update()
+
+    # ---- painting
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        p.fillRect(self.rect(), QColor(40, 40, 44))
+        r = self._rect()
+        p.drawImage(r, self.img)
+        path = QPainterPath()
+        path.addRect(r)
+        inner = QPainterPath()
+        inner.addPolygon(self.poly())
+        inner.closeSubpath()
+        p.fillPath(path.subtracted(inner), QColor(0, 0, 0, 125))
+        p.setPen(QPen(ACCENT, 2))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPolygon(self.poly())
+        for i in range(4):
+            c = self._mid(i)
+            p.setPen(QPen(ACCENT, 1.5))
+            p.setBrush(QColor(255, 255, 255))
+            p.drawEllipse(c, 5, 5)
+        for i in range(4):
+            c = self._pt(i)
+            p.setPen(QPen(ACCENT, 2))
+            p.setBrush(ACCENT if i == self.sel else QColor(255, 255, 255))
+            p.drawRect(QRectF(c.x() - 6, c.y() - 6, 12, 12))
+        d = self.drag
+        if d and d["kind"] == "corner":
+            self._loupe(p, d["i"])
+        p.end()
+
+    def _loupe(self, p, i):
+        """A 3x magnifier next to the corner that is being moved."""
+        c = self._pt(i)
+        S, B = 40, 126
+        sx = self.q[2 * i] * self.img.width() - S / 2
+        sy = self.q[2 * i + 1] * self.img.height() - S / 2
+        bx = c.x() + 26 if c.x() + 26 + B < self.width() else c.x() - 26 - B
+        by = c.y() + 26 if c.y() + 26 + B < self.height() else c.y() - 26 - B
+        box = QRectF(bx, by, B, B)
+        p.save()
+        p.setClipRect(box)
+        p.fillRect(box, QColor(255, 255, 255))
+        p.drawImage(box, self.img, QRectF(sx, sy, S, S))
+        p.restore()
+        p.setPen(QPen(ACCENT, 2))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRect(box)
+        p.setPen(QPen(QColor(255, 0, 0, 200), 1))
+        p.drawLine(QPointF(box.center().x() - 8, box.center().y()), QPointF(box.center().x() + 8, box.center().y()))
+        p.drawLine(QPointF(box.center().x(), box.center().y() - 8), QPointF(box.center().x(), box.center().y() + 8))
+
+    # ---- mouse
+    def mousePressEvent(self, e):
+        self.setFocus()
+        if e.button() != Qt.MouseButton.LeftButton:
+            return
+        pos = e.position()
+        for i in range(4):
+            c = self._pt(i)
+            if abs(c.x() - pos.x()) <= self.HIT and abs(c.y() - pos.y()) <= self.HIT:
+                self.sel = i
+                self.drag = {"kind": "corner", "i": i, "start": QPointF(pos), "q0": list(self.q)}
+                self.update()
+                return
+        for i in range(4):
+            c = self._mid(i)
+            if abs(c.x() - pos.x()) <= self.HIT and abs(c.y() - pos.y()) <= self.HIT:
+                self.drag = {"kind": "edge", "i": i, "start": QPointF(pos), "q0": list(self.q)}
+                return
+        if self.poly().containsPoint(pos, Qt.FillRule.OddEvenFill):
+            self.drag = {"kind": "all", "start": QPointF(pos), "q0": list(self.q)}
+
+    def mouseMoveEvent(self, e):
+        pos = e.position()
+        d = self.drag
+        if d is None:
+            cur = Qt.CursorShape.ArrowCursor
+            if any(abs(self._pt(i).x() - pos.x()) <= self.HIT and abs(self._pt(i).y() - pos.y()) <= self.HIT for i in range(4)):
+                cur = Qt.CursorShape.CrossCursor
+            elif self.poly().containsPoint(pos, Qt.FillRule.OddEvenFill):
+                cur = Qt.CursorShape.SizeAllCursor
+            self.setCursor(QCursor(cur))
+            return
+        r = self._rect()
+        dx, dy = (pos.x() - d["start"].x()) / r.width(), (pos.y() - d["start"].y()) / r.height()
+        q = list(d["q0"])
+        free = bool(e.modifiers() & Qt.KeyboardModifier.AltModifier)
+        if d["kind"] == "corner":
+            i = d["i"]
+            x, y = min(1.0, max(0.0, q[2 * i] + dx)), min(1.0, max(0.0, q[2 * i + 1] + dy))
+            if not free:
+                x, y = self._magnets(i, x, y, q, r)
+            q[2 * i], q[2 * i + 1] = x, y
+        else:
+            idx = (d["i"], (d["i"] + 1) % 4) if d["kind"] == "edge" else (0, 1, 2, 3)
+            xs, ys = [q[2 * k] for k in idx], [q[2 * k + 1] for k in idx]
+            dx = max(-min(xs), min(1.0 - max(xs), dx))                 # the whole shape stays on the picture
+            dy = max(-min(ys), min(1.0 - max(ys), dy))
+            for k in idx:
+                q[2 * k] += dx
+                q[2 * k + 1] += dy
+        if pl.quad_valid(q):
+            self.q = q
+            self.update()
+
+    def _magnets(self, i, x, y, q, r):
+        tx, ty = self.SNAP_PX / r.width(), self.SNAP_PX / r.height()
+        for v in (0.0, 1.0):
+            if abs(x - v) <= tx:
+                x = v
+            if abs(y - v) <= ty:
+                y = v
+        for j in ((i + 1) % 4, (i + 3) % 4):                         # in line with the next corner (straight edge)
+            if abs(x - q[2 * j]) <= tx:
+                x = q[2 * j]
+            if abs(y - q[2 * j + 1]) <= ty:
+                y = q[2 * j + 1]
+        return x, y
+
+    def mouseReleaseEvent(self, e):
+        self.drag = None
+        self.update()
+
+    def keyPressEvent(self, e):
+        K = Qt.Key
+        if self.sel >= 0 and e.key() in (K.Key_Left, K.Key_Right, K.Key_Up, K.Key_Down):
+            st = 10.0 if e.modifiers() & Qt.KeyboardModifier.ShiftModifier else 1.0
+            q, i = list(self.q), self.sel
+            if e.key() == K.Key_Left:
+                q[2 * i] -= st / self.rw
+            elif e.key() == K.Key_Right:
+                q[2 * i] += st / self.rw
+            elif e.key() == K.Key_Up:
+                q[2 * i + 1] -= st / self.rh
+            else:
+                q[2 * i + 1] += st / self.rh
+            q[2 * i], q[2 * i + 1] = min(1.0, max(0.0, q[2 * i])), min(1.0, max(0.0, q[2 * i + 1]))
+            if pl.quad_valid(q):
+                self.q = q
+                self.update()
+            e.accept()
+            return
+        super().keyPressEvent(e)
+
+
+class CropDialog(QDialog):
+    """Pull the 4 corners onto the area you want; Apply cuts it out straight (from the original picture, lossless)."""
+
+    def __init__(self, parent, base_page, quad, had_crop, settings):
+        super().__init__(parent)
+        self.setWindowTitle("Perspective crop")
+        self.settings = settings
+        self.removed = False
+        v = QVBoxLayout(self)
+        tip = QLabel("Pull each corner onto a corner of the area you want (a skewed photo of a paper, a sign, a screen ...).  "
+                     "Edge handle = moves a whole edge  \u00b7  inside = moves the shape  \u00b7  Alt = magnets off  \u00b7  "
+                     "arrow keys move the chosen corner (Shift = 10 px)  \u00b7  Enter = apply  \u00b7  Esc = cancel")
+        tip.setWordWrap(True)
+        v.addWidget(tip)
+        size = base_page.size or base_page.preview.size
+        self.view = CropView(pil_to_qimage(base_page.preview), size, quad)
+        v.addWidget(self.view, 1)
+        self.chkFit = QCheckBox("Fit the cut-out inside the printable area afterwards")
+        self.chkFit.setChecked(settings.value("print/cropfit", False, type=bool))
+        v.addWidget(self.chkFit)
+        row = QHBoxLayout()
+        bReset = QPushButton("Reset corners")
+        bReset.clicked.connect(lambda: self.view.set_quad([0.03, 0.03, 0.97, 0.03, 0.97, 0.97, 0.03, 0.97]))
+        row.addWidget(bReset)
+        self.bRemove = QPushButton("Remove crop")
+        self.bRemove.setToolTip("Back to the whole picture")
+        self.bRemove.setVisible(bool(had_crop))
+        self.bRemove.clicked.connect(self._remove)
+        row.addWidget(self.bRemove)
+        row.addStretch(1)
+        bCancel = QPushButton("Cancel")
+        bCancel.clicked.connect(self.reject)
+        bOk = QPushButton("Apply")
+        bOk.setDefault(True)
+        bOk.setProperty("accent", True)
+        bOk.clicked.connect(self._ok)
+        row.addWidget(bCancel)
+        row.addWidget(bOk)
+        v.addLayout(row)
+        self.resize(900, 700)
+
+    def _ok(self):
+        self.settings.setValue("print/cropfit", self.chkFit.isChecked())
+        self.accept()
+
+    def _remove(self):
+        self.removed = True
+        self.settings.setValue("print/cropfit", self.chkFit.isChecked())
+        self.accept()
+
+    def quad(self):
+        return self.view.quad()
+
+    def fit_after(self):
+        return self.chkFit.isChecked()
+
+
+class HelpDialog(QDialog):
+    ROWS = (("Click", "select a picture"), ("Ctrl + click", "add / remove from the selection"),
+            ("Ctrl + A", "select all on the page under the mouse"), ("Drag", "move (all selected together)"),
+            ("Alt + drag", "copy (all selected together)"), ("Shift + drag", "move / copy dead straight, stays on its page"),
+            ("Corner handles", "resize  (Shift = free shape)"), ("Round handle", "turn  (Shift = 15\u00b0 steps)"),
+            ("F  /  Fit", "fit the selected picture(s) inside the printable area"),
+            ("C  /  Crop", "perspective crop of the selected picture (pull 4 corners, lossless)"),
+            ("R  /  Shift + R", "turn 90\u00b0 clockwise / back"),
+            ("R, nothing selected", "mouse on a page = that page  \u00b7  mouse elsewhere = all pages"),
+            ("Arrow keys", "nudge 1 mm  (Shift = 10 mm)"), ("Drag to another page", "move it there  (Alt + drag = copy there)"),
+            ("Ctrl + C / Ctrl + X", "copy / cut the selected pictures"),
+            ("Ctrl + V", "paste on the page under the mouse (or a picture from the clipboard as a new page)"),
+            ("Ctrl + D", "duplicate on the same page"), ("Ctrl + Z / Ctrl + Y", "undo / redo"),
+            ("Delete", "remove the selected pictures"), ("Drop a picture file", "add it as a new page"),
+            ("Ctrl + wheel / Ctrl + 0", "zoom / 100%"), ("Esc", "deselect"))
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("Print screen shortcuts")
+        g = QGridLayout(self)
+        g.setHorizontalSpacing(18)
+        for n, (k, t) in enumerate(self.ROWS):
+            a = QLabel("<b>%s</b>" % k)
+            g.addWidget(a, n, 0)
+            g.addWidget(QLabel(t), n, 1)
+        b = QPushButton("Close")
+        b.clicked.connect(self.accept)
+        g.addWidget(b, len(self.ROWS), 1, Qt.AlignmentFlag.AlignRight)
+
+
 # ================================================================================================ the print screen
 class PrintStudio(QDialog):
     def __init__(self, parent, settings, cards, checked_uids):
@@ -994,6 +1391,11 @@ class PrintStudio(QDialog):
                 self.checked.add(c.uid)
         if not self.checked and self.order:
             self.checked.add(self.order[0].key)
+        self._orig_order = list(self.order)              # for "Reset all"
+        self._ui_ready = False                            # set when the whole window is built
+        self.unit, self.lock = "mm", True                # the W / H / X / Y fields
+        self._crop_pages, self._crop_n, self._img_n = {}, 0, 0
+        self.setAcceptDrops(True)
         self.area = (5.0, 5.0, 200.0, 287.0)
         self.paper = (210.0, 297.0)
         self.sheets, self.pcopies = [], 1
@@ -1036,6 +1438,19 @@ class PrintStudio(QDialog):
         # ---- left: the pages
         left = QVBoxLayout()
         left.addWidget(QLabel("Pages  (tick = print)"))
+        rr = QHBoxLayout()
+        self.edRange = QLineEdit()
+        self.edRange.setPlaceholderText("All pages \u00b7 e.g. 1-5, 8, 10-12")
+        self.edRange.setClearButtonEnabled(True)
+        self.edRange.setToolTip("Type the pages to print, for example 1-5, 8, 10-12, and press Enter.  Empty = all pages")
+        self.edRange.returnPressed.connect(self._apply_range)
+        bRange = QPushButton("Apply")
+        bRange.clicked.connect(self._apply_range)
+        rr.addWidget(self.edRange, 1)
+        rr.addWidget(bRange)
+        left.addLayout(rr)
+        self.lblSelCount = QLabel("")
+        left.addWidget(self.lblSelCount)
         self.listPages = QListWidget()
         self.listPages.setIconSize(QSize(44, 56))
         self.listPages.setMinimumWidth(190)
@@ -1065,7 +1480,7 @@ class PrintStudio(QDialog):
         self.btnBlank.clicked.connect(self._add_blank)
         self.btnDelBlank = QToolButton()
         self.btnDelBlank.setText("\u2715")
-        self.btnDelBlank.setToolTip("Remove the selected blank page")
+        self.btnDelBlank.setToolTip("Take the selected page out of the printout (Ctrl+Z brings it back)")
         self.btnDelBlank.clicked.connect(self._del_blank)
         for w in (self.btnUp, self.btnDown, self.btnBlank, self.btnDelBlank):
             r2.addWidget(w)
@@ -1079,26 +1494,33 @@ class PrintStudio(QDialog):
         bar.setSpacing(4)
         self.btnTransform = QPushButton("Transform")
         self.btnTransform.setCheckable(True)
-        self.btnTransform.setToolTip("Move, resize, turn and copy the pictures on the sheets (not with several pages on one sheet)")
+        self.btnTransform.setToolTip("Move, resize, turn, crop and copy the pictures on the sheets (not with several pages on one sheet)")
         self.btnTransform.toggled.connect(self._transform_toggled)
         bar.addWidget(self.btnTransform)
         self.toolButtons = []
 
-        def tool(text, tip, fn):
+        def tool(text, tip, fn, row=None):
             b = QToolButton()
             b.setText(text)
             b.setToolTip(tip)
             b.clicked.connect(fn)
-            bar.addWidget(b)
+            (row if row is not None else bar).addWidget(b)
             self.toolButtons.append(b)
             return b
         self.canvas = SheetCanvas(self)
-        tool("\u21ba 90", "Turn the picture 90\u00b0 to the left", lambda: self.canvas.do_turn(-90))
-        tool("\u21bb 90", "Turn the picture 90\u00b0 to the right", lambda: self.canvas.do_turn(90))
-        tool("Center", "Put the picture in the middle of the page", self.canvas.do_center)
-        tool("Copy", "Copy the picture (Ctrl+C). Alt + drag copies too", self.canvas.do_copy)
-        tool("Paste", "Paste on the page in use (Ctrl+V)", self.canvas.do_paste)
-        tool("Delete", "Delete the picture (Del)", self.canvas.do_delete)
+        c = self.canvas
+        tool("\u21ba 90", "Turn the picture 90\u00b0 to the left (Shift + R)", lambda: c.do_turn(-90))
+        tool("\u21bb 90", "Turn the picture 90\u00b0 to the right (R)", lambda: c.do_turn(90))
+        tool("Center", "Put the picture in the middle of the page", c.do_center)
+        tool("Fit", "Fit the selected picture(s) inside the printable area, same shape, centred (F)", c.do_fit)
+        self.btnCrop = tool("\u2702 Perspective crop", "Pull 4 corners onto the area you want; it is cut out straight, lossless (C)",
+                            self.crop_selected)
+        tool("Select all", "Select every picture on the page (Ctrl+A)", c.do_select_all)
+        tool("Cut", "Cut the picture (Ctrl+X)", c.do_cut)
+        tool("Copy", "Copy the picture (Ctrl+C). Alt + drag copies too", c.do_copy)
+        tool("Paste", "Paste on the page under the mouse (Ctrl+V). With nothing copied, a picture from the clipboard becomes a page", c.do_paste)
+        tool("Duplicate", "Copy on the same page (Ctrl+D)", c.do_duplicate)
+        tool("Delete", "Delete the picture (Del)", c.do_delete)
         self.btnAddPic = QToolButton()
         self.btnAddPic.setText("Add picture \u25be")
         self.btnAddPic.setToolTip("Put another picture on the page in use")
@@ -1108,18 +1530,88 @@ class PrintStudio(QDialog):
         self.btnAddPic.setMenu(self.menuAdd)
         bar.addWidget(self.btnAddPic)
         self.toolButtons.append(self.btnAddPic)
-        tool("Reset page", "Back to the normal look of this page", self.canvas.do_reset_sheet)
-        self.btnUndo = tool("Undo", "Ctrl+Z", self.do_undo)
-        self.btnRedo = tool("Redo", "Ctrl+Y", self.do_redo)
         bar.addStretch(1)
         for text, tip, fn in (("\u2212", "Smaller", lambda: self.zoom_by(1 / 1.2)), ("+", "Bigger", lambda: self.zoom_by(1.2)),
-                              ("Fit width", "The sheet fills the width", self.fit_width), ("100%", "Zoom 100%", self.zoom_100)):
+                              ("Fit width", "The sheet fills the width", self.fit_width),
+                              ("Fit page", "The whole sheet is in view", self.fit_page),
+                              ("100%", "Zoom 100% (Ctrl+0)", self.zoom_100)):
             b = QToolButton()
             b.setText(text)
             b.setToolTip(tip)
             b.clicked.connect(fn)
             bar.addWidget(b)
+        self.btnSharp = QToolButton()
+        self.btnSharp.setCheckable(True)
+        self.btnSharp.setChecked(True)
+        self.btnSharp.setText("Sharp")
+        self.btnSharp.setToolTip("Screen only (the printout is always full quality).\nSharp = pictures in original quality on the screen.\n"
+                                 "Fast = light pictures on the screen: smoother with many or big pages.")
+        self.btnSharp.toggled.connect(self._sharp_toggled)
+        bar.addWidget(self.btnSharp)
         mid.addLayout(bar)
+
+        # ---- the Transform dock: more tools + the numbers of the selected picture
+        self.dock = QFrame()
+        self.dock.setFrameShape(QFrame.Shape.StyledPanel)
+        dv = QHBoxLayout(self.dock)
+        dv.setContentsMargins(6, 3, 6, 3)
+        dv.setSpacing(4)
+        tool("Reset page", "Back to the normal look of the page under the mouse", c.do_reset_sheet, dv)
+        tool("Reset all", "Back to the normal look of ALL pages: pictures, added / removed pages and turned pages", self.reset_all, dv)
+        self.btnUndo = tool("Undo", "Ctrl+Z", self.do_undo, dv)
+        self.btnRedo = tool("Redo", "Ctrl+Y", self.do_redo, dv)
+        self.btnHelp = QToolButton()
+        self.btnHelp.setText("?")
+        self.btnHelp.setToolTip("All the shortcuts of this screen")
+        self.btnHelp.clicked.connect(self.show_help)
+        dv.addWidget(self.btnHelp)
+        dv.addSpacing(14)
+        self.lblNoSel = QLabel("Select a picture to type its size and place.")
+        dv.addWidget(self.lblNoSel)
+        self.fieldsBox = QWidget()
+        fv = QHBoxLayout(self.fieldsBox)
+        fv.setContentsMargins(0, 0, 0, 0)
+        fv.setSpacing(4)
+
+        def field(label, name):
+            fv.addWidget(QLabel(label))
+            sp = QDoubleSpinBox()
+            sp.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+            sp.setKeyboardTracking(False)
+            sp.setMaximumWidth(84)
+            sp.editingFinished.connect(lambda n=name: self._field_edited(n))
+            fv.addWidget(sp)
+            return sp
+        self.spW = field("W", "w")
+        self.btnLock = QToolButton()
+        self.btnLock.setCheckable(True)
+        self.btnLock.setChecked(True)
+        self.btnLock.setText("Lock")
+        self.btnLock.setToolTip("Locked: typing W or H keeps the shape of the picture")
+        self.btnLock.toggled.connect(lambda on: setattr(self, "lock", bool(on)))
+        fv.addWidget(self.btnLock)
+        self.spH = field("H", "h")
+        self.spX = field("X", "x")
+        self.spY = field("Y", "y")
+        self.spR = field("Rot", "rot")
+        self.spR.setSuffix("\u00b0")
+        self.unitBtns = {}
+        for u in ("mm", "cm", "in"):
+            b = QToolButton()
+            b.setText(u)
+            b.setCheckable(True)
+            b.setChecked(u == "mm")
+            b.clicked.connect(lambda _=False, u=u: self._unit_changed(u))
+            fv.addWidget(b)
+            self.unitBtns[u] = b
+        self.lblMulti = QLabel("")
+        fv.addWidget(self.lblMulti)
+        dv.addWidget(self.fieldsBox)
+        dv.addStretch(1)
+        self.fieldsBox.hide()
+        self._unit_changed("mm")
+        mid.addWidget(self.dock)
+        self.dock.hide()
         self.scroll = QScrollArea()
         self.scroll.setWidget(self.canvas)
         self.scroll.setWidgetResizable(False)
@@ -1131,6 +1623,7 @@ class PrintStudio(QDialog):
         mid.addWidget(self.lblHint)
         body.addLayout(mid, 1)
         self.canvas.message.connect(self._say)
+        self.canvas.selection.connect(self.sync_fields)
         self.canvas.changed.connect(self._items_changed)
         self.canvas.current.connect(self._sheet_in_use)
 
@@ -1190,6 +1683,21 @@ class PrintStudio(QDialog):
         self.numpanel = PageNumberPanel(load_numspec(self.settings), show_keep_own=True)
         v3.addWidget(self.numpanel)
         pv.addWidget(g3)
+
+        g4 = QGroupBox("Presets")
+        v4 = QVBoxLayout(g4)
+        self.cbPreset = QComboBox()
+        self.cbPreset.setToolTip("Printer, paper, orientation, colour, two-sided, copies and layout, saved under a name")
+        self.cbPreset.activated.connect(self._preset_apply)
+        r4 = QHBoxLayout()
+        self.btnPresetSave, self.btnPresetDel = QPushButton("Save as..."), QPushButton("Delete")
+        self.btnPresetSave.clicked.connect(self._preset_save)
+        self.btnPresetDel.clicked.connect(self._preset_delete)
+        r4.addWidget(self.btnPresetSave)
+        r4.addWidget(self.btnPresetDel)
+        v4.addWidget(self.cbPreset)
+        v4.addLayout(r4)
+        pv.addWidget(g4)
         pv.addStretch(1)
         side.setWidget(panel)
         body.addWidget(side)
@@ -1227,7 +1735,9 @@ class PrintStudio(QDialog):
         self.chkTurn.toggled.connect(self._layout_changed)
         self.cbNup.currentIndexChanged.connect(self._nup_changed)
         self.numpanel.changed.connect(self._numbers_changed)
+        self._ui_ready = True
         self._restore_settings()
+        self._fill_presets()
         self._update_tools()
 
     # ---------------------------------------------------------------- settings memory
@@ -1251,6 +1761,12 @@ class PrintStudio(QDialog):
         self.chkTurn.setChecked(s.value("print/turn", True, type=bool))
         self.chkTurn.blockSignals(False)
         self.spPct.setEnabled(self.cbScale.currentData() == "custom")
+        sharp = s.value("print/sharp", True, type=bool)
+        self.btnSharp.blockSignals(True)
+        self.btnSharp.setChecked(sharp)
+        self.btnSharp.setText("Sharp" if sharp else "Fast")
+        self.btnSharp.blockSignals(False)
+        self.canvas.sharp = sharp
 
     def _save_settings(self, *_):
         s = self.settings
@@ -1460,7 +1976,10 @@ class PrintStudio(QDialog):
         self.model.sel = []
         self._update_tools()
         self._schedule()
-        self._say("Transform: drag a picture to move it (Shift = straight, Alt = copy), the corners resize, the round handle turns.")
+        if on:
+            self._say("Transform: drag a picture to move it (Shift = straight, Alt = copy), the corners resize, the round handle turns.  ? = all shortcuts.")
+        elif self.model.edited:
+            self._say("Your Transform changes are kept for printing.  Turn Transform on and press Reset all to undo them.")
 
     def _update_tools(self):
         on = self.btnTransform.isChecked()
@@ -1470,12 +1989,16 @@ class PrintStudio(QDialog):
             self.btnUndo.setEnabled(self.model.can_undo)
             self.btnRedo.setEnabled(self.model.can_redo)
         self.btnTransform.setEnabled(pl.get_nup(self.cbNup.currentData()) == 1)
+        self.dock.setVisible(on)
+        if on:
+            self.btnCrop.setEnabled(len(self.model.sel) == 1)
         self.lblHint.setText("Drag = move  \u00b7  Shift + drag = straight  \u00b7  Alt + drag = copy  \u00b7  corners = resize  \u00b7  "
                              "round handle = turn (Shift = 15\u00b0 steps)  \u00b7  drag onto another page to move it there  \u00b7  Del = delete"
                              if on else "")
 
     def _items_changed(self):
         self._update_tools()
+        self.sync_fields()
 
     def _sheet_in_use(self, i):
         pass
@@ -1506,6 +2029,9 @@ class PrintStudio(QDialog):
                 if p.key not in self.model.lay:
                     self.model.lay[p.key] = self._default_items(p, aw, ah, mode, pct, rotate)
             lay = self.model.lay
+        elif nup == 1 and self.model.edited:                       # changed in Transform: stays in use when it is switched off
+            lay = {k: v for k, v in self.model.lay.items() if k in self.model.edited} or None
+        self._update_count()
         sheets, self.pcopies = pl.plan(ticked, nums, nup, copies, lay)
         self.sheets = sheets
         shown = pl.display_sheets(sheets) if nup > 1 else [(s, 1) for s in sheets]
@@ -1629,7 +2155,7 @@ class PrintStudio(QDialog):
     def _row_changed(self, row):
         key = self._current_key()
         pg = self.all_pages.get(key)
-        self.btnDelBlank.setEnabled(bool(pg and pg.blank))
+        self.btnDelBlank.setEnabled(pg is not None)
         i = self.first_sheet_of.get(key)
         if i is not None and i < len(self.canvas.sheets):
             self.canvas.scroll_to(i)
@@ -1644,7 +2170,10 @@ class PrintStudio(QDialog):
         self._schedule()
 
     def _add_blank(self):
-        key = self._current_key()
+        self.insert_blank_after(self._current_key())
+
+    def insert_blank_after(self, key):
+        """A blank white page after the page called key (the + button above a sheet, or the list's + Blank page)."""
         idx = next((i for i, p in enumerate(self.order) if p.key == key), len(self.order) - 1)
         self.model.push(self.extra_state())
         self._blank_n += 1
@@ -1656,17 +2185,23 @@ class PrintStudio(QDialog):
         self._schedule()
 
     def _del_blank(self):
-        key = self._current_key()
+        self.remove_page(self._current_key())
+
+    def remove_page(self, key):
+        """Takes a page out of the printout completely (Ctrl+Z brings it back)."""
         pg = self.all_pages.get(key)
-        if not pg or not pg.blank:
+        if pg is None or pg not in self.order or self._busy_print:
             return
         self.model.push(self.extra_state())
         idx = self.order.index(pg)
         self.order.remove(pg)
         self.checked.discard(key)
         self.model.lay.pop(key, None)
+        self.model.edited.discard(key)
+        self.model.sel = []
         self._fill_list(select=self.order[max(0, idx - 1)].key if self.order else None)
         self._schedule()
+        self._say("Page removed.  Ctrl+Z brings it back.")
 
     def _fill_add_menu(self):
         self.menuAdd.clear()
@@ -1678,13 +2213,19 @@ class PrintStudio(QDialog):
 
     # ---------------------------------------------------------------- undo / redo (pictures + blank pages together)
     def extra_state(self):
-        return {"order": [p.key for p in self.order], "checked": set(self.checked)}
+        return {"order": [p.key for p in self.order], "checked": set(self.checked),
+                "turns": {k: p.turn for k, p in self.all_pages.items() if p.turn}}
 
     def _restore_extra(self, ex):
         if not ex:
             return
         self.order = [self.all_pages[k] for k in ex["order"] if k in self.all_pages]
         self.checked = set(ex["checked"])
+        for k, p in self.all_pages.items():
+            want = ex.get("turns", {}).get(k, 0)
+            if p.turn != want:
+                p.turn_by(want - p.turn)
+                self.canvas.qcache.pop(k, None)
         self._fill_list(select=self._current_key())
 
     def do_undo(self):
@@ -1698,6 +2239,372 @@ class PrintStudio(QDialog):
         if r is not None:
             self._restore_extra(r[0])
             self._rebuild()
+
+    # ---------------------------------------------------------------- page range
+    def _update_count(self):
+        n, total = len([p for p in self.order if p.key in self.checked]), len(self.order)
+        self.lblSelCount.setText("%d of %d selected" % (n, total))
+        if not self.edRange.hasFocus():
+            nums = [i + 1 for i, p in enumerate(self.order) if p.key in self.checked]
+            self.edRange.setText("" if n == total or n == 0 else pl.compress_range(nums))
+
+    def _apply_range(self):
+        text = self.edRange.text().strip()
+        if not text:
+            self._tick_all(True)
+            self._update_count()
+            return
+        total = len(self.order)
+        nums, bad, over = pl.parse_range(text, total)
+        if bad:
+            self._say("Cannot read: %s.  Use a format like 1-5, 8, 10-12" % ", ".join(bad))
+            return
+        if not nums:
+            self._say("No such page.  There are %d page(s)." % total)
+            return
+        self.checked = {p.key for i, p in enumerate(self.order) if (i + 1) in nums}
+        self._request_load([p for p in self.order if p.key in self.checked])
+        self.listPages.blockSignals(True)
+        for r in range(self.listPages.count()):
+            k = self.listPages.item(r).data(Qt.ItemDataRole.UserRole)
+            self.listPages.item(r).setCheckState(Qt.CheckState.Checked if k in self.checked else Qt.CheckState.Unchecked)
+        self.listPages.blockSignals(False)
+        self.edRange.clearFocus()
+        self._schedule()
+        self._say("Pages beyond %d were ignored." % total if over else "%d page(s) ticked." % len(nums))
+
+    # ---------------------------------------------------------------- the numbers (W / H / X / Y / Rot)
+    def _unit_changed(self, u):
+        self.unit = u
+        for k, b in self.unitBtns.items():
+            b.blockSignals(True)
+            b.setChecked(k == u)
+            b.blockSignals(False)
+        dec = {"mm": 1, "cm": 2, "in": 3}[u]
+        f = pl.UNITS[u]
+        for sp in (self.spW, self.spH, self.spX, self.spY):
+            sp.setDecimals(dec)
+            sp.setRange(-30000.0 / f, 30000.0 / f)
+        self.spR.setDecimals(1)
+        self.spR.setRange(-360.0, 360.0)
+        if self._ui_ready:
+            self.sync_fields()
+
+    def sync_fields(self):
+        """Shows the numbers of the selected picture (the last one selected)."""
+        on = self.btnTransform.isChecked()
+        sel = self.model.selected() if on else []
+        self._update_tools()
+        self.fieldsBox.setVisible(bool(sel))
+        self.lblNoSel.setVisible(not sel)
+        if not sel:
+            return
+        key, it = sel[-1]
+        multi = len(sel) > 1
+        vals = {self.spW: it["w"], self.spH: it["h"], self.spX: it["cx"], self.spY: it["cy"]}
+        for sp, v in vals.items():
+            if not sp.hasFocus():
+                sp.blockSignals(True)
+                sp.setValue(float(pl.unit_text(v, self.unit)))
+                sp.blockSignals(False)
+        if not self.spR.hasFocus():
+            self.spR.blockSignals(True)
+            self.spR.setValue(round(it["rot"] % 360.0, 1))
+            self.spR.blockSignals(False)
+        self.spX.setEnabled(not multi)
+        self.spY.setEnabled(not multi)
+        self.lblMulti.setText("%d selected" % len(sel) if multi else "")
+
+    def _field_edited(self, name):
+        if not self.btnTransform.isChecked() or self._busy_print:
+            return
+        sel = self.model.selected()
+        if not sel:
+            return
+        f = pl.UNITS[self.unit]
+        sp = {"w": self.spW, "h": self.spH, "x": self.spX, "y": self.spY, "rot": self.spR}[name]
+        v = sp.value() if name == "rot" else sp.value() * f
+        if name in ("w", "h") and v <= 0:
+            return
+        kw = {name: v}
+        targets = sel if name not in ("x", "y") else sel[-1:]
+        probe = [dict(it) for _k, it in targets]
+        if not any(self.model.set_fields(pi, k, lock=self.lock, **kw) for pi, (k, _it) in zip(probe, targets)):
+            return
+        self.model.push(self.extra_state())
+        for key, it in targets:
+            self.model.set_fields(it, key, lock=self.lock, **kw)
+        self._update_tools()
+        self.canvas.update()
+        self.sync_fields()
+
+    # ---------------------------------------------------------------- perspective crop
+    def _crop_page(self, base, q):
+        sig = (base.key, tuple(round(v, 6) for v in q))
+        if sig in self._crop_pages:
+            return self._crop_pages[sig]
+        self._crop_n += 1
+        pg = pl.make_crop_page("crop:%d" % self._crop_n, base, q)
+        self.all_pages[pg.key] = pg
+        self._crop_pages[sig] = pg
+        return pg
+
+    def crop_selected(self):
+        sel = self.model.selected()
+        if len(sel) != 1:
+            self._say("Select one picture, then press C (Perspective crop).")
+            return
+        key, it = sel[0]
+        pg = self.all_pages.get(it["pk"])
+        if pg is None or pg.blank:
+            return
+        base = pg.base if pg.base is not None else pg
+        start = pg.quad if pg.base is not None else pl.full_quad()
+        if base.preview is None:
+            self._request_load([base])
+            self._say("The picture is still loading.  Try again in a moment.")
+            return
+        dlg = CropDialog(self, base, start, pg.base is not None, self.settings)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        q = dlg.quad()
+        full = dlg.removed or pl.quad_is_full(q)
+        if full and pg.base is None:
+            return                                                   # nothing was cropped, nothing to remove
+        self.model.push(self.extra_state())
+        new = base if full else self._crop_page(base, q)
+        nw, nh = new.natural_mm()
+        sc = min(it["w"] / nw, it["h"] / nh)                          # the cut-out fits inside the box the picture had, same centre
+        if dlg.fit_after() and not full:
+            aw, ah = self.area[2], self.area[3]
+            if int(round(it["rot"])) % 180 == 90:
+                aw, ah = ah, aw
+            sc = min(aw / nw, ah / nh)
+            it["cx"], it["cy"] = self.area[2] / 2.0, self.area[3] / 2.0
+        it["pk"] = new.key
+        it["w"], it["h"] = nw * sc, nh * sc
+        self.model.touch(key)
+        self._request_load([new])
+        self.canvas.qcache.pop(new.key, None)
+        self._schedule()
+        self.canvas.update()
+        self.sync_fields()
+        self._say("Crop removed." if full else "Perspective crop applied.  Press C again to change the corners.")
+
+    # ---------------------------------------------------------------- turning pages (R) / reset all
+    def rotate_key(self, deg):
+        """R: turns the selected pictures; with nothing selected the page under the mouse, mouse elsewhere = all pages."""
+        if self._busy_print:
+            return
+        if self.btnTransform.isChecked() and self.model.sel:
+            self.canvas.do_turn(deg)
+            return
+        vp = self.scroll.viewport()
+        gp = QCursor.pos()
+        i = self.canvas.sheet_at(self.canvas.mapFromGlobal(gp)) if vp.rect().contains(vp.mapFromGlobal(gp)) else None
+        if i is not None and i < len(self.canvas.sheets):
+            pages = [p for p in self.canvas.sheets[i].pages if not p.blank]
+            where = "Page %d" % (i + 1)
+        else:
+            pages = [p for p in self.order if p.key in self.checked and not p.blank]
+            where = "All pages"
+        self.rotate_pages(pages, deg, where)
+
+    def rotate_pages(self, pages, deg, where=""):
+        if not pages:
+            return
+        self.model.push(self.extra_state())
+        keys = {p.key for p in pages}
+        for p in pages:
+            p.turn_by(deg)
+            self.canvas.qcache.pop(p.key, None)
+            if p.key not in self.model.edited:
+                self.model.lay.pop(p.key, None)                      # gets its normal look again, now for the turned shape
+        if int(round(deg / 90.0)) % 2:
+            for key, items in self.model.lay.items():
+                if key in self.model.edited:
+                    for it in items:
+                        if it["pk"] in keys:
+                            it["w"], it["h"] = it["h"], it["w"]
+        self.listPages.blockSignals(True)
+        for r in range(self.listPages.count()):
+            k = self.listPages.item(r).data(Qt.ItemDataRole.UserRole)
+            if k in keys:
+                self._set_icon(self.listPages.item(r), self.all_pages[k])
+        self.listPages.blockSignals(False)
+        self._schedule()
+        self._say("%s turned %d\u00b0 %s." % (where, abs(deg), "clockwise" if deg > 0 else "back"))
+
+    def reset_all(self):
+        """Back to the normal look of every page: pictures, added / removed pages and turned pages."""
+        if self._busy_print:
+            return
+        self.model.push(self.extra_state())
+        for p in self._orig_order:
+            if p not in self.order:
+                self.checked.add(p.key)                               # a removed page comes back, ticked
+        self.order = list(self._orig_order)
+        self.checked &= {p.key for p in self.order}
+        for p in self.all_pages.values():
+            if p.turn:
+                p.turn_by(-p.turn)
+                self.canvas.qcache.pop(p.key, None)
+        self.model.lay.clear()
+        self.model.edited.clear()
+        self.model.sel = []
+        self._fill_list(select=self._current_key())
+        self._request_load([p for p in self.order if p.key in self.checked])
+        self._schedule()
+        self._say("Everything is back to the normal look.  Ctrl+Z undoes this.")
+
+    def show_help(self):
+        HelpDialog(self).exec()
+
+    # ---------------------------------------------------------------- adding pictures as pages (clipboard / drop)
+    def _add_page_after_current(self, page):
+        key = self._current_key()
+        idx = next((i for i, p in enumerate(self.order) if p.key == key), len(self.order) - 1)
+        self.model.push(self.extra_state())
+        self.all_pages[page.key] = page
+        self.order.insert(idx + 1, page)
+        self.checked.add(page.key)
+        self._fill_list(select=page.key)
+        self._request_load([page])
+        self._schedule()
+
+    def add_image_file(self, path):
+        try:
+            with Image.open(path) as im:
+                dpi = im.info.get("dpi", (300, 300))[0]
+        except Exception:
+            self._say("Could not read %s" % os.path.basename(path))
+            return False
+
+        def loader(p=path):
+            im = Image.open(p)
+            im.load()
+            return ImageOps.exif_transpose(im)
+        self._img_n += 1
+        try:
+            dpi = float(dpi)
+        except Exception:
+            dpi = 300.0
+        self._add_page_after_current(pl.Page("img:%d" % self._img_n, os.path.basename(path), loader=loader,
+                                             dpi=dpi if 36 <= dpi <= 2400 else 300.0))
+        return True
+
+    def paste_clipboard_image(self):
+        md = QApplication.clipboard().mimeData()
+        if md is not None and md.hasUrls():
+            n = sum(1 for u in md.urls() if u.isLocalFile() and self.add_image_file(u.toLocalFile()))
+            if n:
+                self._say("Added %d picture(s) as new page(s)." % n)
+                return
+        q = QApplication.clipboard().image()
+        if q.isNull():
+            self._say("Nothing to paste.")
+            return
+        q = q.convertToFormat(QImage.Format.Format_RGBA8888)
+        im = Image.frombuffer("RGBA", (q.width(), q.height()), bytes(q.constBits()), "raw", "RGBA", q.bytesPerLine(), 1).copy()
+        self._img_n += 1
+        self._add_page_after_current(pl.Page("img:%d" % self._img_n, "Pasted picture", loader=lambda im=im: im.copy(), dpi=150.0))
+        self._say("Pasted the clipboard picture as a new page.")
+
+    IMG_EXT = (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff", ".webp")
+
+    def dragEnterEvent(self, e):
+        if not self._busy_print and e.mimeData().hasUrls():
+            e.acceptProposedAction()
+
+    def dropEvent(self, e):
+        n = 0
+        for u in e.mimeData().urls():
+            f = u.toLocalFile()
+            if f and f.lower().endswith(self.IMG_EXT) and self.add_image_file(f):
+                n += 1
+        if n:
+            self._say("Added %d picture(s) as new page(s)." % n)
+            e.acceptProposedAction()
+
+    def keyPressEvent(self, e):
+        if not self._busy_print and self.canvas.handle_key(e):
+            return
+        super().keyPressEvent(e)
+
+    # ---------------------------------------------------------------- Sharp / Fast, Fit page
+    def _sharp_toggled(self, on):
+        self.btnSharp.setText("Sharp" if on else "Fast")
+        self.settings.setValue("print/sharp", bool(on))
+        self.canvas.set_sharp(on)
+
+    def fit_page(self):
+        vp = self.scroll.viewport()
+        aw = (vp.width() - 2 * SheetCanvas.PAD - 4) / max(1.0, self.paper[0])
+        ah = (vp.height() - 2 * SheetCanvas.GAP) / max(1.0, self.paper[1])
+        if aw > 0 and ah > 0:
+            self.canvas.set_zoom(min(aw, ah))
+            self.canvas.scroll_to(self.canvas.cur)
+
+    # ---------------------------------------------------------------- presets
+    PRESET_KEYS = ("printer", "paper", "orient", "color", "duplex", "copies", "scale", "pct", "turn", "nup")
+
+    def _presets(self):
+        try:
+            d = json.loads(self.settings.value("print/presets", "{}", type=str) or "{}")
+            return d if isinstance(d, dict) else {}
+        except Exception:
+            return {}
+
+    def _fill_presets(self, select=""):
+        self.cbPreset.blockSignals(True)
+        self.cbPreset.clear()
+        self.cbPreset.addItem("Presets ...", "")
+        for name in sorted(self._presets(), key=str.lower):
+            self.cbPreset.addItem(name, name)
+        i = self.cbPreset.findData(select)
+        self.cbPreset.setCurrentIndex(max(0, i))
+        self.cbPreset.blockSignals(False)
+        self.btnPresetDel.setEnabled(self.cbPreset.count() > 1)
+
+    def _preset_save(self):
+        name, ok = QInputDialog.getText(self, "Save preset", "Name of the preset:", text=self.cbPreset.currentData() or "")
+        name = (name or "").strip()
+        if not ok or not name:
+            return
+        d = self._presets()
+        d[name] = {"printer": self.cbPrinter.currentData() or "", "paper": self.cbPaper.currentText(),
+                   "orient": self.cbOrient.currentData(), "color": self.cbColor.currentData(),
+                   "duplex": self.cbDuplex.currentIndex(), "copies": self.spCopies.value(),
+                   "scale": self.cbScale.currentData(), "pct": self.spPct.value(), "turn": self.chkTurn.isChecked(),
+                   "nup": self.cbNup.currentData()}
+        self.settings.setValue("print/presets", json.dumps(d))
+        self._fill_presets(name)
+        self._say("Preset \"%s\" saved." % name)
+
+    def _preset_apply(self, *_):
+        name = self.cbPreset.currentData()
+        d = self._presets().get(name) if name else None
+        if not d:
+            return
+        s = self.settings
+        for k in ("printer", "paper", "orient", "color", "duplex", "scale", "pct", "turn", "nup"):
+            if k in d:
+                s.setValue("print/" + k, d[k])
+        self._fill_printers()                                          # reads printer / paper / two-sided from the settings
+        self._restore_settings()
+        self.spCopies.setValue(max(1, min(99, int(d.get("copies", 1) or 1))))
+        self._geometry_changed()
+        self._update_tools()
+        self._say("Preset \"%s\" applied." % name)
+
+    def _preset_delete(self):
+        name = self.cbPreset.currentData()
+        if not name:
+            return
+        d = self._presets()
+        d.pop(name, None)
+        self.settings.setValue("print/presets", json.dumps(d))
+        self._fill_presets()
 
     # ---------------------------------------------------------------- zoom
     def zoom_by(self, f):
@@ -1770,7 +2677,8 @@ class PrintStudio(QDialog):
         self._busy_print = on
         for w in (self.listPages, self.canvas, self.btnTransform, self.numpanel, self.cbPrinter, self.cbPaper, self.cbOrient,
                   self.cbColor, self.spCopies, self.cbScale, self.chkTurn, self.cbNup, self.btnProps,
-                  self.btnBlank, self.btnUp, self.btnDown, self.btnDelBlank):
+                  self.btnBlank, self.btnUp, self.btnDown, self.btnDelBlank, self.edRange, self.cbPreset, self.btnPresetSave,
+                  self.btnPresetDel, self.dock):
             w.setEnabled(not on)
         self.spPct.setEnabled((not on) and self.cbScale.currentData() == "custom")
         self.cbDuplex.setEnabled((not on) and self.cbDuplex.count() > 1)
