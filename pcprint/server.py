@@ -1,0 +1,1743 @@
+import os, sys, io, re, math, hmac, socket, uuid, time, json, shutil, tempfile, threading, functools
+import subprocess, atexit, hashlib, secrets, collections, ipaddress, contextlib
+from flask import Flask, request, jsonify, send_file, session
+import fitz
+from PIL import Image, ImageOps, ImageDraw, ImageFont, ImageGrab
+from . import printing
+
+
+def res(p):
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), p)
+
+
+app = Flask(__name__, static_folder=None)
+app.secret_key = os.urandom(24)
+FILES = {}
+ORDER = []
+GONE = {}   # file id -> set of page numbers removed with the red cross (shared by PC and phone)
+JOBS = {}
+LOCK = threading.Lock()    # fitz is not thread safe
+SLOCK = threading.Lock()   # file list changes
+REV = {"n": 0}
+NOTICE = {"t": ""}
+BATCH = {"t": 0.0, "ids": []}
+HOOKS = {"rebind": None, "pick": None, "pickdir": None, "front": None, "autostart_get": None, "autostart_set": None}   # set by app.py (file dialog, bring window to front)
+IMG_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
+SCALES = ("fit", "actual", "fill", "custom")
+NUP_CHOICES = (2, 4, 6, 8, 12, 16)   # pages on one sheet (always an even number); 1 = off
+NUP_GAP = 2.0                        # mm of empty space between the small pages
+NUP_TURN = 1.15                      # a page is turned 90 degrees only if that makes it at least 15% bigger
+
+CFG_DIR = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "PCPrint")
+PROF_FILE = os.path.join(CFG_DIR, "profiles.json")
+SET_FILE = os.path.join(CFG_DIR, "settings.json")
+PLOCK = threading.Lock()
+DIALOG_LOCK = threading.Lock()
+
+
+_UP = {"dir": None, "n": 0}   # temp folder for dropped / pasted files
+
+
+def upload_dir():
+    if not _UP["dir"] or not os.path.isdir(_UP["dir"]):
+        _UP["dir"] = tempfile.mkdtemp(prefix="pcprint_")
+    return _UP["dir"]
+
+
+def cleanup():
+    if _UP["dir"]:
+        shutil.rmtree(_UP["dir"], ignore_errors=True)
+
+
+SETTING_KEYS = ("hq", "prn", "num")   # the only settings the two pages save
+LOCAL = ("127.0.0.1", "::1")
+PH = {"ok": False, "port": 0, "fails": 0, "until": 0}
+PH_FILE = os.path.join(CFG_DIR, "phone.json")
+SREV = {"n": 0}
+LOCAL_ONLY = ("/api/add", "/api/pick", "/api/paste", "/api/autostart", "/api/phone/", "/api/x", "/api/update", "/api/save")   # /api/savedir, /api/savepdf: write to this PC's disk
+
+
+def origin():
+    return "pc"       # inside Image Fixer only this PC's own window can reach the server (it listens on 127.0.0.1 only)
+
+
+def host_ok():
+    """Only an IP address or 'localhost' is a valid Host. A malicious web page reaches this PC under ITS OWN domain
+    name, so any other name is refused."""
+    raw = (request.host or "").strip().lower()
+    host = raw[1:raw.index("]")] if raw.startswith("[") and "]" in raw else raw.rsplit(":", 1)[0] if raw.count(":") == 1 else raw
+    if host == "localhost":
+        return True
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+@app.before_request
+def guard():
+    if not host_ok():
+        return "bad host", 403          # DNS rebinding: a web page cannot reach this program under its own domain name
+    if request.remote_addr not in LOCAL:
+        return "forbidden", 403
+
+
+@app.post("/api/login")
+def login():
+    return jsonify(ok=True)          # the page still asks once; no PIN inside Image Fixer
+
+
+# ------------------------------------------------------------------ files
+def bump():
+    REV["n"] += 1
+
+
+def natural(name):
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", name.lower())]
+
+
+# ---- open PDF handles: kept for a short time (opening a big PDF for EVERY page was slow), closed again when idle,
+#      so a PDF is never locked on disk for long. Used only with LOCK held (fitz is not thread safe).
+_DOCS = collections.OrderedDict()   # (path, mtime) -> [document, last use]
+DOC_IDLE = 15.0
+DOC_MAX = 6
+
+
+def _docs_close(match=None, idle=None):
+    """Close cached documents (call with LOCK held): all, those of one path, or those unused for `idle` seconds."""
+    now = time.time()
+    for k in list(_DOCS):
+        if (match is None or k[0] == match) and (idle is None or now - _DOCS[k][1] > idle):
+            try:
+                _DOCS.pop(k)[0].close()
+            except Exception:
+                pass
+
+
+@contextlib.contextmanager
+def pdf_doc(path):
+    with LOCK:
+        try:
+            key = (path, os.stat(path).st_mtime_ns)
+        except OSError:
+            key = (path, 0)
+        _docs_close(match=path) if any(k[0] == path and k != key for k in _DOCS) else None   # file changed on disk
+        ent = _DOCS.pop(key, None)
+        if ent is None:
+            ent = [fitz.open(path), 0]
+        ent[1] = time.time()
+        _DOCS[key] = ent
+        while len(_DOCS) > DOC_MAX:
+            _, old = _DOCS.popitem(last=False)
+            try:
+                old[0].close()
+            except Exception:
+                pass
+        yield ent[0]
+        ent[1] = time.time()
+
+
+def _doc_reaper():
+    while True:
+        time.sleep(5)
+        if LOCK.acquire(timeout=1):
+            try:
+                _docs_close(idle=DOC_IDLE)
+            finally:
+                LOCK.release()
+
+
+threading.Thread(target=_doc_reaper, daemon=True).start()
+
+
+def open_file(path):
+    ext = os.path.splitext(path)[1].lower()
+    name = os.path.basename(path)
+    if ext == ".pdf":
+        with pdf_doc(path) as d:
+            n = d.page_count
+            lands, asps = [], []
+            for i in range(n):
+                r = d.load_page(i).rect
+                lands.append(r.width > r.height)
+                asps.append(round(r.width / r.height, 5) if r.height else 0.7071)
+        if n < 1:
+            raise ValueError("empty PDF")
+        kind = "pdf"
+    elif ext in IMG_EXT:
+        with Image.open(path) as im:
+            im.verify()
+        with Image.open(path) as im:
+            w, h = im.size
+            if im.getexif().get(274, 1) in (5, 6, 7, 8):
+                w, h = h, w
+        kind, n, lands = "img", 1, [w > h]
+        asps = [297 / 210 if w > h else 210 / 297]   # /api/view shows a picture on an A4 sheet
+    else:
+        raise ValueError("only PDF and image files are supported")
+    fid = uuid.uuid4().hex[:10]
+    FILES[fid] = {"id": fid, "name": name, "kind": kind, "pages": n, "lands": lands, "asps": asps, "path": path}
+    return fid
+
+
+def register(paths, sort=True):
+    """Add files. Files that arrive within 1.5 s of each other (one 'Open with' on
+    many files) are treated as one batch and sorted by name.
+    Opening a file (reading a big PDF) is slow, so it is done BEFORE the file-list lock is taken:
+    the screen keeps updating while files are being added (before, it waited until they were all opened)."""
+    added, errors = 0, []
+    opened = {}      # absolute path -> (file id, True if it was opened just now)
+    for p in paths:
+        p = os.path.abspath(p)
+        if p in opened:
+            continue
+        with SLOCK:
+            if any(FILES[i]["path"] == p for i in ORDER if i in FILES):
+                continue
+            known = next((i for i, x in FILES.items() if x["path"] == p), None)   # used earlier by Transform
+        if known:
+            opened[p] = (known, False)
+            continue
+        try:
+            opened[p] = (open_file(p), True)
+        except Exception as e:
+            errors.append(f"{os.path.basename(p)}: {e}")
+    with SLOCK:
+        if sort:
+            now = time.time()
+            if now - BATCH["t"] > 1.5:
+                BATCH["ids"] = []
+            BATCH["t"] = now
+        for p in paths:
+            p = os.path.abspath(p)
+            if p not in opened:
+                continue
+            fid, new = opened.pop(p)
+            if any(FILES[i]["path"] == p for i in ORDER if i in FILES):
+                if new:
+                    FILES.pop(fid, None)     # the same file was added by another request meanwhile
+                continue
+            ORDER.append(fid)
+            added += 1
+            if sort:
+                BATCH["ids"].append(fid)
+        if sort and len(BATCH["ids"]) > 1:
+            ids = BATCH["ids"]
+            k = len(ids)
+            if ORDER[-k:] == ids:
+                ordered = sorted(ids, key=lambda i: natural(FILES[i]["name"]))
+                ORDER[-k:] = ordered
+                BATCH["ids"] = ordered
+        if errors:
+            NOTICE["t"] = "\n".join(errors)
+        if added or errors:
+            bump()
+    return added, errors
+
+
+def pub(f):
+    return {"id": f["id"], "name": f["name"], "kind": f["kind"], "pages": f["pages"], "lands": f["lands"],
+            "asps": f.get("asps") or [], "gone": sorted(GONE.get(f["id"], ()))}
+
+
+# Inside Image Fixer: no phone link and no PC Print auto update (Image Fixer has its own)
+EMBED_HEAD = ("<script>window.EMBED=1</script>"
+              "<style>#bph,#phpanel,#upddd{display:none!important}</style>")
+
+
+@app.get("/")
+def index():
+    with open(res("static/index.html"), encoding="utf-8") as fh:
+        html = fh.read()
+    html = html.replace("</head>", EMBED_HEAD + "</head>", 1)
+    r = app.response_class(html, mimetype="text/html")
+    r.headers["Cache-Control"] = "no-store"
+    return r
+
+
+@app.get("/api/ping")
+def ping():
+    return jsonify(app="pcprint")
+
+
+def _hang_trace():
+    """DEBUG: after every /api/add (a file handed over by Image Fixer / Send to) write the stack of ALL threads to
+    hang_trace.txt (in the PCPrint settings folder) after 10 s and after 30 s.  If the window hangs, this file shows
+    where every thread is waiting.  Nothing is written when you never use /api/add."""
+    def run():
+        import faulthandler
+        for wait, tag in ((10, "after 10 s"), (20, "after 30 s")):
+            time.sleep(wait)
+            try:
+                os.makedirs(CFG_DIR, exist_ok=True)
+                with open(os.path.join(CFG_DIR, "hang_trace.txt"), "a", encoding="utf-8") as fh:
+                    fh.write("\n===== %s  (%s since /api/add) =====\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), tag))
+                    fh.flush()
+                    faulthandler.dump_traceback(file=fh, all_threads=True)
+            except Exception:
+                pass
+    threading.Thread(target=run, daemon=True).start()
+
+
+@app.post("/api/add")
+def add():
+    d = request.get_json(silent=True) or {}
+    paths = [str(p) for p in d.get("paths", [])]
+    _hang_trace()
+    if HOOKS["front"]:      # the window comes up at once (in its own thread); opening a big PDF below can take a while
+        threading.Thread(target=lambda: HOOKS["front"](), daemon=True).start()
+    added, errors = register(paths, sort=True)
+    return jsonify(added=added, errors=errors)
+
+
+@app.post("/api/pick")
+def pick():
+    if not HOOKS["pick"]:
+        return jsonify(error="No file dialog"), 500
+    try:
+        paths = HOOKS["pick"]()
+    except Exception as e:
+        return jsonify(error=str(e)), 500
+    added, errors = register(paths or [], sort=False)
+    return jsonify(added=added, errors=errors)
+
+
+def sniff_ext(path):
+    """Look at the file's first bytes to find out if it is a PDF or a picture."""
+    try:
+        with open(path, "rb") as fh:
+            if fh.read(1024).lstrip()[:4] == b"%PDF":
+                return ".pdf"
+        with Image.open(path) as im:
+            return {"JPEG": ".jpg", "PNG": ".png", "WEBP": ".webp", "GIF": ".gif",
+                    "BMP": ".bmp", "TIFF": ".tif"}.get(im.format)
+    except Exception:
+        return None
+
+
+def save_upload(up):
+    """Save one dropped/pasted file into the temp folder, keeping its real name."""
+    name = os.path.basename((up.filename or "").replace("\\", "/")).strip()
+    name = re.sub(r'[<>:"/\\|?*]', "_", name)
+    ext = os.path.splitext(name)[1].lower()
+    mt = (up.mimetype or "").lower()
+    generic = name.lower() in ("", "image.png", "image.jpg", "image.jpeg", "blob")
+    if generic or not ext:
+        e = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp", "image/gif": ".gif",
+             "image/bmp": ".bmp", "application/pdf": ".pdf"}.get(mt)
+        if e:   # a pasted picture (screenshot) has no real name
+            _UP["n"] += 1
+            name = f"Pasted image {_UP['n']}{e}" if e != ".pdf" else f"Pasted file {_UP['n']}.pdf"
+    d = os.path.join(upload_dir(), uuid.uuid4().hex[:8])
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, name or "file")
+    up.save(path)
+    if os.path.splitext(path)[1].lower() not in IMG_EXT | {".pdf"}:
+        e2 = sniff_ext(path)   # shared files often come without a usable name / type
+        if e2:
+            os.replace(path, path + e2)
+            path += e2
+    return path
+
+
+@app.get("/api/files")
+def files_list():
+    """Same answer as the old Phone Print server (other apps / share targets rely on it)."""
+    with SLOCK:
+        return jsonify([pub(FILES[i]) for i in ORDER if i in FILES])
+
+
+@app.post("/api/upload")
+def upload():
+    """Files dropped on the window, pasted, or sent from a phone / another app.
+    One file: answers with that file (id, name, kind, pages, lands) like the old Phone Print,
+    or status 400 + {error}. Several files: {added, errors}."""
+    ups = request.files.getlist("file")
+    paths = [save_upload(u) for u in ups]
+    if not paths:
+        return jsonify(added=0, errors=["No file received"], error="No file"), 400
+    with SLOCK:
+        NOTICE["t"] = ""
+    added, errors = register(paths, sort=True)
+    with SLOCK:
+        if origin() != "pc":
+            NOTICE["t"] = ""   # the phone gets the error in this answer
+    if len(paths) == 1:
+        if errors:
+            return jsonify(added=0, errors=errors, error=errors[0]), 400
+        f = next((x for x in FILES.values() if x["path"] == os.path.abspath(paths[0])), None)
+        return jsonify(added=1, errors=[], **(pub(f) if f else {}))
+    return jsonify(added=added, errors=errors)
+
+
+@app.post("/api/paste")
+def paste():
+    """Ctrl+V fallback: read the Windows clipboard (copied files, or a copied picture)."""
+    try:
+        data = ImageGrab.grabclipboard()
+    except Exception as e:
+        return jsonify(added=0, errors=[f"Cannot read the clipboard: {e}"])
+    if isinstance(data, list):   # files copied in Explorer
+        added, errors = register([p for p in data if os.path.isfile(p)], sort=True)
+        return jsonify(added=added, errors=errors)
+    if data is not None:         # a copied picture
+        _UP["n"] += 1
+        d = os.path.join(upload_dir(), uuid.uuid4().hex[:8])
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, f"Pasted image {_UP['n']}.png")
+        data.convert("RGB").save(path)
+        added, errors = register([path], sort=True)
+        return jsonify(added=added, errors=errors)
+    return jsonify(added=0, errors=["The clipboard has no file or picture"])
+
+
+# ------------------------- extra pictures for the Transform tool (not added to the page list)
+def register_extra(paths):
+    """Pictures dropped / pasted / chosen onto a sheet. The server knows them (so they can be
+    drawn and printed) but they are NOT added to the list of pages."""
+    out, errors = [], []
+    for p in paths:     # opening is slow: done without holding the file-list lock, so the screen keeps updating
+        p = os.path.abspath(p)
+        fid = next((i for i, x in list(FILES.items()) if x["path"] == p), None)
+        try:
+            if fid is None:
+                fid = open_file(p)
+            out.append(pub(FILES[fid]))
+        except Exception as e:
+            errors.append(f"{os.path.basename(p)}: {e}")
+    return {"files": out, "errors": errors}
+
+
+@app.post("/api/xupload")
+def xupload():
+    paths = [save_upload(u) for u in request.files.getlist("file")]
+    if not paths:
+        return jsonify(files=[], errors=["No file received"])
+    return jsonify(**register_extra(paths))
+
+
+@app.post("/api/xpaste")
+def xpaste():
+    try:
+        data = ImageGrab.grabclipboard()
+    except Exception as e:
+        return jsonify(files=[], errors=[f"Cannot read the clipboard: {e}"])
+    if isinstance(data, list):
+        return jsonify(**register_extra([p for p in data if os.path.isfile(p)]))
+    if data is not None:
+        _UP["n"] += 1
+        d = os.path.join(upload_dir(), uuid.uuid4().hex[:8])
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, f"Pasted image {_UP['n']}.png")
+        data.convert("RGB").save(path)
+        return jsonify(**register_extra([path]))
+    return jsonify(files=[], errors=["The clipboard has no file or picture"])
+
+
+@app.post("/api/xpick")
+def xpick():
+    if not HOOKS["pick"]:
+        return jsonify(error="No file dialog"), 500
+    try:
+        paths = HOOKS["pick"]()
+    except Exception as e:
+        return jsonify(error=str(e)), 500
+    return jsonify(**register_extra(paths or []))
+
+
+@app.get("/api/autostart")
+def autostart_get():
+    h = HOOKS.get("autostart_get")
+    return jsonify(available=bool(h), on=bool(h()) if h else False)
+
+
+@app.post("/api/autostart")
+def autostart_set():
+    h = HOOKS.get("autostart_set")
+    if not h:
+        return jsonify(error="Not available"), 400
+    on = bool((request.get_json(silent=True) or {}).get("on"))
+    try:
+        h(on)
+    except Exception as e:
+        return jsonify(error=str(e)), 500
+    return jsonify(on=on)
+
+
+@app.get("/api/state")
+def state():
+    """The window asks every second. When it sends the revision it already has (?rev=&srev=) and nothing changed,
+    a tiny answer is sent instead of the whole file list. Only this PC's window takes the notice (a phone used to
+    swallow the 'bad file' message meant for the PC)."""
+    pc = origin() == "pc"
+    with SLOCK:
+        notice = ""
+        if pc and NOTICE["t"]:
+            notice, NOTICE["t"] = NOTICE["t"], ""
+        if not notice and request.args.get("rev") == str(REV["n"]) and request.args.get("srev") == str(SREV["n"]):
+            return jsonify(rev=REV["n"], srev=SREV["n"], same=True)
+        return jsonify(rev=REV["n"], srev=SREV["n"], notice=notice, files=[pub(FILES[i]) for i in ORDER if i in FILES])
+
+
+def drop_file(fid):
+    """Forget a file (call with SLOCK held). A copy that this program made in its temp folder (dropped / pasted /
+    phone upload) is deleted from the disk too, as soon as no print / save job is running. Files the user picked
+    from their own folders are never touched."""
+    GONE.pop(fid, None)
+    f = FILES.pop(fid, None)
+    if fid in ORDER:
+        ORDER.remove(fid)
+    if not f or not _UP["dir"]:
+        return
+    path = os.path.abspath(f["path"])
+    root = os.path.abspath(_UP["dir"])
+    if os.path.dirname(os.path.dirname(path)) == root:      # <temp folder>/<random folder>/<file>
+        _TRASH.append(path)
+        threading.Thread(target=sweep_trash, daemon=True).start()   # LOCK may be busy drawing: never wait for it here
+
+
+_TRASH = []
+
+
+def sweep_trash():
+    if not _TRASH or any(j.get("state") == "run" for j in list(JOBS.values())):
+        return
+    if not LOCK.acquire(timeout=30):
+        return
+    try:
+        while _TRASH:
+            path = _TRASH.pop()
+            _docs_close(match=path)      # an open handle would block the delete on Windows
+            try:
+                os.remove(path)
+                os.rmdir(os.path.dirname(path))        # its own little folder
+            except OSError:
+                pass
+    finally:
+        LOCK.release()
+
+
+def new_job(job):
+    """Register a print / save job. Finished jobs older than 10 minutes are forgotten (the list never grew smaller before)."""
+    now = time.time()
+    for k in [k for k, j in list(JOBS.items()) if j.get("state") != "run" and now - j.get("t", now) > 600]:
+        JOBS.pop(k, None)
+    sweep_trash()
+    jid = uuid.uuid4().hex[:8]
+    job["t"] = now
+    JOBS[jid] = job
+    return jid
+
+
+def job_end(jid, **kw):
+    """Mark a job finished (done / error) and let a waiting temp-file delete go ahead."""
+    JOBS[jid].update(kw)
+    JOBS[jid]["t"] = time.time()
+    sweep_trash()
+
+
+@app.delete("/api/files/<fid>")
+def del_one(fid):
+    with SLOCK:
+        if fid in FILES:
+            drop_file(fid)
+            bump()
+    return jsonify(ok=True)
+
+
+@app.post("/api/pages/remove")
+def pages_remove():
+    """Remove one page of a file from the list (PC and phone both follow). Removing the last page removes the file."""
+    d = request.get_json(silent=True) or {}
+    fid = str(d.get("f", ""))
+    try:
+        p = int(d.get("p"))
+    except Exception:
+        return jsonify(error="bad page"), 400
+    with SLOCK:
+        f = FILES.get(fid)
+        if not f or not (0 <= p < f["pages"]):
+            return jsonify(ok=True)
+        g = GONE.setdefault(fid, set())
+        g.add(p)
+        if len(g) >= f["pages"]:
+            drop_file(fid)
+        bump()
+    return jsonify(ok=True)
+
+
+@app.delete("/api/files")
+def del_all():
+    with SLOCK:
+        for fid in list(FILES):
+            drop_file(fid)
+        ORDER.clear()
+        GONE.clear()
+        bump()
+    return jsonify(ok=True)
+
+
+@app.post("/api/move")
+def move():
+    d = request.get_json(silent=True) or {}
+    fid, step = d.get("id"), -1 if d.get("dir") == "up" else 1
+    with SLOCK:
+        if fid in ORDER:
+            i = ORDER.index(fid)
+            j = i + step
+            if 0 <= j < len(ORDER):
+                ORDER[i], ORDER[j] = ORDER[j], ORDER[i]
+                bump()
+    return jsonify(ok=True)
+
+
+# ------------------------------------------------------------- settings
+@app.get("/api/settings")
+def settings_get():
+    try:
+        with open(SET_FILE, "r", encoding="utf-8") as fh:
+            return jsonify(json.load(fh))
+    except Exception:
+        return jsonify({})
+
+
+@app.post("/api/settings")
+def settings_set():
+    d = request.get_json(silent=True)
+    if not isinstance(d, dict):
+        return jsonify(error="bad settings"), 400
+    d = {k: v for k, v in d.items() if k in SETTING_KEYS}   # only the keys the two pages really use
+    try:
+        os.makedirs(CFG_DIR, exist_ok=True)
+        try:
+            with open(SET_FILE, "r", encoding="utf-8") as fh:
+                old = json.load(fh)
+        except Exception:
+            old = {}
+        old.update(d)   # keys written by the other side survive
+        with open(SET_FILE, "w", encoding="utf-8") as fh:
+            json.dump(old, fh)
+        SREV["n"] += 1
+    except Exception:
+        pass
+    return jsonify(ok=True)
+
+
+# ------------------------------------------------------- page numbers
+def gnum(fid, p):
+    """1-based position of a page in the whole document (all files in order)."""
+    n = 0
+    for i in list(ORDER):
+        f = FILES.get(i)
+        if not f:
+            continue
+        gone = GONE.get(i, ())
+        if i == fid:
+            if p in gone:
+                return None
+            return n + sum(1 for q in range(p) if q not in gone) + 1
+        n += f["pages"] - len(gone)
+    return None
+
+
+def numspec(args, fid, p):
+    if str(args.get("num")) not in ("1", "true", "True"):
+        return None
+    pos = args.get("npos") if args.get("npos") in ("top", "bottom") else "bottom"
+    align = args.get("nalign") if args.get("nalign") in ("left", "center", "right") else "center"
+    try:
+        size = max(6.0, min(72.0, float(args.get("nsize", 12))))
+    except Exception:
+        size = 12.0
+    try:
+        start = int(float(args.get("nstart", 1)))
+    except Exception:
+        start = 1
+    try:
+        margin = max(2.0, min(40.0, float(args.get("nmargin", 8))))
+    except Exception:
+        margin = 8.0
+    bold = str(args.get("nbold")) in ("1", "true", "True")
+    try:
+        n = int(args["nn"]) if args.get("nn") else None   # Transform: serial number of the sheet in the printed list
+    except Exception:
+        n = None
+    if n is None:
+        n = gnum(fid, p)   # position in the whole document, so one file keeps its serial number
+    if n is None:
+        return None
+    return {"text": str(start - 1 + n), "pos": pos, "align": align, "size": size,
+            "margin": margin, "bold": bold}
+
+
+@functools.lru_cache(maxsize=64)
+def get_font(px, bold=False):
+    win = os.environ.get("WINDIR", r"C:\Windows")
+    names = (["timesbd.ttf", "Times New Roman Bold.ttf", "LiberationSerif-Bold.ttf", "DejaVuSerif-Bold.ttf"]
+             if bold else
+             ["times.ttf", "Times New Roman.ttf", "LiberationSerif-Regular.ttf", "DejaVuSerif.ttf"])
+    for name in [os.path.join(win, "Fonts", names[0])] + names:
+        try:
+            return ImageFont.truetype(name, max(6, int(px)))
+        except Exception:
+            pass
+    try:
+        return ImageFont.load_default(size=max(6, int(px)))
+    except Exception:
+        return ImageFont.load_default()
+
+
+def stamp(img, num, ppmm):
+    """Print the page number (Times New Roman) directly on the page, at the chosen place."""
+    d = ImageDraw.Draw(img)
+    fnt = get_font(round(num["size"] * 25.4 / 72 * ppmm), num["bold"])
+    text = num["text"]
+    l, t, r, b = d.textbbox((0, 0), text, font=fnt)
+    tw, th = r - l, b - t
+    W, H = img.size
+    m = int(num["margin"] * ppmm)
+    if num["align"] == "left":
+        x = m
+    elif num["align"] == "right":
+        x = W - m - tw
+    else:
+        x = (W - tw) // 2
+    y = m if num["pos"] == "top" else H - m - th
+    d.text((x - l, y - t), text, font=fnt, fill=0 if img.mode == "L" else (0, 0, 0))
+
+
+# ------------------------------------------------------------- drawing
+def get_pct(v):
+    """Custom scaling percent (of actual size), kept between 10 and 400."""
+    try:
+        return max(10.0, min(400.0, float(v)))
+    except Exception:
+        return 100.0
+
+
+def flatten(img):
+    """Any picture -> plain RGB (transparent parts become white)."""
+    if img.mode in ("RGBA", "LA", "P"):
+        img = img.convert("RGBA")
+        bg = Image.new("RGB", img.size, "white")
+        bg.paste(img, mask=img.split()[3])
+        return bg
+    return img.convert("RGB")
+
+
+def compose(f, idx, W, H, mono, rotate=True, mode="fit", ppmm=None, pct=100.0):
+    """Draw one page on a white sheet of W x H pixels.
+    mode "fit":    whole page fitted inside the area, nothing cut off
+    mode "actual": real size (needs ppmm = pixels per mm), may be cut at the edges
+    mode "fill":   page covers the whole area, the extra part is cropped
+    mode "custom": real size x pct/100, centered (needs ppmm), may be cut at the edges"""
+    def pick(fw, fh, unit_mm):
+        if mode == "fill":
+            s = max(W / fw, H / fh)
+        elif mode == "actual" and ppmm:
+            s = ppmm * unit_mm
+        elif mode == "custom" and ppmm:
+            s = ppmm * unit_mm * pct / 100.0
+        else:
+            s = min(W / fw, H / fh)
+        return min(s, 8000.0 / max(fw, fh))  # safety cap for huge pages
+
+    if f["kind"] == "pdf":
+        with pdf_doc(f["path"]) as doc:
+            pg = doc[idx]
+            pw, ph = pg.rect.width, pg.rect.height
+            rot = rotate and ((pw > ph) != (W > H))
+            fw, fh = (ph, pw) if rot else (pw, ph)
+            s = pick(fw, fh, 25.4 / 72)
+            pix = pg.get_pixmap(matrix=fitz.Matrix(s, s),
+                                colorspace=fitz.csGRAY if mono else fitz.csRGB, alpha=False)
+            img = Image.frombytes("L" if mono else "RGB", (pix.width, pix.height), pix.samples)
+    else:
+        img = Image.open(f["path"])
+        try:
+            dpi = float((img.info.get("dpi") or (300, 300))[0])
+        except Exception:
+            dpi = 300.0
+        if dpi < 1:
+            dpi = 300.0
+        if mode == "fit" and img.format == "JPEG":   # a big JPEG shown small: the decoder itself skips the extra detail (2x faster)
+            img.draft("RGB", (max(W, H), max(W, H)))
+        img = flatten(ImageOps.exif_transpose(img))
+        iw, ih = img.size
+        rot = rotate and ((iw > ih) != (W > H))
+        fw, fh = (ih, iw) if rot else (iw, ih)
+        s = pick(fw, fh, 25.4 / dpi)
+        img = img.resize((max(1, int(iw * s)), max(1, int(ih * s))), Image.LANCZOS)
+        if mono:
+            img = img.convert("L")
+    if rot:
+        img = img.rotate(90, expand=True)
+    canvas = Image.new(img.mode, (W, H), 255 if img.mode == "L" else (255, 255, 255))
+    canvas.paste(img, ((W - img.width) // 2, (H - img.height) // 2))  # larger image is cropped
+    return canvas
+
+
+def sheet(f, idx, W, H, mono, mode="fit", ppmm=None, pct=100.0, num=None, rotate=True, items=None):
+    """One printed sheet: the page, with the page number printed directly on it.
+    items = free layout from the Transform tool (None / empty = the normal way)."""
+    if items is not None and ppmm:
+        canvas = compose_items(W, H, mono, ppmm, items)
+    else:
+        canvas = compose(f, idx, W, H, mono, rotate, mode, ppmm, pct)
+    if num and ppmm:
+        stamp(canvas, num, ppmm)
+    return canvas
+
+
+# ------------------------------------------------- several pages on one sheet (N-up)
+def get_nup(v):
+    """Pages per sheet: one of NUP_CHOICES, anything else = 1 (off)."""
+    try:
+        v = int(float(v))
+    except Exception:
+        return 1
+    return v if v in NUP_CHOICES else 1
+
+
+def _nup_fit(cw, ch, asp):
+    """Biggest size (page height, same unit as cw/ch) of a page with width/height = asp inside a cw x ch cell,
+    and whether the page has to be turned 90 degrees for that."""
+    s1 = min(cw / asp, ch)
+    s2 = min(cw, ch / asp)
+    return (s2, True) if s2 > s1 * NUP_TURN else (s1, False)
+
+
+def nup_grid(n, aw, ah, asp):
+    """(columns, rows) for n pages on an aw x ah mm area: the split that makes every page biggest."""
+    best = None
+    for c in range(1, n + 1):
+        if n % c:
+            continue
+        r = n // c
+        cw = (aw - NUP_GAP * (c - 1)) / c
+        ch = (ah - NUP_GAP * (r - 1)) / r
+        if cw <= 1 or ch <= 1:
+            continue
+        s, _ = _nup_fit(cw, ch, asp)
+        if best is None or s > best[0] * 1.0001:
+            best = (s, c, r)
+    return (best[1], best[2]) if best else (n, 1)
+
+
+def nup_asp(f, idx):
+    """width / height of a page (used to choose the grid)."""
+    try:
+        w, h = natural_mm(f, idx)
+        if w > 0 and h > 0:
+            return w / h
+    except Exception:
+        pass
+    return 210 / 297
+
+
+def parse_group(s):
+    """'fileid:page,fileid:page' -> [(file, page index)], bad entries dropped."""
+    out = []
+    for t in str(s or "").split(",")[:max(NUP_CHOICES)]:
+        fid, _, p = t.rpartition(":")
+        f = FILES.get(fid)
+        try:
+            p = int(p)
+        except Exception:
+            continue
+        if f and 0 <= p < f["pages"]:
+            out.append((f, p))
+    return out
+
+
+def nup_sheet(group, W, H, mono, ppmm, nargs, grid):
+    """One printed sheet with several pages on it (W x H pixels, ppmm pixels per mm).
+    Every page is fitted whole into its own cell (nothing cut off, turned 90 degrees when that is bigger).
+    The page number is drawn on each page itself, smaller in the same ratio as the page."""
+    cols, rows = grid
+    white = 255 if mono else (255, 255, 255)
+    canvas = Image.new("L" if mono else "RGB", (W, H), white)
+    gap = max(0, round(NUP_GAP * ppmm))
+    cw, ch = max(1, (W - gap * (cols - 1)) // cols), max(1, (H - gap * (rows - 1)) // rows)
+    k = min(1.0, math.sqrt((cw * ch) / float(W * H)))   # how much smaller than a whole sheet
+    for i, (f, p) in enumerate(group[:cols * rows]):
+        r, c = divmod(i, cols)
+        asp = nup_asp(f, p)
+        _, turn = _nup_fit(cw, ch, asp)
+        tw, th = (ch, cw) if turn else (cw, ch)       # the cell, in the page's own direction
+        s = min(tw / asp, th)                         # page height in pixels when it fills the cell
+        pw, ph = max(1, round(s * asp)), max(1, round(s))
+        num = numspec(nargs, f["id"], p)
+        if num:
+            num = {**num, "size": num["size"] * k, "margin": num["margin"] * k}
+        # the tile is exactly the page (no white border), so the page number sits at the page's own edge
+        tile = sheet(f, p, pw, ph, mono, "fit", ppmm, 100.0, num, rotate=False)
+        if turn:
+            tile = tile.rotate(90, expand=True)   # the page number turns together with the page
+        canvas.paste(tile, (c * (cw + gap) + (cw - tile.width) // 2, r * (ch + gap) + (ch - tile.height) // 2))
+    return canvas
+
+
+def nup_groups(pages, n):
+    """Cut the page list into sheets of n pages (the last sheet may have fewer)."""
+    return [pages[i:i + n] for i in range(0, len(pages), n)]
+
+
+def nup_plan(pages, n, copies):
+    """Sheets for 'n pages on one sheet' + copies. Returns (sheets, copies_for_printer).
+    * The whole job fits on ONE sheet (pages <= n): the copies fill the empty spaces of the sheet,
+      e.g. 1 page, 2 on a sheet, 2 copies -> one sheet with the page twice; 1 page, 4 copies -> 2 sheets with 2 each.
+      Copies are already inside the sheets, so the printer gets copies = 1.
+    * The job is longer than one sheet: unchanged, every copy is printed as its own set of sheets.
+    The preview (index.html, pvPlan) uses exactly the same rule."""
+    m = len(pages)
+    if m == 0 or m > n or copies <= 1:
+        return nup_groups(pages, n), copies
+    per = n // m                                   # whole copies of the job that fit on one sheet
+    seq, left = [], copies
+    while left > 0:
+        take = min(per, left)
+        seq.append(list(pages) * take)
+        left -= take
+    return seq, 1
+
+
+# ------------------------------------------------- free layout (Transform)
+def natural_mm(f, idx):
+    """Size of the page at its natural (100%) size, in mm."""
+    if f["kind"] == "pdf":
+        with pdf_doc(f["path"]) as doc:
+            r = doc[idx].rect
+            return r.width * 25.4 / 72, r.height * 25.4 / 72
+    with Image.open(f["path"]) as im:
+        try:
+            dpi = float((im.info.get("dpi") or (300, 300))[0])
+        except Exception:
+            dpi = 300.0
+        if dpi < 1:
+            dpi = 300.0
+        w, h = im.size
+        if im.getexif().get(274, 1) in (5, 6, 7, 8):
+            w, h = h, w
+    return w / dpi * 25.4, h / dpi * 25.4
+
+
+def load_source(f, idx, want_w, mono):
+    """The page as one flat picture, about want_w pixels wide (never enlarged for pictures)."""
+    want_w = max(16.0, float(want_w))
+    if f["kind"] == "pdf":
+        with pdf_doc(f["path"]) as doc:
+            pg = doc[idx]
+            pw, ph = pg.rect.width, pg.rect.height
+            s = min(want_w / pw, 8000.0 / max(pw, ph))
+            pix = pg.get_pixmap(matrix=fitz.Matrix(s, s),
+                                colorspace=fitz.csGRAY if mono else fitz.csRGB, alpha=False)
+            return Image.frombytes("L" if mono else "RGB", (pix.width, pix.height), pix.samples)
+    img = Image.open(f["path"])
+    img = flatten(ImageOps.exif_transpose(img))
+    if img.width > want_w:
+        img = img.resize((max(1, int(want_w)), max(1, int(img.height * want_w / img.width))), Image.LANCZOS)
+    return img.convert("L") if mono else img
+
+
+# ---- perspective crop (Transform): cut a 4-corner area out of the ORIGINAL and straighten it ----
+CROP_EPS = 1.0                    # pixels: a quad this close to a plain rectangle is cut as a rectangle (nothing resampled)
+CROP_MAX_PIXELS = 100_000_000     # safety cap for the straightened picture
+
+
+def parse_quad(raw):
+    """8 numbers (x, y of the corners TL, TR, BR, BL, each 0..1 of the whole page) -> ((x, y) * 4), or None
+    when it is missing, bad, has no area, or is not a proper convex four-sided shape."""
+    try:
+        vals = [float(x) for x in (raw.split(",") if isinstance(raw, str) else raw)]
+    except Exception:
+        return None
+    if len(vals) != 8 or not all(math.isfinite(x) for x in vals):
+        return None
+    vals = [min(1.0, max(0.0, x)) for x in vals]
+    q = [(vals[i], vals[i + 1]) for i in range(0, 8, 2)]
+    for i in range(4):   # every turn the same way (clockwise on screen) = convex, no twisted corners
+        ax, ay = q[i]
+        bx, by = q[(i + 1) % 4]
+        cx, cy = q[(i + 2) % 4]
+        if (bx - ax) * (cy - by) - (by - ay) * (cx - bx) <= 1e-7:
+            return None
+    return tuple(q)
+
+
+def _solve8(A, B):
+    """Solve an 8x8 linear system (Gauss, partial pivoting)."""
+    n = 8
+    M = [list(map(float, A[i])) + [float(B[i])] for i in range(n)]
+    for c in range(n):
+        piv = max(range(c, n), key=lambda r: abs(M[r][c]))
+        if abs(M[piv][c]) < 1e-12:
+            raise ValueError("degenerate crop")
+        M[c], M[piv] = M[piv], M[c]
+        for r in range(c + 1, n):
+            f = M[r][c] / M[c][c]
+            if f:
+                for k in range(c, n + 1):
+                    M[r][k] -= f * M[c][k]
+    x = [0.0] * n
+    for r in range(n - 1, -1, -1):
+        x[r] = (M[r][n] - sum(M[r][k] * x[k] for k in range(r + 1, n))) / M[r][r]
+    return x
+
+
+def _persp_coeffs(dst, src):
+    """Pillow PERSPECTIVE coefficients: for every pixel (x, y) of the output rectangle `dst`, where to read in the
+    source quad `src`."""
+    A, B = [], []
+    for (x, y), (X, Y) in zip(dst, src):
+        A.append([x, y, 1, 0, 0, 0, -X * x, -X * y])
+        B.append(X)
+        A.append([0, 0, 0, x, y, 1, -Y * x, -Y * y])
+        B.append(Y)
+    return _solve8(A, B)
+
+
+def _is_rect(Q, eps):
+    TL, TR, BR, BL = Q
+    return (abs(TL[0] - BL[0]) <= eps and abs(TR[0] - BR[0]) <= eps
+            and abs(TL[1] - TR[1]) <= eps and abs(BL[1] - BR[1]) <= eps)
+
+
+def _straighten(img, Q):
+    """Q = the 4 corners (TL, TR, BR, BL) in pixel coordinates of img -> that area as an upright rectangle.
+    A rectangle is cut exactly (every pixel copied, nothing resampled). A slanted area is straightened with one
+    perspective transform, bicubic, into a picture as big as its longest sides (so no side is made smaller)."""
+    W, H = img.size
+    if _is_rect(Q, CROP_EPS):
+        x0 = round((Q[0][0] + Q[3][0]) / 2)
+        x1 = round((Q[1][0] + Q[2][0]) / 2)
+        y0 = round((Q[0][1] + Q[1][1]) / 2)
+        y1 = round((Q[3][1] + Q[2][1]) / 2)
+        x0 = max(0, min(W - 1, x0))
+        y0 = max(0, min(H - 1, y0))
+        x1 = max(x0 + 1, min(W, x1))
+        y1 = max(y0 + 1, min(H, y1))
+        return img.crop((x0, y0, x1, y1))
+    Q = [(min(W - 0.5, max(0.5, x)), min(H - 0.5, max(0.5, y))) for x, y in Q]   # never read outside the picture
+    d = lambda a, b: math.hypot(a[0] - b[0], a[1] - b[1])
+    TL, TR, BR, BL = Q
+    ow, oh = max(d(TL, TR), d(BL, BR)), max(d(TL, BL), d(TR, BR))
+    if ow * oh > CROP_MAX_PIXELS:
+        k = math.sqrt(CROP_MAX_PIXELS / (ow * oh))
+        ow, oh = ow * k, oh * k
+    ow, oh = max(1, round(ow)), max(1, round(oh))
+    coeffs = _persp_coeffs([(0, 0), (ow, 0), (ow, oh), (0, oh)], Q)
+    return img.transform((ow, oh), Image.Transform.PERSPECTIVE, coeffs, Image.Resampling.BICUBIC)
+
+
+def crop_source(f, idx, quad, want_w=None):
+    """The quad (see parse_quad) of a page, straightened. Pictures are cut from the full original (never from a
+    reduced copy). PDF pages are drawn again at the size that is needed (at least 72 dpi, up to 1200 dpi), so text
+    and drawings stay sharp. want_w = how many pixels wide the result will be used (PDF only)."""
+    if f["kind"] == "pdf":
+        with pdf_doc(f["path"]) as doc:
+            pg = doc[idx]
+            pw, ph = pg.rect.width, pg.rect.height
+            P = [(x * pw, y * ph) for x, y in quad]
+            dd = lambda a, b: math.hypot(a[0] - b[0], a[1] - b[1])
+            ew = max(dd(P[0], P[1]), dd(P[3], P[2]), 1.0)
+            bx0, bx1 = min(p[0] for p in P), max(p[0] for p in P)
+            by0, by1 = min(p[1] for p in P), max(p[1] for p in P)
+            s = float(want_w or 2400) / ew
+            if not _is_rect(P, 1.0 / max(s, 0.01)):
+                s *= 1.5                                  # slanted: draw bigger, the result is reduced after
+            s = max(1.0, min(s, 1200.0 / 72.0, 9000.0 / max(bx1 - bx0, by1 - by0, 1.0)))
+            clip = fitz.Rect(bx0 - 2, by0 - 2, bx1 + 2, by1 + 2) & pg.rect
+            pix = pg.get_pixmap(matrix=fitz.Matrix(s, s), clip=clip, colorspace=fitz.csRGB, alpha=False)
+            img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+            Q = [(x * s - pix.x, y * s - pix.y) for x, y in P]
+    else:
+        img = load_source(f, idx, 1e9, False)   # the picture at its real size, never reduced
+        Q = [(x * img.width, y * img.height) for x, y in quad]
+    return _straighten(img, Q)
+
+
+def item_source(f, idx, want_w, mono, crop=None):
+    """What one picture on a Transform sheet is made from: the page, or its perspective crop."""
+    if not crop:
+        return load_source(f, idx, want_w, mono)
+    img = crop_source(f, idx, crop, want_w)
+    return img.convert("L") if mono else img
+
+
+def clean_items(raw, own=None):
+    """Pictures placed on a sheet: centre (cx, cy) and size (w, h) in mm from the printable
+    area's top-left corner, rotation in degrees (clockwise), and which file/page to draw
+    (f, p; default = the sheet's own page). Bad entries are dropped."""
+    out = []
+    if not isinstance(raw, list):
+        return out
+    for it in raw[:100]:
+        try:
+            v = {k: float(it[k]) for k in ("cx", "cy", "w", "h")}
+            v["rot"] = float(it.get("rot", 0))
+            fobj = FILES.get(str(it["f"])) if it.get("f") else (own[0] if own else None)
+            pg = int(it["p"]) if it.get("p") is not None else (own[1] if own else 0)
+        except Exception:
+            continue
+        if not all(math.isfinite(x) for x in v.values()):
+            continue
+        if not fobj or not (0 <= pg < fobj["pages"]):
+            continue
+        v["w"] = max(1.0, min(3000.0, v["w"]))
+        v["h"] = max(1.0, min(3000.0, v["h"]))
+        v["file"], v["pg"] = fobj, pg
+        v["crop"] = parse_quad(it.get("crop")) if it.get("crop") else None   # perspective crop (None = whole page)
+        out.append(v)
+    return out
+
+
+def compose_items(W, H, mono, ppmm, items):
+    """White sheet of W x H pixels with every picture placed where it was put,
+    each with its own size and rotation (later ones on top)."""
+    canvas = Image.new("L" if mono else "RGB", (W, H), 255 if mono else (255, 255, 255))
+    need = {}
+    for it in items:
+        k = (it["file"]["id"], it["pg"], it.get("crop"))
+        need[k] = [it["file"], it["pg"], max(need.get(k, [0, 0, 0, None])[2], it["w"] * ppmm), it.get("crop")]
+    srcs = {k: item_source(v[0], v[1], v[2], mono, v[3]) for k, v in need.items()}
+    for it in items:
+        src = srcs[(it["file"]["id"], it["pg"], it.get("crop"))]
+        tw, th = max(1, round(it["w"] * ppmm)), max(1, round(it["h"] * ppmm))
+        if tw * th > 60_000_000:
+            continue
+        im = src if src.size == (tw, th) else src.resize((tw, th), Image.LANCZOS)
+        rot = it["rot"] % 360
+        if 0.01 < rot < 359.99:
+            rgba = im.convert("RGBA").rotate(-rot, expand=True, resample=Image.BICUBIC)
+            tile, mask = rgba.convert(canvas.mode), rgba.getchannel("A")
+        else:
+            tile, mask = im, None
+        x = round(it["cx"] * ppmm - tile.width / 2)
+        y = round(it["cy"] * ppmm - tile.height / 2)
+        canvas.paste(tile, (x, y), mask)
+    return canvas
+
+
+def get_page():
+    f = FILES.get(request.args.get("f", ""))
+    try:
+        p = int(request.args.get("p", 0))
+    except Exception:
+        return None, None
+    if not f or not (0 <= p < f["pages"]):
+        return None, None
+    return f, p
+
+
+def want_hq():
+    """Display only: the screen asks for the sharp (original quality) picture. Print and Save PDF never use this."""
+    return request.args.get("hq") == "1"
+
+
+def send_img(img, hq=False):
+    """Pictures are cached by the window for a while (the address holds every setting that changes the picture).
+    Before: 'no-store' - every time a picture scrolled out of view and back, or the zoom changed, it was drawn
+    again from scratch by the server, which made the program freeze."""
+    b = io.BytesIO()
+    if hq:
+        img.save(b, "JPEG", quality=95, subsampling=0)   # sharp: near lossless, full colour detail
+    else:
+        img.save(b, "JPEG", quality=85)                    # fast: small and quick
+    b.seek(0)
+    r = send_file(b, mimetype="image/jpeg")
+    r.headers["Cache-Control"] = "private, max-age=600"
+    return r
+
+
+DRV_LOCK = threading.Lock()   # printer driver calls one at a time (many at once can freeze a driver)
+AREA_CACHE = {}               # (printer, paper, colour, duplex, orient) -> (time, area from the driver)
+AREA_TTL = 20.0               # seconds; the preview asks for the same area again for every page
+
+
+def get_area(q, fresh=False):
+    """Paper + printable area from the real driver; falls back to plain paper size.
+    The preview used to ask the printer driver once for EVERY picture it showed, all at the same time:
+    a slow / offline printer then made the whole program hang. Now the answer is remembered for a few seconds,
+    driver calls run one after another, and a stuck driver can no longer block everything.
+    fresh=True (Print, Save PDF) always asks the driver itself, so the result is exactly the same as before."""
+    orient = q.get("orient", "portrait")
+    pw = float(q.get("w", 210))
+    ph = float(q.get("h", 297))
+    if (orient == "landscape") != (pw > ph):
+        pw, ph = ph, pw
+    a = {"pw": pw, "ph": ph, "ox": 0, "oy": 0, "aw": pw, "ah": ph, "driver": False}
+    key = (q.get("printer", ""), q.get("paper"), q.get("color") == "color", q.get("duplex", "off"), orient)
+    hit = AREA_CACHE.get(key)
+    if hit and not fresh and time.time() - hit[0] < AREA_TTL:
+        return dict(hit[1])
+    if not DRV_LOCK.acquire(timeout=60 if fresh else 8):
+        return dict(hit[1]) if hit else a       # driver is busy / stuck: use the last good answer
+    try:
+        hit = AREA_CACHE.get(key)               # another request may have just filled it while we waited
+        if hit and not fresh and time.time() - hit[0] < AREA_TTL:
+            return dict(hit[1])
+        try:
+            a = printing.area(key[0], key[1], key[2], key[3], orient)
+            a["driver"] = True
+            AREA_CACHE[key] = (time.time(), dict(a))
+            if len(AREA_CACHE) > 64:
+                AREA_CACHE.pop(next(iter(AREA_CACHE)), None)
+        except Exception:
+            pass
+    finally:
+        DRV_LOCK.release()
+    return a
+
+
+# At most a few big pictures are drawn at the same time (each one can be 50-100 MB at high quality).
+# Before, scrolling a long list started dozens of them at once: memory ran out and the program froze.
+RENDER_SEM = threading.BoundedSemaphore(3)
+THUMBS = {}   # (file, page, mtime) -> small JPEG, so the list can be redrawn without drawing again
+
+
+def limited(fn):
+    @functools.wraps(fn)
+    def w(*a, **k):
+        with RENDER_SEM:
+            return fn(*a, **k)
+    return w
+
+
+@app.get("/api/thumb")
+@limited
+def thumb():
+    f, p = get_page()
+    if not f:
+        return "", 404
+    try:
+        key = (f["id"], p, os.stat(f["path"]).st_mtime_ns)
+    except OSError:
+        key = None
+    data = THUMBS.get(key) if key else None
+    if data is None:
+        b = io.BytesIO()
+        compose(f, p, 240, 320, False, rotate=False).save(b, "JPEG", quality=85)
+        data = b.getvalue()
+        if key:
+            THUMBS[key] = data
+            while len(THUMBS) > 400:          # about 10 KB each
+                THUMBS.pop(next(iter(THUMBS)), None)
+    r = send_file(io.BytesIO(data), mimetype="image/jpeg")
+    r.headers["Cache-Control"] = "private, max-age=600"
+    return r
+
+
+@app.get("/api/view")
+@limited
+def view():
+    """Reader: the page as it looks on its own sheet, with the page number."""
+    f, p = get_page()
+    if not f:
+        return "", 404
+    if f["kind"] == "pdf":
+        with pdf_doc(f["path"]) as doc:
+            r = doc[p].rect
+            wmm, hmm = r.width * 25.4 / 72, r.height * 25.4 / 72
+    else:  # an image is shown on an A4 sheet
+        wmm, hmm = (297.0, 210.0) if f["lands"][0] else (210.0, 297.0)
+    try:
+        zq = max(1.0, min(5.0 if want_hq() else 3.0, float(request.args.get("q", 1))))   # sharper picture when zoomed in
+    except Exception:
+        zq = 1.0
+    W = int((1000 if wmm > hmm else 800) * zq)
+    ppmm = W / wmm
+    H = max(100, int(hmm * ppmm))
+    num = numspec(request.args, f["id"], p)
+    img = sheet(f, p, W, H, False, "fit", ppmm, 100.0, num, rotate=False)
+    return send_img(img, want_hq())
+
+
+@app.get("/api/area")
+def area():
+    return jsonify(get_area(request.args))
+
+
+@app.get("/api/pageinfo")
+def pageinfo():
+    """Natural size of a page in mm (used by the Transform tool)."""
+    f, p = get_page()
+    if not f:
+        return "", 404
+    try:
+        w, h = natural_mm(f, p)
+    except Exception as e:
+        return jsonify(error=str(e)), 500
+    return jsonify(w=w, h=h)
+
+
+@app.get("/api/src")
+@limited
+def src_img():
+    """The page as a flat picture (Transform tool draws and moves copies of it)."""
+    f, p = get_page()
+    if not f:
+        return "", 404
+    try:
+        px = max(200, min(3000, int(float(request.args.get("px", 1600)))))
+    except Exception:
+        px = 1600
+    quad = parse_quad(request.args.get("crop")) if request.args.get("crop") else None
+    if quad:   # perspective crop: cut from the original, straightened, then only reduced to the screen size
+        try:
+            img = crop_source(f, p, quad, px)
+        except Exception as e:
+            return jsonify(error=str(e)), 500
+        if img.width > px:
+            img = img.resize((px, max(1, round(img.height * px / img.width))), Image.LANCZOS)
+        return send_img(img, want_hq())
+    return send_img(load_source(f, p, px, False), want_hq())
+
+
+@app.get("/api/preview")
+@limited
+def preview():
+    f, p = get_page()
+    if not f:
+        return "", 404
+    a = get_area(request.args)
+    mode = request.args.get("scale", "fit")
+    if mode not in SCALES:
+        mode = "fit"
+    try:
+        W = int(max(480.0, min(3600.0 if want_hq() else 1800.0, float(request.args.get("pw", 720)))))   # sharper when zoomed in
+    except Exception:
+        W = 720
+    s = W / a["pw"]  # pixels per mm on the preview sheet
+    H = max(100, int(a["ph"] * s))
+    ox, oy = int(a["ox"] * s), int(a["oy"] * s)
+    AW = max(1, min(W - ox, int(a["aw"] * s)))
+    AH = max(1, min(H - oy, int(a["ah"] * s)))
+    mono = request.args.get("color") != "color"
+    num = numspec(request.args, f["id"], p)
+    nup = get_nup(request.args.get("nup"))
+    group = parse_group(request.args.get("pg")) if nup > 1 else []
+    if group:   # several pages on this sheet: the grid is chosen from the first page of the whole job
+        first = parse_group(request.args.get("g0")) or group
+        grid = nup_grid(nup, a["aw"], a["ah"], nup_asp(*first[0]))
+        page = nup_sheet(group, AW, AH, mono, s, request.args, grid).convert("RGB")
+    elif request.args.get("blank") == "1":   # Transform tool: empty sheet, the pictures are drawn by the page
+        page = Image.new("RGB", (AW, AH), (255, 255, 255))
+        if num:
+            stamp(page, num, s)
+    else:
+        page = sheet(f, p, AW, AH, mono, mode, s, get_pct(request.args.get("pct")), num).convert("RGB")
+    img = Image.new("RGB", (W, H), (205, 208, 214))  # gray = area the printer cannot print on
+    img.paste(page, (ox, oy))
+    d = ImageDraw.Draw(img)
+    blue = (37, 99, 235)
+    x1, y1, x2, y2 = ox, oy, ox + AW - 1, oy + AH - 1
+    for x in range(x1, x2, 12):  # dashed printable-area border
+        d.line((x, y1, min(x + 6, x2), y1), fill=blue, width=2)
+        d.line((x, y2, min(x + 6, x2), y2), fill=blue, width=2)
+    for y in range(y1, y2, 12):
+        d.line((x1, y, x1, min(y + 6, y2)), fill=blue, width=2)
+        d.line((x2, y, x2, min(y + 6, y2)), fill=blue, width=2)
+    d.rectangle((0, 0, W - 1, H - 1), outline=(120, 124, 132), width=2)
+    return send_img(img, want_hq())
+
+
+@app.get("/api/printers")
+def printers():
+    if not DRV_LOCK.acquire(timeout=20):
+        return jsonify(error="The printer is busy. Try again in a moment."), 503
+    try:
+        return jsonify(printing.list_printers())
+    except Exception as e:
+        return jsonify(error=str(e)), 500
+    finally:
+        DRV_LOCK.release()
+
+
+@app.get("/api/printer")
+def printer():
+    if not DRV_LOCK.acquire(timeout=20):
+        return jsonify(error="The printer is busy. Try again in a moment."), 503
+    try:
+        return jsonify(printing.caps(request.args.get("name", "")))
+    except Exception as e:
+        return jsonify(error=str(e)), 500
+    finally:
+        DRV_LOCK.release()
+
+
+# ------------------------------------------------------------- profiles
+def load_profiles():
+    try:
+        with open(PROF_FILE, "r", encoding="utf-8") as fh:
+            d = json.load(fh)
+            return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_profiles(d):
+    os.makedirs(CFG_DIR, exist_ok=True)
+    tmp = PROF_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(d, fh)
+    os.replace(tmp, PROF_FILE)
+
+
+def find_profile(printer_name, pid):
+    if not pid:
+        return None
+    with PLOCK:
+        for p in load_profiles().get(printer_name, []):
+            if p["id"] == pid:
+                return p["data"]
+    return None
+
+
+@app.get("/api/profiles")
+def profiles_list():
+    name = request.args.get("printer", "")
+    with PLOCK:
+        items = load_profiles().get(name, [])
+    return jsonify([{"id": p["id"], "name": p["name"]} for p in items])
+
+
+@app.post("/api/profiles/new")
+def profiles_new():
+    """Opens the driver's own settings window (like Word's Printer Properties)."""
+    d = request.get_json(silent=True) or {}
+    printer_name = str(d.get("printer", ""))
+    pname = str(d.get("name", "")).strip()[:40]
+    if not printer_name or not pname:
+        return jsonify(error="Printer and profile name are required"), 400
+    if DIALOG_LOCK.locked():
+        return jsonify(error="A settings window is already open"), 409
+    base = find_profile(printer_name, d.get("base"))
+    jid = new_job({"state": "run", "kind": "profile"})
+
+    def run():
+        with DIALOG_LOCK:
+            try:
+                data = printing.driver_dialog(printer_name, base)
+                if data is None:
+                    job_end(jid, state="cancel")
+                    return
+                pid = uuid.uuid4().hex[:8]
+                with PLOCK:
+                    allp = load_profiles()
+                    allp.setdefault(printer_name, []).append({"id": pid, "name": pname, "data": data})
+                    save_profiles(allp)
+                job_end(jid, state="done", profile={"id": pid, "name": pname})
+            except Exception as e:
+                job_end(jid, state="error", error=str(e))
+
+    threading.Thread(target=run, daemon=True).start()
+    return jsonify(id=jid)
+
+
+@app.delete("/api/profiles/<pid>")
+def profiles_delete(pid):
+    name = request.args.get("printer", "")
+    with PLOCK:
+        allp = load_profiles()
+        allp[name] = [p for p in allp.get(name, []) if p["id"] != pid]
+        save_profiles(allp)
+    return jsonify(ok=True)
+
+
+# ---------------------------------------------------------------- print
+def job_pages(d):
+    """[(file, page index, added-blank-page key or None), ...] from a print / save request, or None when a file is gone."""
+    try:
+        return [(FILES[x[0]], int(x[1]), (str(x[2]) if len(x) > 2 else None)) for x in d["pages"]]   # 3rd = an added blank page
+    except Exception:
+        return None
+
+
+def job_numargs(d):
+    """Page-number settings of a print / save request, in the form numspec() reads."""
+    nd = d.get("num") or {}
+    return {"num": "1" if nd.get("on") else "0", "npos": nd.get("pos"), "nalign": nd.get("align"),
+            "nsize": nd.get("size"), "nstart": nd.get("start"),
+            "nmargin": nd.get("margin"), "nbold": "1" if nd.get("bold") else "0"}
+
+
+def job_items(pages, lay):
+    """page_items(i) for a print / save job: the Transform pictures of sheet i (None = normal page, [] = blank page)."""
+    def page_items(i):
+        f, p, vk = pages[i]
+        lk = vk or f'{f["id"]}:{p}'
+        if lk not in lay:
+            return [] if vk else None
+        return clean_items(lay[lk], (f, p))   # an empty list = a blank page
+    return page_items
+
+
+@app.post("/api/print")
+def do_print():
+    d = request.get_json(silent=True) or {}
+    pages = job_pages(d)
+    if pages is None:
+        return jsonify(error="Files not found. Add them again."), 400
+    if not pages:
+        return jsonify(error="No pages selected"), 400
+    try:
+        copies = max(1, min(99, int(d.get("copies", 1))))
+    except Exception:
+        copies = 1
+    orient = "landscape" if d.get("orient") == "landscape" else "portrait"
+    nup = get_nup(d.get("nup"))
+    sheets, pcopies = None, copies
+    if nup > 1:   # N pages on one sheet; copies of a short job fill the sheet (see nup_plan)
+        sheets, pcopies = nup_plan([(f, p) for f, p, _ in pages], nup, copies)
+    jid = new_job({"state": "run", "done": 0, "total": (len(sheets) if sheets else len(pages)) * pcopies})
+    color = d.get("color") == "color"
+    profile = find_profile(d.get("printer", ""), d.get("profile"))  # None = normal way
+    mode = d.get("scale") if d.get("scale") in SCALES else "fit"
+    pct = get_pct(d.get("pct"))
+    lay = d.get("layout") if isinstance(d.get("layout"), dict) and not sheets else {}   # only sent when Transform is on
+    nargs = job_numargs(d)
+
+    page_items = job_items(pages, lay)
+
+    def run():
+        try:
+            area = get_area({"printer": d["printer"], "paper": d.get("paper"),
+                             "color": "color" if color else "mono",
+                             "duplex": d.get("duplex", "off"), "orient": orient}, fresh=True)
+            area_mm = area["aw"]
+            if sheets:
+                grid = nup_grid(nup, area["aw"], area["ah"], nup_asp(*sheets[0][0]))
+                provider = lambda i, W, H, m: nup_sheet(sheets[i], W, H, m, W / area_mm, nargs, grid)
+            else:
+                provider = lambda i, W, H, m: sheet(pages[i][0], pages[i][1], W, H, m, mode, W / area_mm, pct,
+                                                    numspec({**nargs, "nn": i + 1} if lay else nargs, pages[i][0]["id"], pages[i][1]),
+                                                    items=page_items(i))
+            printing.print_job(
+                d["printer"], d.get("paper"), color, d.get("duplex", "off"), orient, pcopies,
+                len(sheets) if sheets else len(pages), provider,
+                lambda done, total: JOBS[jid].update(done=done, total=total),
+                d.get("title", "PC Print"), profile=profile)
+            job_end(jid, state="done")
+        except Exception as e:
+            job_end(jid, state="error", error=str(e))
+
+    threading.Thread(target=run, daemon=True).start()
+    return jsonify(id=jid)
+
+
+# ------------------------------------------------- save the merged result as a PDF
+SAVE_FILE = os.path.join(CFG_DIR, "save.json")   # kept apart from settings.json: phones may read that one
+SAVE_DPI = 300.0       # lowest quality used for Save PDF (was 200); pictures with more detail get up to SAVE_MAX_DPI
+SAVE_MAX_DPI = 600.0
+
+
+def save_dpi_for(pages, a):
+    """Pixels per inch for Save PDF: at least SAVE_DPI, more when a picture on the list has more detail
+    than that on this paper (so nothing of the original is thrown away), never above SAVE_MAX_DPI."""
+    best = SAVE_DPI
+    try:
+        long_in = max(a["pw"], a["ph"]) / 25.4
+        for f, _p, _vk in pages:
+            if f.get("kind") == "pdf":
+                continue
+            try:
+                with Image.open(f["path"]) as im:
+                    best = max(best, max(im.size) / long_in)
+            except Exception:
+                pass
+        # compose() keeps pictures under 8000 px: stay below that on big paper (A3 and up)
+        best = min(best, SAVE_MAX_DPI, 7900.0 / long_in)
+    except Exception:
+        best = SAVE_DPI
+    return max(72.0, best)
+
+
+def encode_save_page(paper):
+    """One finished sheet -> bytes for the PDF, with no visible loss:
+    flat pages (text, drawings: up to 65536 colours) are stored lossless (PNG),
+    photos as JPEG quality 98 with full colour detail."""
+    b = io.BytesIO()
+    flat = False
+    try:
+        flat = paper.getcolors(maxcolors=65536) is not None
+    except Exception:
+        flat = False
+    if flat:
+        paper.save(b, "PNG", optimize=False, compress_level=6)
+    else:
+        paper.save(b, "JPEG", quality=98, subsampling=0, optimize=True)
+    return b.getvalue()
+
+
+def save_cfg():
+    try:
+        with open(SAVE_FILE, "r", encoding="utf-8") as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_cfg_set(**kw):
+    d = save_cfg()
+    d.update(kw)
+    os.makedirs(CFG_DIR, exist_ok=True)
+    with open(SAVE_FILE, "w", encoding="utf-8") as fh:
+        json.dump(d, fh)
+
+
+def save_dir_now():
+    d = save_cfg().get("dir") or ""
+    return d if d and os.path.isdir(d) else ""
+
+
+@app.get("/api/savedir")
+def savedir_get():
+    return jsonify(dir=save_dir_now())
+
+
+@app.post("/api/savedir")
+def savedir_set():
+    """{pick: true} opens the folder window; {dir: path} sets it directly. The choice is remembered."""
+    d = request.get_json(silent=True) or {}
+    path = ""
+    if d.get("pick"):
+        if not HOOKS["pickdir"]:
+            return jsonify(error="No folder window"), 500
+        try:
+            with DIALOG_LOCK:
+                path = HOOKS["pickdir"]() or ""
+        except Exception as e:
+            return jsonify(error=str(e)), 500
+        if not path:
+            return jsonify(dir=save_dir_now(), cancelled=True)
+    else:
+        path = str(d.get("dir") or "")
+    if not path or not os.path.isdir(path):
+        return jsonify(error="That folder does not exist."), 400
+    try:
+        save_cfg_set(dir=path)
+    except Exception as e:
+        return jsonify(error=str(e)), 500
+    return jsonify(dir=path)
+
+
+@app.post("/api/savedir/open")
+def savedir_open():
+    d = save_dir_now()
+    if not d:
+        return jsonify(error="No save folder chosen yet."), 400
+    try:
+        os.startfile(d)
+    except Exception as e:
+        return jsonify(error=str(e)), 500
+    return jsonify(ok=True)
+
+
+def safe_pdf_name(name):
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', " ", str(name or "")).strip(" .")
+    name = re.sub(r"\s+", " ", name)
+    if name.lower().endswith(".pdf"):
+        name = name[:-4].rstrip(" .")
+    if not name:
+        name = "Merged " + time.strftime("%Y-%m-%d %H-%M-%S")
+    return name[:120]
+
+
+def unique_path(folder, base):
+    path = os.path.join(folder, base + ".pdf")
+    n = 2
+    while os.path.exists(path):
+        path = os.path.join(folder, "%s (%d).pdf" % (base, n))
+        n += 1
+    return path
+
+
+@app.post("/api/savepdf")
+def save_pdf():
+    """Same pages, same order, same layout, page numbers and Transform changes as printing - but into one PDF file
+    in the chosen folder (page size = the paper, the picture sits where the printer would put it)."""
+    d = request.get_json(silent=True) or {}
+    pages = job_pages(d)
+    if pages is None:
+        return jsonify(error="Files not found. Add them again."), 400
+    if not pages:
+        return jsonify(error="No pages selected"), 400
+    folder = str(d.get("dir") or "") or save_dir_now()
+    if not folder or not os.path.isdir(folder):
+        return jsonify(error="nodir"), 400
+    orient = "landscape" if d.get("orient") == "landscape" else "portrait"
+    color = d.get("color") == "color"
+    mode = d.get("scale") if d.get("scale") in SCALES else "fit"
+    pct = get_pct(d.get("pct"))
+    lay = d.get("layout") if isinstance(d.get("layout"), dict) else {}
+    nargs = job_numargs(d)
+    area_q = {"printer": d.get("printer", ""), "paper": d.get("paper"), "color": "color" if color else "mono",
+              "duplex": "off", "orient": orient, "w": d.get("w", 210), "h": d.get("h", 297)}
+    base = safe_pdf_name(d.get("name"))
+    nup = get_nup(d.get("nup"))
+    sheets = nup_groups([(f, p) for f, p, _ in pages], nup) if nup > 1 else None   # N pages on one sheet
+    if sheets:
+        lay = {}
+    jid = new_job({"state": "run", "done": 0, "total": len(sheets) if sheets else len(pages)})
+
+    page_items = job_items(pages, lay)
+
+    def run():
+        tmp = None
+        try:
+            a = get_area(area_q, fresh=True)
+            dpi_now = save_dpi_for(pages, a)
+            sc = dpi_now / 25.4                               # pixels per mm
+            W, H = max(1, round(a["pw"] * sc)), max(1, round(a["ph"] * sc))
+            ox, oy = round(a["ox"] * sc), round(a["oy"] * sc)
+            AW, AH = max(1, min(W - ox, round(a["aw"] * sc))), max(1, min(H - oy, round(a["ah"] * sc)))
+            pt_w, pt_h = a["pw"] / 25.4 * 72.0, a["ph"] / 25.4 * 72.0
+            with LOCK:
+                doc = fitz.open()
+            try:
+                grid = nup_grid(nup, a["aw"], a["ah"], nup_asp(*sheets[0][0])) if sheets else None
+                for i in range(len(sheets) if sheets else len(pages)):
+                    if sheets:
+                        pg = nup_sheet(sheets[i], AW, AH, not color, sc, nargs, grid)
+                    else:
+                        f, p, vk = pages[i]
+                        num = numspec({**nargs, "nn": i + 1} if lay else nargs, f["id"], p)
+                        pg = sheet(f, p, AW, AH, not color, mode, sc, pct, num, items=page_items(i))
+                    paper = Image.new(pg.mode, (W, H), 255 if pg.mode == "L" else (255, 255, 255))
+                    paper.paste(pg, (ox, oy))
+                    data = encode_save_page(paper)
+                    del pg, paper
+                    with LOCK:
+                        page = doc.new_page(width=pt_w, height=pt_h)
+                        page.insert_image(page.rect, stream=data)
+                    JOBS[jid].update(done=i + 1)
+                path = unique_path(folder, base)
+                tmp = path + ".part"
+                with LOCK:
+                    doc.save(tmp, deflate=True, garbage=3)
+            finally:
+                with LOCK:
+                    doc.close()
+            os.replace(tmp, path)
+            tmp = None
+            job_end(jid, state="done", path=path)
+        except Exception as e:
+            job_end(jid, state="error", error=str(e))
+        finally:
+            if tmp and os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+
+    threading.Thread(target=run, daemon=True).start()
+    return jsonify(id=jid)
+
+
+
+@app.get("/api/job/<jid>")
+def job(jid):
+    return jsonify(JOBS.get(jid, {"state": "error", "error": "unknown job"}))
