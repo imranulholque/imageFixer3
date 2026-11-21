@@ -2400,7 +2400,7 @@ $('#updgo').onclick=async()=>{
   }catch{$('#updmerr').textContent='Could not start the update.'}
   upLoad();
 };
-(async()=>{if(!window.EMBED){initAuto();upLoad()}svLoad();await loadSettings();numNote();await refresh(true);setInterval(()=>{if(!document.hidden)refresh()},1200);document.addEventListener('visibilitychange',()=>{if(!document.hidden)refresh()})})();
+(async()=>{if(!window.EMBED){initAuto();upLoad()}svLoad();await loadSettings();numNote();await refresh(true);if(window.EMBED&&FILES.length)go(2);setInterval(()=>{if(!document.hidden)refresh()},1200);document.addEventListener('visibilitychange',()=>{if(!document.hidden)refresh()})})();
 </script>
 </body>
 </html>
