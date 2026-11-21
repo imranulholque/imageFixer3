@@ -41,6 +41,11 @@ jobs:
         continue-on-error: true
         timeout-minutes: 5
         run: python test_printlayout.py
+      # The PC Print screen inside Image Fixer (same code as PrintMerged): the server and its page start and answer.
+      - name: PC Print screen test
+        continue-on-error: true
+        timeout-minutes: 5
+        run: python test_pcprint.py
       # Opens the real window invisibly and clicks through the main features.
       # If something is wrong the log shows exactly where; the exe is still built.
       - name: Self test
@@ -64,7 +69,7 @@ jobs:
               d.polygon([(70, 176), (110, 130), (136, 158), (158, 138), (190, 176)], fill=(255, 255, 255, 255))
               d.ellipse((84, 86, 108, 110), fill=(255, 255, 255, 255))
               im.save("icon.ico", sizes=[(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
-      - run: pyinstaller --noconsole --onedir --name ImageFixer --icon icon.ico --collect-all pillow_heif --collect-all pypdfium2 --hidden-import buildinfo --hidden-import croplearn --hidden-import printstudio --hidden-import printlayout --exclude-module tkinter app.py
+      - run: pyinstaller --noconsole --onedir --name ImageFixer --icon icon.ico --collect-all pillow_heif --collect-all pypdfium2 --hidden-import buildinfo --hidden-import croplearn --hidden-import printstudio --hidden-import printlayout --hidden-import printweb --hidden-import pcprint.server --hidden-import pcprint.printing --hidden-import win32print --hidden-import win32ui --hidden-import win32gui --hidden-import win32con --hidden-import win32api --add-data "pcprint/static;pcprint/static" --exclude-module tkinter app.py
       # Scanner helpers: a 64-bit and a 32-bit copy (many office scanners, e.g. Toshiba e-Studio, only have a 32-bit TWAIN driver).
       - name: Build 64-bit scan helper
         run: |
