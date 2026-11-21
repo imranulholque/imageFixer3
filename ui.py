@@ -1854,17 +1854,8 @@ class MainWindow(QMainWindow):
             self.say("The print program was not found. Choose it again in Settings > Print program.")
             return
         self.say("Opening in %s ..." % (extprint.program_name(exe) or "the print program"))
-        made, todo = {}, []
-        for c in cards:
-            p = c.export_ready()                             # untouched = its own file; edited = the file made before
-            if p and os.path.isfile(p):
-                made[c.uid] = p
-            else:
-                stem, ext = c.out_name()
-                todo.append((c, c.render_source(), export_path(stem, ext), c._ver if c._loaded else None))
 
-        def finish():
-            files = [made.get(c.uid) for c in cards]
+        def finish(files):
             err = extprint.launch(exe, files)
             if err:
                 self.say(err)
@@ -1874,9 +1865,22 @@ class MainWindow(QMainWindow):
             if self.settings.value("print_sleep", True, type=bool):
                 extprint.cpu_load()                          # starting point for the "is the PC calm?" check
                 QTimer.singleShot(1000, self._sleep_when_ready)   # not at once: the print program is starting and needs the disk / CPU
+        self._export_for_print(cards, extprint.program_name(exe) or "the print program", finish)
+
+    def _export_for_print(self, cards, label, finish):
+        """Makes the picture files (full resolution, all edits, nothing is saved in the user's folders) and then calls
+        finish(files) - one path per card, in the same order.  Used by the other print program and by the print screen."""
+        made, todo = {}, []
+        for c in cards:
+            p = c.export_ready()                             # untouched = its own file; edited = the file made before
+            if p and os.path.isfile(p):
+                made[c.uid] = p
+            else:
+                stem, ext = c.out_name()
+                todo.append((c, c.render_source(), export_path(stem, ext), c._ver if c._loaded else None))
 
         if not todo:
-            finish()
+            finish([made.get(c.uid) for c in cards])
             return
 
         def work(progress):
@@ -1905,8 +1909,8 @@ class MainWindow(QMainWindow):
                 made[c.uid] = path
                 if ver is not None and c._loaded and c._ver == ver:
                     c.set_export(ver, path)                  # the next print / drag reuses this file
-            finish()
-        self.runner.run("Preparing %d picture(s) for %s" % (len(cards), extprint.program_name(exe) or "the print program"),
+            finish([made.get(c.uid) for c in cards])
+        self.runner.run("Preparing %d picture(s) for %s" % (len(cards), label),
                         work, done, lambda msg: self.say("Could not prepare the pictures: " + msg.splitlines()[0]))
 
     def _sleep_when_ready(self, waited=1000):
@@ -1977,8 +1981,29 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------ print (with all edits; nothing is saved)
     def _print_builtin(self, cards):
-        """Image Fixer's own print screen.  Every open picture is in its list; the ones that were selected are ticked, the
-        others are only loaded when they are ticked (so opening it stays quick).  Returns False when it is not available."""
+        """Image Fixer's own print screen = the PC Print screen (printweb.py), with the selected pictures in its list
+        (all edits included).  Returns False when no print screen is available."""
+        try:
+            import printweb                                   # the PC Print screen (same as the PrintMerged program)
+        except Exception:                                     # no web engine in this build: the older Qt print screen
+            printweb = None
+        if printweb is not None:
+            def show(files):
+                files = [f for f in files if f and os.path.isfile(f)]
+                if not files:
+                    self.say("Nothing to print.")
+                    return
+
+                def go():
+                    if not printweb.open_print_screen(self, self.settings, files):
+                        self._print_builtin_qt(cards)         # the print screen could not start: the older Qt one
+                QTimer.singleShot(0, go)
+            self._export_for_print(cards, "printing", show)
+            return True
+        return self._print_builtin_qt(cards)
+
+    def _print_builtin_qt(self, cards):
+        """The older Qt print screen (only used when the PC Print screen cannot be started)."""
         try:
             from printstudio import PrintStudio
         except ImportError:

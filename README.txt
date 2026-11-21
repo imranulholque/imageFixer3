@@ -345,3 +345,14 @@ PRINT SCREEN (Ctrl+P)  - now has the same preview features as PC Print (PrintMer
  - Ctrl+V with nothing copied: a picture from the clipboard becomes a new page.  Dropping picture files on the window adds them as pages.
  - Not copied from PC Print on purpose: the first "choose files" page (Image Fixer already has the pictures) and the Windows DEVMODE printer
    profiles (presets above cover the same settings; "Printer properties..." still opens the driver's own window).
+
+
+PRINT SCREEN (Ctrl+P)
+ The print screen is the SAME screen as the PrintMerged / PC Print program (folder pcprint/ = its page and its code, taken over
+ without redrawing it): printer, saved printer profiles, Printer Properties, paper, orientation, colour, copies, scaling,
+ many pages on one sheet, Add page numbers (+ the Page numbers button), Transform, perspective crop, Save PDF.
+ It opens inside Image Fixer (printweb.py shows it with Qt's web engine); the selected pictures come with all their edits.
+ Taken out because they belong to the stand-alone program: the Phone button and PC Print's own Updates button.
+ Settings / profiles / save folder are kept in %APPDATA%\PCPrint (shared with the PC Print program).
+ If you update the PrintMerged page later, run:  python make_pcprint.py <PrintMerged folder>   (copies it again, same changes).
+ Test: python test_pcprint.py
