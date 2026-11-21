@@ -89,5 +89,7 @@ open(os.path.join(dst, "__init__.py"), "w").write('"""The PrintMerged / PC Print
 p = os.path.join(dst, "static", "index.html")
 h = open(p, encoding="utf-8").read()
 h = rep(h, "(async()=>{initAuto();upLoad();svLoad();", "(async()=>{if(!window.EMBED){initAuto();upLoad()}svLoad();")
+# Image Fixer opens straight on the preview page (step 2); "Back to pages" still goes to the page list
+h = rep(h, "await refresh(true);setInterval(", "await refresh(true);if(window.EMBED&&FILES.length)go(2);setInterval(")
 open(p, "w", encoding="utf-8").write(h)
 print("ok", len(s.splitlines()), "lines in server.py")
