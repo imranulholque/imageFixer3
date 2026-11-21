@@ -429,7 +429,7 @@ SHORTCUT_GROUPS = (
         ("Ctrl+C", "Copy the picture (full quality)"),
         ("Ctrl+S", "Save (replaces the original; asked once)"),
         ("Ctrl+Shift+S", "Save all edited pictures"),
-        ("Ctrl+P", "Print: opens your print program (Settings > Print program) with the selected pictures, or with this picture; without a program it opens the Windows print window"),
+        ("Ctrl+P", "Print: opens Image Fixer's own print screen (preview, page numbers, pages per sheet, Transform) with the selected pictures, or with this picture. Settings > Print can switch to another program or the Windows print window"),
         ("Right-click a thumbnail", "Duplicate, Print, Remove, Copy"))),
     ("Undo / Redo", (
         ("Ctrl+Z", "Undo, step by step"),
@@ -708,6 +708,7 @@ class MainWindow(QMainWindow):
         m.addSeparator()
         act("Save all edited...", self.save_all)
         act("All pages as one PDF", self.save_all_pdf)
+        act("Page numbers...", self.open_page_numbers)
         m.addSeparator()
         act("Clear all", self.clear_all)
         m.aboutToShow.connect(lambda: self.actMoreOpen.setEnabled(bool(self._dir())))
@@ -742,6 +743,7 @@ class MainWindow(QMainWindow):
         self.actSaveAs = act("Save as...", lambda: self._with_loaded(self.save_card_as))
         self.actSaveAll = act("Save all edited...", self.save_all)
         self.actPdfAll = act("All pages as one PDF", self.save_all_pdf)
+        self.actPageNums = act("Page numbers...", self.open_page_numbers)
         self.actPrint = act("Print...\tCtrl+P", lambda: self._with_loaded(lambda c: self.print_cards(self.print_targets())))
         m.addSeparator()
         self.actCopy = act("Copy picture\tCtrl+C", lambda: self._with_loaded(lambda c: c.copy_image()))
@@ -1646,8 +1648,8 @@ class MainWindow(QMainWindow):
         try:
             if self._hibernating or self.quitting or self.runner.busy:
                 return
-            if not self.settings.value("print_exe", "", type=str):
-                return
+            if self._print_mode() != "external" or not self.settings.value("print_exe", "", type=str):
+                return                                       # only the "other program" way needs the file made beforehand
             c = self.carousel.current()
             if c is not None and c._loaded and not c._dead and c.is_edited() and c.export_ready() is None:
                 c.prepare_export()
@@ -1750,18 +1752,31 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------ print program (Ctrl+P) + sleeping
     def _build_print_menu(self, menu):
-        sub = menu.addMenu("Print program  (Ctrl+P)")
+        sub = menu.addMenu("Print  (Ctrl+P)")
         self.actPrintNow = QAction("", self)
         self.actPrintNow.setEnabled(False)
         sub.addAction(self.actPrintNow)
-        a = QAction("Choose the program (.exe)...", self)
+        grp = QActionGroup(self)
+        grp.setExclusive(True)
+        self._print_mode_acts = {}
+        for mode, text in (("builtin", "Image Fixer's own print screen  (preview, page numbers, pages per sheet, Transform)"),
+                           ("external", "Another program (.exe)"),
+                           ("windows", "The normal Windows print window")):
+            a = QAction(text, self)
+            a.setCheckable(True)
+            a.triggered.connect(lambda _=False, m=mode: self._set_print_mode(m))
+            grp.addAction(a)
+            sub.addAction(a)
+            self._print_mode_acts[mode] = a
+        sub.addSeparator()
+        a = QAction("Choose the other program (.exe)...", self)
         a.triggered.connect(self.choose_print_exe)
         sub.addAction(a)
-        self.actPrintClear = QAction("Use the normal Windows print window instead", self)
-        self.actPrintClear.triggered.connect(self.clear_print_exe)
-        sub.addAction(self.actPrintClear)
+        a = QAction("Page numbers...", self)
+        a.triggered.connect(self.open_page_numbers)
+        sub.addAction(a)
         sub.addSeparator()
-        self.actPrintSleep = QAction("After opening it: go to the tray and sleep (saves RAM and power)", self)
+        self.actPrintSleep = QAction("Other program only: after opening it go to the tray and sleep (saves RAM and power)", self)
         self.actPrintSleep.setCheckable(True)
         self.actPrintSleep.setChecked(self.settings.value("print_sleep", True, type=bool))
         self.actPrintSleep.setToolTip("Image Fixer hides in the tray and gives back memory. Your pictures and edits are kept; "
@@ -1771,10 +1786,33 @@ class MainWindow(QMainWindow):
         sub.aboutToShow.connect(self._refresh_print_menu)
         self._refresh_print_menu()
 
+    def _print_mode(self):
+        """'builtin' (Image Fixer's own print screen), 'external' (the chosen .exe) or 'windows' (the normal print window).
+        Not chosen yet: the program that was chosen before keeps working, otherwise the own print screen."""
+        m = self.settings.value("print_mode", "", type=str)
+        if m in ("builtin", "external", "windows"):
+            return m
+        return "external" if self.settings.value("print_exe", "", type=str) else "builtin"
+
+    def _set_print_mode(self, mode):
+        if mode == "external" and not self.settings.value("print_exe", "", type=str):
+            self.choose_print_exe()                      # nothing to open yet: ask for the program first
+            return
+        self.settings.setValue("print_mode", mode)
+        self._refresh_print_menu()
+        self.say({"builtin": "Ctrl+P now opens Image Fixer's own print screen.",
+                  "external": "Ctrl+P now opens the pictures in the other print program.",
+                  "windows": "Ctrl+P now opens the normal Windows print window."}[mode])
+
     def _refresh_print_menu(self):
         exe = self.settings.value("print_exe", "", type=str)
-        self.actPrintNow.setText("Now: " + (extprint.program_name(exe) or exe) if exe else "Now: the normal Windows print window")
-        self.actPrintClear.setEnabled(bool(exe))
+        mode = self._print_mode()
+        names = {"builtin": "Image Fixer's own print screen", "windows": "the normal Windows print window",
+                 "external": (extprint.program_name(exe) or exe) if exe else "another program"}
+        self.actPrintNow.setText("Now: " + names[mode])
+        for m, a in getattr(self, "_print_mode_acts", {}).items():
+            a.setChecked(m == mode)
+        self.actPrintSleep.setEnabled(mode == "external")
 
     def choose_print_exe(self):
         start = self.settings.value("print_exe", "", type=str) or os.environ.get("ProgramFiles", "")
@@ -1783,13 +1821,24 @@ class MainWindow(QMainWindow):
         if not path:
             return
         self.settings.setValue("print_exe", os.path.normpath(path))
+        self.settings.setValue("print_mode", "external")
         self._refresh_print_menu()
         self.say("Ctrl+P now opens the pictures in " + (extprint.program_name(path) or path) + ".")
 
     def clear_print_exe(self):
-        self.settings.remove("print_exe")
-        self._refresh_print_menu()
-        self.say("Ctrl+P now opens the normal Windows print window.")
+        self._set_print_mode("windows")
+
+    def open_page_numbers(self):
+        """Page numbers: one setting for the print screen and for 'All pages as one PDF'."""
+        try:
+            from printstudio import PageNumberDialog, load_numspec
+        except ImportError:
+            self.say("Page numbers are not available in this build.")
+            return
+        if PageNumberDialog(self.settings, self).exec() == QDialog.DialogCode.Accepted:
+            sp = load_numspec(self.settings)
+            self.say("Page numbers are on: %s %s, first number %d. Used by Print and by All pages as one PDF."
+                     % ("bottom" if sp.pos == "bottom" else "top", sp.align, sp.start) if sp.on else "Page numbers are off.")
 
     def print_targets(self):
         """Ctrl+P: two or more selected thumbnails = all of them; otherwise only the picture that is being worked on."""
@@ -1927,14 +1976,32 @@ class MainWindow(QMainWindow):
             self.tray.setToolTip("Image Fixer  -  by " + AUTHOR)
 
     # ------------------------------------------------------------ print (with all edits; nothing is saved)
+    def _print_builtin(self, cards):
+        """Image Fixer's own print screen.  Every open picture is in its list; the ones that were selected are ticked, the
+        others are only loaded when they are ticked (so opening it stays quick).  Returns False when it is not available."""
+        try:
+            from printstudio import PrintStudio
+        except ImportError:
+            return False
+        everything = list(self.carousel.cards)
+        for c in cards:
+            if c not in everything:
+                everything.append(c)
+        PrintStudio(self, self.settings, everything, {c.uid for c in cards}).exec()
+        return True
+
     def print_cards(self, cards):
         cards = [c for c in cards if c is not None]
         if not cards or self._busy():
             return
+        mode = self._print_mode()
         exe = self.settings.value("print_exe", "", type=str)
-        if exe:                                           # the program the user chose in Settings > Print program
+        if mode == "external" and exe:                    # the program the user chose in Settings > Print
             self._print_external(cards, exe)
             return
+        if mode in ("builtin", "external"):               # own print screen (also when the chosen program is gone)
+            if self._print_builtin(cards):
+                return
         try:
             from PySide6.QtPrintSupport import QPrintDialog, QPrinter
         except ImportError:
@@ -2359,23 +2426,35 @@ class MainWindow(QMainWindow):
         if not cards:
             self.say("There is no picture to save.")
             return
+        try:
+            from printstudio import PdfOptionsDialog
+            opts = PdfOptionsDialog(self.settings, self)
+            if opts.exec() != QDialog.DialogCode.Accepted:
+                return
+            mode, spec = opts.mode(), opts.spec()
+        except ImportError:                                  # no print screen file: the old question, no page numbers
+            mode, spec = self._pdf_mode(), None
+            if mode is None:
+                return
         start = os.path.join(self._dir() or os.path.expanduser("~"), "Pages.pdf")
         path, _ = QFileDialog.getSaveFileName(self, "Save all pages as one PDF", start, "PDF document (*.pdf)")
         if not path:
             return
         if not path.lower().endswith(".pdf"):
             path += ".pdf"
-        mode = self._pdf_mode()
-        if mode is None:
-            return
         sources = [c.render_source() for c in cards]       # made and written one by one in the worker thread
+        numbered = spec is not None and spec.on
 
         def work(progress):
-            core.save_pdf(sources, path, mode, progress=progress)
+            if numbered:                                     # the number is real text at the paper's edge (sharp at any zoom)
+                import printlayout
+                printlayout.save_pdf_numbered(sources, path, mode, spec, pdf_page=core.pdf_page, progress=progress)
+            else:
+                core.save_pdf(sources, path, mode, progress=progress)
             return path
 
         def done(p):
-            self.say("PDF saved (%d pages): %s" % (len(cards), p))
+            self.say("PDF saved (%d pages%s): %s" % (len(cards), ", with page numbers" if numbered else "", p))
         self.runner.run("Making the PDF", work, done, self._fail_box("PDF"))
 
     # --------------------------------------------------------------- scanner
